@@ -1,218 +1,200 @@
-"""最小可用主窗口:搜索 -> 选中 -> 解析下载 -> 播放。
+"""主窗口:组装各块 widget,并把界面事件接到播放编排上。
 
-这是 MVP 验证界面,刻意保持单文件、少抽象,先证明整条链路能跑通。
-后续做正式 UI 时再把列表项、歌词面板、歌单抽屉拆成独立 widget。
+**这里只做接线**。搜索、解析、下载、切歌的判断分别在 ``api`` / ``audio`` 里,界面负责
+把用户操作转成方法调用、把编排层发来的信号渲染成界面状态(``AGENTS.md`` 第 4 节)。
 
-网络层改成 ``QNetworkAccessManager`` 之后,**界面里没有任何线程**:
-搜索、解析、下载全部是回调驱动,所以不需要 QThread,也不需要跨线程信号转发。
+这个文件此前是 500 行的单文件界面:布局、业务判断、网络回调全混在一起,多加一个面板
+就要在几百行里找位置。拆出 ``ui/widgets/`` 之后,主窗口只剩组装与转发 —— 判断它是否
+合格的依据是**职责**(里面还有没有业务逻辑),不是行数。
 
-界面层的职责边界(``AGENTS.md`` 第 4 节):只做展示与事件转发。
-这里不解析任何接口 JSON(交给 ``api`` 的 ``parse_*``),也不算缓存键
-(交给 ``core.cache``),更不判断音质档位(交给 ``audio.resolver``)。
+依赖以参数注入的只有"可替换的外部资源"(客户端 / 缓存 / 配置 / 编排器):默认全部走真实
+实现,测试可以塞替身进来,于是界面接线能被自动化验证,而不是只能靠肉眼点。
 """
 
 from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QCloseEvent, QIcon
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QSlider,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from ..api.bilibili import BilibiliClient, SearchResult
-from ..audio.player import DEFAULT_VOLUME, PlayerController
+from ..audio.playback import PlaybackController
+from ..audio.player import PlayerController
 from ..audio.resolver import AudioResolver, ResolvedAudio
 from ..core.cache import AudioCache
+from ..core.config import ConfigStore
 from ..core.models import Video, format_count
-from .icons import app_icon_path, get_icon, palette
+from ..core.queue import QueueItem
+from .cover_loader import CoverLoader
+from .icons import Palette, app_icon_path, get_icon, palette
+from .theme import apply_theme
+from .widgets import PlayerBar, QueueDrawer, TrackList
 
 __all__ = ["MainWindow", "run"]
 
-#: 播放控件图标的逻辑尺寸。按钮本身给 36×36,留出 6px 内边距。
-BUTTON_ICON_SIZE = 20
+#: 搜索结果表格的列。
+_SEARCH_COLUMNS = ("标题", "UP主", "时长", "分P", "播放量")
 
-#: 结果表格的列定义(标题 / UP主 / 时长 / 分P / 播放量)。
-#:
-#: 写成常量是为了让"列数"与"表头文字"只有一个来源 —— 加列时不会漏改
-#: ``QTableWidget(0, 5)`` 里的那个 5。
-_TABLE_COLUMNS = ("标题", "UP主", "时长", "分P", "播放量")
+#: "分P"列在详情补全前显示的占位符。
+_UNKNOWN_PAGES = "?"
 
 
 class MainWindow(QMainWindow):
     """主窗口。
 
-    持有整条链路的四个协作对象(客户端 / 缓存 / 解析器 / 播放器),
-    但本身只负责把它们的状态反映到控件上。
-
-    属性:
-        client: B站接口客户端。
-        cache: 音频磁盘缓存。
-        player: 播放器控制器。
-        resolver: 音源解析器。
+    Args:
+        client: 接口客户端;``None`` 时使用默认的 Qt 后端实现。
+        cache: 音频缓存;``None`` 时使用平台默认缓存目录。
+        config_store: 配置读写;``None`` 时使用平台默认配置路径。
+        playback: 播放编排器;``None`` 时用 ``client`` 与 ``cache`` 现搭一个。
+            传入替身(duck typing)即可在测试里跑通整条界面接线。
     """
 
-    def __init__(self, client: BilibiliClient | None = None) -> None:
-        """构建窗口、控件与信号连接。
-
-        Args:
-            client: 注入的接口客户端,便于复用已预热会话或换用 urllib 后端;
-                ``None`` 表示就地新建一个 Qt 后端。两种情况下窗口都会在关闭时
-                调用它的 ``close()``,所以不要把生命周期比窗口更长的实例传进来。
-        """
+    def __init__(
+        self,
+        client: BilibiliClient | None = None,
+        *,
+        cache: AudioCache | None = None,
+        config_store: ConfigStore | None = None,
+        playback: PlaybackController | None = None,
+    ) -> None:
         super().__init__()
-        self.setWindowTitle("BiliMusic - MVP 验证")
-        self.resize(940, 620)
+        self.setWindowTitle("BiliMusic")
+        self.resize(1100, 680)
         self._apply_window_icon()
 
-        self.client = client or BilibiliClient()
-        self.cache = AudioCache()
-        self.player = PlayerController(self)
-        self.resolver = AudioResolver(self.client, self.cache)
-
-        # 图标颜色统一取自调色板,后续接深色主题只需换成 icons.palette("dark")
-        self._palette = palette("light")
+        self.client = client if client is not None else BilibiliClient()
+        self.cache = cache if cache is not None else AudioCache()
+        self.config_store = config_store if config_store is not None else ConfigStore()
+        self.playback = (
+            playback
+            if playback is not None
+            else PlaybackController(
+                AudioResolver(self.client, self.cache), PlayerController(self)
+            )
+        )
 
         self._videos: list[Video] = []
-        self._current: Video | None = None
-        self._current_page = 1
-        # 拖动进度条时不要被播放位置回写打断
-        self._seeking = False
+        #: 最近一次位置信号里的毫秒数;落盘只在切歌与退出时做(见 _remember_position)
+        self._position_ms = 0
+        self._config = self.config_store.load()
+        #: 当前主题的图标调色板;由 _apply_theme 填,各控件按它重绘
+        self._colors: Palette = palette("light")
+        self.cover_loader = CoverLoader(self.client.fetch_cover)
 
         self._build_ui()
         self._connect()
+        self._apply_config()
 
     # ------------------------------------------------------------ 构建界面
 
     def _build_ui(self) -> None:
-        """一次性搭好所有控件并塞进布局。
-
-        刻意不做"按需创建控件"的懒加载:控件总数只有十几个,启动成本可以忽略,
-        而集中构建让布局结构一眼可见。
-        """
+        """组装搜索行、结果列表、队列抽屉与播放条。"""
         root = QWidget()
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(12, 12, 12, 8)
         layout.setSpacing(8)
 
-        # --- 搜索行 ---
-        search_row = QHBoxLayout()
+        layout.addLayout(self._build_search_row())
+
+        content = QHBoxLayout()
+        content.setSpacing(8)
+        content.addLayout(self._build_result_column(), 1)
+
+        self.queue_drawer = QueueDrawer()
+        content.addWidget(self.queue_drawer)
+        layout.addLayout(content, 1)
+
+        self.player_bar = PlayerBar()
+        layout.addWidget(self.player_bar)
+
+        self.setCentralWidget(root)
+
+    def _build_search_row(self) -> QHBoxLayout:
+        """建"搜索框 + 搜索按钮"这一行。"""
+        row = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("搜索 B站音乐视频,例如:周杰伦 MV")
         self.search_input.returnPressed.connect(self.on_search)
+
         self.search_button = QPushButton("搜索")
         self.search_button.setIcon(
-            get_icon(
-                "search",
-                self._palette.muted,
-                BUTTON_ICON_SIZE,
-                disabled_color=self._palette.disabled,
-            )
+            get_icon("search", palette("light").muted, 18)
         )
-        self.search_button.setIconSize(QSize(BUTTON_ICON_SIZE, BUTTON_ICON_SIZE))
         self.search_button.clicked.connect(self.on_search)
-        search_row.addWidget(self.search_input, 1)
-        search_row.addWidget(self.search_button)
-        layout.addLayout(search_row)
 
-        # --- 结果表格 ---
-        self.table = QTableWidget(0, len(_TABLE_COLUMNS))
-        self.table.setHorizontalHeaderLabels(list(_TABLE_COLUMNS))
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.verticalHeader().setVisible(False)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for col in range(1, len(_TABLE_COLUMNS)):
-            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.doubleClicked.connect(self.on_row_activated)
-        layout.addWidget(self.table, 1)
+        # 主题切换用文字而不是图标:仓库里没有合适的"月亮/太阳"图标,而按钮上写清
+        # "点了会变成什么"比一个需要猜的图标更直接
+        self.theme_button = QPushButton()
+        self.theme_button.setToolTip("切换浅色 / 深色主题")
+        self.theme_button.clicked.connect(self._toggle_theme)
 
-        # --- 分P选择(仅多P视频显示) ---
-        self.page_row = QWidget()
-        page_layout = QHBoxLayout(self.page_row)
-        page_layout.setContentsMargins(0, 0, 0, 0)
-        page_layout.addWidget(QLabel("分P"))
-        self.page_combo = QComboBox()
-        self.page_combo.setMinimumWidth(360)
-        self.page_combo.activated.connect(self.on_page_changed)
-        page_layout.addWidget(self.page_combo, 1)
-        self.page_row.setVisible(False)
-        layout.addWidget(self.page_row)
+        row.addWidget(self.search_input, 1)
+        row.addWidget(self.search_button)
+        row.addWidget(self.theme_button)
+        return row
 
-        # --- 播放信息 ---
-        self.now_playing = QLabel("未播放")
-        self.now_playing.setStyleSheet("font-weight: 600;")
-        layout.addWidget(self.now_playing)
+    def _build_result_column(self) -> QVBoxLayout:
+        """建"结果表格 + 状态 + 进度条"这一列。"""
+        column = QVBoxLayout()
+        column.setSpacing(4)
+
+        self.result_list = TrackList(_SEARCH_COLUMNS, stretch_column=0)
+        self.result_list.row_activated.connect(self._on_result_activated)
+        self.result_list.row_menu_requested.connect(self._on_result_menu)
+        column.addWidget(self.result_list, 1)
 
         self.status_label = QLabel("就绪")
-        self.status_label.setStyleSheet(f"color: {self._palette.muted};")
-        layout.addWidget(self.status_label)
+        self.status_label.setStyleSheet(f"color: {palette('light').muted};")
+        column.addWidget(self.status_label)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setVisible(False)
-        layout.addWidget(self.progress)
-
-        # --- 播放控制 ---
-        control_row = QHBoxLayout()
-        # 播放/暂停共用一个按钮,靠图标和 tooltip 表达状态,不再用 ▶ / ⏸ 字符
-        self.play_button = QPushButton()
-        self.play_button.setFixedSize(36, 36)
-        self.play_button.setIcon(self._transport_icon("play"))
-        self.play_button.setIconSize(QSize(BUTTON_ICON_SIZE, BUTTON_ICON_SIZE))
-        self.play_button.setToolTip("播放")
-        self.play_button.clicked.connect(self.on_toggle_play)
-
-        self.position_label = QLabel("0:00")
-        self.duration_label = QLabel("0:00")
-
-        self.position_slider = QSlider(Qt.Orientation.Horizontal)
-        self.position_slider.setRange(0, 0)
-        self.position_slider.sliderPressed.connect(self._on_slider_pressed)
-        self.position_slider.sliderReleased.connect(self._on_slider_released)
-
-        volume_label = QLabel("音量")
-        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self.volume_slider.setRange(0, 100)
-        # 与播放器默认音量保持同源,避免"控件显示 80 而实际音量是别的值"
-        self.volume_slider.setValue(round(DEFAULT_VOLUME * 100))
-        self.volume_slider.setFixedWidth(120)
-        self.volume_slider.valueChanged.connect(lambda v: self.player.set_volume(v / 100))
-
-        control_row.addWidget(self.play_button)
-        control_row.addWidget(self.position_label)
-        control_row.addWidget(self.position_slider, 1)
-        control_row.addWidget(self.duration_label)
-        control_row.addWidget(volume_label)
-        control_row.addWidget(self.volume_slider)
-        layout.addLayout(control_row)
-
-        self.setCentralWidget(root)
+        column.addWidget(self.progress)
+        return column
 
     def _connect(self) -> None:
-        """把播放器的信号接到界面槽上(只连一次,避免重复 emit 触发多次刷新)。"""
-        self.player.state_changed.connect(self._on_state_changed)
-        self.player.position_changed.connect(self._on_position_changed)
-        self.player.track_finished.connect(self._on_track_finished)
-        self.player.error_occurred.connect(self._on_player_error)
+        """把界面信号接到编排层,把编排层信号接到界面。"""
+        self.playback.track_changed.connect(self._on_track_changed)
+        self.playback.audio_ready.connect(self._on_audio_ready)
+        self.playback.queue_changed.connect(self._on_queue_changed)
+        self.playback.mode_changed.connect(self._on_mode_changed)
+        self.playback.state_changed.connect(self.player_bar.set_playing)
+        self.playback.position_changed.connect(self._on_position_changed)
+        self.playback.progress.connect(self._on_progress)
+        self.playback.error_occurred.connect(self._on_error)
+        self.playback.stopped.connect(self._on_stopped)
+
+        self.player_bar.play_toggled.connect(self.playback.toggle)
+        self.player_bar.next_requested.connect(self._on_next)
+        self.player_bar.previous_requested.connect(self.playback.previous)
+        self.player_bar.mode_changed.connect(self.playback.set_mode)
+        self.player_bar.quality_changed.connect(self.playback.set_quality)
+        self.player_bar.seek_requested.connect(self.playback.seek)
+        self.player_bar.volume_changed.connect(self._on_volume_changed)
+
+        self.queue_drawer.row_activated.connect(self.playback.jump_to)
+        self.queue_drawer.remove_requested.connect(self.playback.remove_at)
+        self.queue_drawer.clear_requested.connect(self.playback.clear)
+
+        self.cover_loader.loaded.connect(self._on_cover_loaded)
+        self.cover_loader.failed.connect(self._on_cover_failed)
 
     def _apply_window_icon(self) -> None:
         """设置窗口/任务栏图标。
@@ -228,20 +210,28 @@ class MainWindow(QMainWindow):
             return
         self.setWindowIcon(icon)
 
-    # ------------------------------------------------------------ 交互
+    def _apply_config(self) -> None:
+        """把读到的配置推给播放器、播放条与主题(音量、播放模式、深浅色)。"""
+        volume = self._config.volume / 100.0
+        self.player_bar.set_volume(volume)
+        self.playback.set_volume(volume)
+        self.player_bar.set_mode(self._config.play_mode)
+        self.playback.set_mode(self._config.play_mode)
+        self._apply_theme(self._config.theme)
+
+    # ------------------------------------------------------------ 搜索
 
     def on_search(self) -> None:
         """发起搜索(回车或点按钮都会走到这里)。
 
-        立刻禁用按钮并置提示,再发请求 —— 请求是异步的,不先禁用的话
-        连点几次会产生多个并发请求,白白消耗风控额度。
+        请求是异步的:先把按钮禁掉再发,否则用户连点会叠出多个搜索请求,
+        在这个接口上等于自找风控。
         """
         keyword = self.search_input.text().strip()
         if not keyword:
             return
         self.search_button.setEnabled(False)
         self.status_label.setText(f"正在搜索「{keyword}」…")
-        # 回调式:请求发出后立即返回,界面不会卡住
         self.client.search_video(
             keyword,
             on_success=self._on_search_done,
@@ -249,95 +239,161 @@ class MainWindow(QMainWindow):
         )
 
     def _on_search_done(self, result: SearchResult) -> None:
-        """搜索成功:填表格并显示结果统计。"""
+        """搜索成功:填表并把分P列标成未知(要等详情接口才知道)。"""
         self.search_button.setEnabled(True)
-        self._videos = result.videos
-        self._fill_table()
-        self.status_label.setText(
-            f"共 {result.total} 条结果,本页 {len(result.videos)} 条"
+        self._videos = list(result.videos)
+        self.result_list.set_rows(
+            [
+                (
+                    video.title,
+                    video.author,
+                    video.duration_text,
+                    _UNKNOWN_PAGES,
+                    format_count(video.play_count),
+                )
+                for video in self._videos
+            ]
         )
+        self.result_list.set_highlight(-1)
+        self.status_label.setText(f"共 {result.total} 条结果,本页 {len(result.videos)} 条")
 
     def _on_search_failed(self, exc: Exception) -> None:
-        """搜索失败:恢复按钮可用并弹错误。"""
+        """搜索失败:恢复按钮并如实报错。"""
         self.search_button.setEnabled(True)
         self._fail(f"搜索失败:{exc}")
 
-    def _fill_table(self) -> None:
-        """按当前搜索结果重建表格。
-
-        整体重建而不是增量更新:一页最多 30 行,重建成本可以忽略,
-        却省掉了"新结果比旧结果少时残留旧行"这类同步 bug。
-        """
-        self.table.setRowCount(0)
-        for video in self._videos:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            self.table.setItem(row, 0, QTableWidgetItem(video.title))
-            self.table.setItem(row, 1, QTableWidgetItem(video.author))
-            self.table.setItem(row, 2, QTableWidgetItem(video.duration_text))
-            # 分P数只有详情接口才知道,搜索结果里先标"?"
-            self.table.setItem(row, 3, QTableWidgetItem("?"))
-            self.table.setItem(row, 4, QTableWidgetItem(format_count(video.play_count)))
-
-    def on_row_activated(self, index) -> None:
-        """双击某一行:播放对应的视频。
-
-        Args:
-            index: 被双击的单元格索引(取 ``row()`` 定位视频)。
-        """
-        row = index.row()
+    def _video_at(self, row: int) -> Video | None:
+        """取某一行对应的视频;越界返回 ``None``。"""
         if 0 <= row < len(self._videos):
-            self.play_video(self._videos[row])
+            return self._videos[row]
+        return None
 
-    def on_page_changed(self) -> None:
-        """下拉框切换分P:重新解析并播放该分P。"""
-        page_index = self.page_combo.currentData()
-        if page_index is None or self._current is None:
+    def _on_result_activated(self, row: int) -> None:
+        """双击搜索结果:整个结果列表成为队列,从这一行开始播。"""
+        if self._video_at(row) is None:
             return
-        self._start_resolve(self._current, int(page_index))
-
-    def play_video(self, video: Video) -> None:
-        """选中一个视频:取分P信息 -> 解析并播放第 1P。
-
-        面板上的文字先按搜索结果里的信息填一遍,不等详情回来 ——
-        详情请求有网络延迟,先填能让双击立刻有反馈。
-        """
-        self.resolver.cancel()
-        self._current = video
-        self._current_page = 1
-        self.now_playing.setText(f"♪ {video.title} — {video.author}")
-        self.duration_label.setText(video.duration_text)
-        self.status_label.setText("正在获取分P信息…")
-        self._start_resolve(video, 1)
-
-    def _start_resolve(self, video: Video, page_index: int) -> None:
-        """统一的"开始解析某个分P"入口(首次播放与自动下一首都走它)。
-
-        进度条切成不定长(``setRange(0, 0)``)表示"忙碌中":
-        这时还不知道文件总大小,给确定区间只会显示一个假的 0%。
-        """
-        self._current_page = page_index
-        self._set_page_combo(page_index)
-        self.status_label.setText("正在解析音源…")
-        self.progress.setVisible(True)
-        self.progress.setRange(0, 0)  # 不定长进度,表示"忙碌"
-        self.play_button.setEnabled(False)
-
-        self.resolver.resolve(
-            video,
-            page_index=page_index,
-            on_success=self._on_resolved,
-            on_error=self._on_resolve_failed,
-            on_progress=self._on_progress,
+        self.playback.play_queue(
+            [QueueItem(video=video) for video in self._videos], start=row
         )
 
-    # ------------------------------------------------------------ 播放回调
+    def _on_result_menu(self, row: int, position) -> None:  # noqa: ANN001 - QPoint
+        """搜索结果右键菜单:播放 / 下一首播放 / 加入队列 / 在B站打开。"""
+        video = self._video_at(row)
+        if video is None:
+            return
+        menu = QMenu(self)
+        play_action = menu.addAction("播放")
+        next_action = menu.addAction("下一首播放")
+        queue_action = menu.addAction("加入队列")
+        menu.addSeparator()
+        open_action = menu.addAction("在B站打开")
+
+        chosen = menu.exec(position)
+        if chosen is play_action:
+            self._on_result_activated(row)
+        elif chosen is next_action:
+            self.playback.enqueue_next(QueueItem(video=video))
+        elif chosen is queue_action:
+            self.playback.enqueue(QueueItem(video=video))
+        elif chosen is open_action:
+            QDesktopServices.openUrl(QUrl(video.web_url))
+
+    # ------------------------------------------------------------ 编排层回调
+
+    def _on_track_changed(self, item: QueueItem) -> None:
+        """换曲目:先把上一首的进度落盘,再更新界面。"""
+        self._remember_position()
+        # 清掉上一首的封面(空 URL 会让加载器立刻发 failed → 显示占位图)。
+        # 顺带把"在飞的旧封面请求"作废,否则它回来时会被当成当前封面贴上。
+        self.cover_loader.load("")
+        self.status_label.setText(f"正在解析「{item.title}」…")
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)  # 不定长进度,表示"忙碌"
+        self.result_list.set_highlight(self._result_row_for(item.video.bvid))
+        self.queue_drawer.set_current(self.playback.queue.current_index)
+
+    def _on_audio_ready(self, resolved: ResolvedAudio) -> None:
+        """音源就绪:更新标题、音质、时长,并记下"上次播的是哪一首"。"""
+        self.progress.setVisible(False)
+        track = resolved.track
+        self.player_bar.set_now_playing(
+            resolved.display_title,
+            f"{resolved.subtitle} · {track.label}({track.kbps} kbps)",
+        )
+        self.status_label.setText(f"已缓存 {resolved.path.name}")
+        self.setWindowTitle(f"BiliMusic - {resolved.display_title}")
+        self._mark_page_count(resolved)
+        # 封面是异步的,而且允许失败:拿不到就用占位图,不打断播放
+        self.cover_loader.load(resolved.video.cover_https)
+        # 位置的落盘交给切歌与退出,这里只更新内存里的"上次播的是哪一首"
+        self._config.last_bvid = resolved.video.bvid
+        self._config.last_cid = resolved.page.cid
+
+    def _on_cover_loaded(self, url: str, pixmap: QPixmap) -> None:
+        """封面到了就贴上;若已经切歌则忽略。
+
+        加载器内部已经拦了一道过期响应,这里再确认一次是因为"当前"的含义在这里
+        更严:只有仍是正在播的那一首的封面才配上屏。
+        """
+        if self.cover_loader.is_current(url):
+            self.player_bar.set_cover(pixmap)
+
+    def _on_cover_failed(self, url: str) -> None:
+        """封面拿不到:退回占位图,不提示用户(为一张图打断播放不划算)。"""
+        if url and not self.cover_loader.is_current(url):
+            return
+        self.player_bar.set_cover(None)
+
+    # ------------------------------------------------------------ 主题
+
+    def _toggle_theme(self) -> None:
+        """在浅色与深色之间切换并落盘。"""
+        name = "light" if self._config.theme == "dark" else "dark"
+        self._config.theme = name
+        self._apply_theme(name)
+        self._save_config()
+
+    def _apply_theme(self, name: str) -> None:
+        """套用主题:应用级调色板 + 各控件的图标与文字颜色。
+
+        为什么要逐块通知:``QPalette`` 只管控件的底/字/选中色,**图标是 SVG 栅格化
+        出来的位图**,不重新染色就会保持旧主题的颜色。
+
+        Args:
+            name: ``"light"`` 或 ``"dark"``。
+
+        Raises:
+            ValueError: 主题名未知(由 :func:`~bilibili_music.ui.theme.apply_theme` 抛出)。
+        """
+        app = QApplication.instance()
+        self._colors = apply_theme(app, name) if app is not None else palette(name)
+        self.status_label.setStyleSheet(f"color: {self._colors.muted};")
+        self.search_button.setIcon(get_icon("search", self._colors.muted, 18))
+        self.player_bar.apply_palette(self._colors)
+        self.queue_drawer.apply_palette(self._colors)
+        # 按钮文字表示"点了会变成什么",不是当前主题
+        self.theme_button.setText("浅色" if name == "dark" else "深色")
+
+    def _on_queue_changed(self) -> None:
+        """队列内容变了:重建抽屉列表并高亮当前项。"""
+        self.queue_drawer.set_items(
+            self.playback.queue.items, self.playback.queue.current_index
+        )
+
+    def _on_mode_changed(self, mode) -> None:  # noqa: ANN001 - PlayMode
+        """播放模式变了:同步按钮外观并落盘(值没变就不写文件)。"""
+        self.player_bar.set_mode(mode)
+        if self._config.play_mode != mode:
+            self._config.play_mode = mode
+            self._save_config()
+
+    def _on_position_changed(self, position: int, duration: int) -> None:
+        """播放位置变化:推给播放条,并记住毫秒数备落盘。"""
+        self.player_bar.set_position(position, duration)
+        self._position_ms = max(0, position)
 
     def _on_progress(self, done: int, total: int) -> None:
-        """下载进度:有总长就显示百分比 + MB,没有就只显示已下载量。
-
-        ``total`` 为 0 是常见情况 —— CDN 不一定会给 ``Content-Length``。
-        """
+        """缓存进度:总长已知时显示百分比,未知时只显示已收字节。"""
         if total > 0:
             self.progress.setRange(0, 100)
             self.progress.setValue(int(done / total * 100))
@@ -347,143 +403,75 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText(f"缓存中 {done / 1048576:.1f} MB")
 
-    def _on_resolved(self, resolved: ResolvedAudio) -> None:
-        """音源就绪:刷新分P列表、更新状态文字,然后交给播放器加载本地文件。"""
+    def _on_volume_changed(self, volume: float) -> None:
+        """音量变了:转给播放器并落盘。"""
+        self.playback.set_volume(volume)
+        level = int(round(volume * 100))
+        if self._config.volume != level:
+            self._config.volume = level
+            self._save_config()
+
+    def _on_next(self) -> None:
+        """下一首:到底了就如实说,不让按钮看起来像坏了。"""
+        if not self.playback.next():
+            self.status_label.setText("已经是最后一首")
+
+    def _on_stopped(self) -> None:
+        """编排层说没有下一项了。"""
         self.progress.setVisible(False)
-        self.play_button.setEnabled(True)
-        self._refresh_pages(resolved.video)
-        page = resolved.page
-        self.status_label.setText(
-            f"音质 {resolved.track.label}({resolved.track.kbps} kbps) · "
-            f"P{page.index} {page.duration_text} · 已缓存 {resolved.path.name}"
-        )
-        self.now_playing.setText(f"♪ {resolved.display_title} — {resolved.subtitle}")
-        self.player.load(resolved.path, autoplay=True)
-        self.setWindowTitle(f"BiliMusic - {resolved.display_title}")
+        self.status_label.setText("播放结束")
 
-    def _on_resolve_failed(self, exc: Exception) -> None:
-        """解析/下载失败:弹窗提示(消息里已带足够定位信息)。"""
-        self._fail(str(exc))
+    def _on_error(self, message: str) -> None:
+        """解析或播放失败:状态栏 + 弹窗(失败必须让用户看见)。"""
+        self._fail(message)
 
-    def on_toggle_play(self) -> None:
-        """播放/暂停按钮的槽(状态图标由 ``state_changed`` 回写)。"""
-        self.player.toggle()
+    # ------------------------------------------------------------ 配置
 
-    # ------------------------------------------------------------ 分P下拉框
+    def _remember_position(self) -> None:
+        """把"上一首播到哪"写进配置。
 
-    def _refresh_pages(self, video: Video) -> None:
-        """把已知的分P列表填进下拉框,并把表格里的分P数补上。
-
-        填充期间 ``blockSignals(True)``:``clear()`` + ``addItem()`` 会连环触发
-        ``activated``,不挡掉就会在刷新列表的过程中又发起一次解析。
+        位置信号每几百毫秒就来一次,每次都落盘会把磁盘写花,所以只在**切歌**与
+        **退出**这两个时刻保存。此时 ``last_bvid`` / ``last_cid`` 记的仍是上一首
+        (新一首的 ``audio_ready`` 还没到),正好对上这个位置。
         """
-        self.page_combo.blockSignals(True)
-        self.page_combo.clear()
-        for page in video.pages:
-            self.page_combo.addItem(page.label, page.index)
-        self.page_row.setVisible(video.is_multipart)
-        self._set_page_combo(self._current_page)
-        self.page_combo.blockSignals(False)
+        self._config.last_position_ms = self._position_ms
+        self._save_config()
 
-        for row, item in enumerate(self._videos):
-            if item.bvid == video.bvid and video.pages:
-                cell = self.table.item(row, 3)
-                if cell is not None:
-                    cell.setText(str(len(video.pages)))
-                break
-
-    def _set_page_combo(self, page_index: int) -> None:
-        """把下拉框同步到正在播放的分P,不触发切换信号。
-
-        必须挡信号:自动播放 P2 时若触发 ``activated``,会再发起一次对同一分P的解析,
-        等于把刚下好的音频又解析一遍。
-        """
-        self.page_combo.blockSignals(True)
-        for i in range(self.page_combo.count()):
-            if self.page_combo.itemData(i) == page_index:
-                self.page_combo.setCurrentIndex(i)
-                break
-        self.page_combo.blockSignals(False)
-
-    # ------------------------------------------------------------ 播放器回调
-
-    def _on_state_changed(self, playing: bool) -> None:
-        """播放状态变化:同步按钮图标与 tooltip。"""
-        self.play_button.setIcon(self._transport_icon("pause" if playing else "play"))
-        self.play_button.setToolTip("暂停" if playing else "播放")
-
-    def _on_position_changed(self, position: int, duration: int) -> None:
-        """播放位置/总时长变化:更新进度条与两个时间标签。
-
-        拖动中(``self._seeking``)不写回滑块位置 —— 否则用户的手和播放器会互相
-        抢滑块,表现为"拖不动"。
-        """
-        if duration > 0:
-            self.position_slider.setRange(0, duration)
-        if not self._seeking:
-            self.position_slider.setValue(position)
-            self.position_label.setText(self.player.format_ms(position))
-        self.duration_label.setText(self.player.format_ms(duration))
-
-    def _on_track_finished(self) -> None:
-        """播完自动跳下一个分P(多P合集时相当于自动下一首)。
-
-        单P视频与最后一个分P都只是改状态文字,不做任何自动重播 ——
-        音乐区合集很长,连续自动播放本身就已经够激进的了。
-        """
-        video = self._current
-        if video is None or not video.is_multipart:
-            self.status_label.setText("播放结束")
-            return
-        next_index = self._current_page + 1
-        if video.page(next_index) is None:
-            self.status_label.setText("播放结束(已是最后一个分P)")
-            return
-        self.status_label.setText(f"自动播放 P{next_index}…")
-        self._start_resolve(video, next_index)
-
-    def _on_slider_pressed(self) -> None:
-        """按下进度条:进入"拖动中",暂停位置回写。"""
-        self._seeking = True
-
-    def _on_slider_released(self) -> None:
-        """松开进度条:退出拖动状态并真正跳转。"""
-        self._seeking = False
-        self.player.seek(self.position_slider.value())
-
-    def _on_player_error(self, message: str) -> None:
-        """播放器报错:只改状态栏,不弹窗。
-
-        播放失败通常只是单个文件的问题(编码不支持、文件被占用),
-        弹窗会打断"自动下一首"的连续播放体验。
-        """
-        self.status_label.setText(f"播放错误:{message}")
+    def _save_config(self) -> None:
+        """写配置;失败只提示,绝不让播放中断。"""
+        try:
+            self.config_store.save(self._config)
+        except OSError as exc:
+            self.status_label.setText(f"配置保存失败:{exc}")
 
     # ------------------------------------------------------------ 工具
 
-    def _transport_icon(self, name: str) -> QIcon:
-        """取一个播放控件图标(走调色板,带禁用态)。"""
-        return get_icon(
-            name,
-            self._palette.text,
-            BUTTON_ICON_SIZE,
-            disabled_color=self._palette.disabled,
-        )
+    def _result_row_for(self, bvid: str) -> int:
+        """在搜索结果里找某个视频的行号,找不到返回 ``-1``。"""
+        for row, video in enumerate(self._videos):
+            if video.bvid == bvid:
+                return row
+        return -1
+
+    def _mark_page_count(self, resolved: ResolvedAudio) -> None:
+        """详情补全后,把结果表里那一行的"分P"列填成真实数量。"""
+        if not resolved.video.pages:
+            return
+        row = self._result_row_for(resolved.video.bvid)
+        if row >= 0:
+            self.result_list.set_cell(row, 3, str(len(resolved.video.pages)))
 
     def _fail(self, message: str) -> None:
-        """统一的失败展示:收起进度、恢复按钮、写状态栏并弹窗。"""
+        """统一失败出口:收进度条、恢复按钮、提示用户。"""
         self.progress.setVisible(False)
-        self.play_button.setEnabled(True)
         self.status_label.setText(message)
         QMessageBox.warning(self, "出错了", message)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt 命名
-        """关窗时按依赖顺序收尾,避免留下在途请求与还在出声的播放器。
-
-        顺序是先取消解析(让下载回调不再碰界面)、再停播放器、最后关网络。
-        """
-        self.resolver.cancel()
-        self.player.stop()
+        """退出前落盘进度,并停掉在飞的解析与播放。"""
+        self._config.last_position_ms = self._position_ms
+        self._save_config()
+        self.playback.stop()
         self.client.close()
         super().closeEvent(event)
 

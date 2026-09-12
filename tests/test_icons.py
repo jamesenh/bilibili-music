@@ -2,8 +2,12 @@
 
 这些测试**只用内存位图,不碰磁盘临时目录**,也不触网。
 
-Qt 需要有 ``QGuiApplication`` 才能建 ``QPixmap``,所以这里在导入被测模块前先强制
-离屏平台并创建一个应用 —— 与 ``scripts/_helpers.py::ensure_app`` 的理由一致。
+Qt 需要有应用实例才能建 ``QPixmap``,所以这里在导入被测模块前先强制离屏平台并创建
+一个应用 —— 与 ``scripts/_helpers.py::ensure_app`` 的理由一致。
+
+**用 ``QApplication`` 而不是 ``QGuiApplication``**:整个测试进程只能有一个应用实例,
+而 ``tests/test_ui_wiring.py`` 要造 ``QWidget``,只建了 ``QGuiApplication`` 的话
+"谁先跑谁说了算",widget 用例会在全量跑时突然起不来(``AGENTS.md`` 第 5 节同一条口径)。
 """
 
 from __future__ import annotations
@@ -15,11 +19,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-# 必须在创建 QGuiApplication 之前设置,否则无显示环境下起不来
+# 必须在创建应用实例之前设置,否则无显示环境下起不来
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-# 注意导入顺序:先 QtGui/QtWidgets 再 QtCore(见 scripts/_helpers.py 的说明)
+# 注意导入顺序:先 QtWidgets/QtGui 再 QtCore(见 scripts/_helpers.py 的说明)
 from PySide6.QtGui import QGuiApplication, QIcon  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
 from PySide6.QtCore import QSize  # noqa: E402
 
 from bilibili_music.ui import icons as icons_mod  # noqa: E402
@@ -36,9 +41,9 @@ from bilibili_music.ui.icons import (  # noqa: E402
 )
 
 
-def _app() -> QGuiApplication:
-    """确保存在 QGuiApplication(幂等)。"""
-    return QGuiApplication.instance() or QGuiApplication(sys.argv)
+def _app() -> QApplication:
+    """确保存在 QApplication(幂等);已有实例时直接复用。"""
+    return QApplication.instance() or QApplication(sys.argv)
 
 
 class TestIconResources(unittest.TestCase):
@@ -66,6 +71,8 @@ class TestIconResources(unittest.TestCase):
             "volume",
             "volume-mute",
             "repeat",
+            "repeat-one",
+            "shuffle",
             "list",
             "heart",
             "close",
