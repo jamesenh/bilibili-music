@@ -28,13 +28,17 @@
 
 **当前阶段**：MVP 端到端已跑通（搜索 → 分P → 音轨 → 缓存 → 播放），两种网络后端可互换。
 
+**后续做什么看哪份文档**：下一阶段做什么、依赖顺序、以及**已拍板的决策**（例如账号能力
+当前冻结）一律见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。**不要在路线图之外自行扩范围**；
+本文件第 1.4 节的跑偏清单优先于路线图里的任何登记项。
+
 ### 1.1 技术栈（锁定，不要擅自替换）
 
 | 项 | 取值 | 说明 |
 |---|---|---|
 | GUI | PySide6 **6.8.3** | 只做桌面，不做 Web/TUI |
 | Python | **3.11**（`.python-version`） | `requires-python = ">=3.11,<3.14"`，**不能用 3.14** |
-| 依赖管理 | `uv` | 新增依赖前先问；能用 Qt 自带的就不加包 |
+| 依赖管理 | `uv` | 新增依赖前先问；能用 Qt 自带的就不加包（但 `core` 不许 import Qt，见 4.1；`json` 这类标准库方案同样不新增依赖） |
 | 网络 | `QNetworkAccessManager`（默认）+ `urllib`（对照） | 两者接口必须一致，可 `--backend` 切换 |
 | 播放 | `QMediaPlayer` + `QAudioOutput` | 只播**本地音频文件** |
 | 本地存储 | 文件缓存（`core/cache.py`，原子写入） | 不引入数据库/ORM |
@@ -92,10 +96,10 @@ docstring **必须用中文陈述**。专有名词、参数名、B站接口字�
 不要硬译（写 `QNetworkAccessManager`、`cid`、`fnval=16`、`buvid3`，不要写"网络访问管理器"）。
 
 ```python
-def pick_best_cached(cache: AudioCache, video: Video, page: Page) -> Path | None:
+def pick_best_cached(cache: AudioCache, video: Video, page: Page) -> CachedHit | None:
     """盲查缓存:不知道实际音质时,按常见档位从高到低试。
 
-    用于界面预判(命中时可以直接播放,不用先发 playurl 请求)。
+    用于在请求 playurl **之前**预判(命中就能直接开播,省掉整次网络请求)。
 
     Args:
         cache: 音频缓存实例。
@@ -103,7 +107,7 @@ def pick_best_cached(cache: AudioCache, video: Video, page: Page) -> Path | None
         page: 目标分P,提供 ``cid``。
 
     Returns:
-        命中的缓存文件路径;全部档位都未命中时返回 ``None``。
+        命中的档位、codec 与文件路径;全部档位都未命中时返回 ``None``。
     """
 ```
 
@@ -158,7 +162,9 @@ def pick_best_cached(cache: AudioCache, video: Video, page: Page) -> Path | None
 - **项目内引用一律相对导入**（`from ..core.errors import ...`），禁止把 `src` 路径塞进
   `sys.path`（`tests/` 与 `scripts/` 的引导除外）。
 - **Qt 枚举写全限定名**（`QHeaderView.ResizeMode.Stretch`），不要用已废弃的短名。
-- **禁止 `sleep` 阻塞事件循环**；定时一律 `QTimer`。
+- **禁止在 Qt 路径里 `sleep` 阻塞事件循环**；定时一律 `QTimer`。既有的 `time.sleep`
+  只出现在同步的 `net/urllib_client.py`（它没有事件循环，退避与限速只能阻塞等待），
+  **不要**把这个写法照搬进任何 Qt 代码路径。
 - 新增依赖前先确认 Qt 自带能力不够用，并**先征得用户同意**。
 
 ---
@@ -173,6 +179,7 @@ net/    网络后端(两种实现,同一个 Protocol 契约)
 api/    接口封装 + 纯解析函数(parse_*)
   ↑
 audio/  解析状态机(AudioResolver) + 播放器封装(PlayerController)
+        + 播放编排(PlaybackController,串起队列/解析/播放)
   ↑
 ui/     界面(依赖以上全部)
 ```
@@ -187,6 +194,45 @@ ui/     界面(依赖以上全部)
 - **界面层不要线程**：网络全部是 QNAM 信号回调，UI / `audio` / Qt 后端里**禁止新增
   `QThread` 或 `threading` 线程**，除非用户明确要求并说明理由。（`net/urllib_client.py`
   里的 `threading.Lock` 只用于同步后端的自我保护，不是线程池，不要当模板照抄。）
+
+### 4.1 Qt 的边界（`core` 为什么禁止 import Qt）
+
+这条规则的目的**不是**"让代码能在没装 Qt 的机器上跑" —— `PySide6` 是本项目的硬依赖
+（见 `pyproject.toml`），那个说法不成立。真正的目的是两条：
+
+1. **可测性**：`core` 的测试不需要创建 `QApplication`、不初始化平台插件、不需要显示器
+   或事件循环，随时都能直接跑（现状即如此：`tests/test_core.py` 一个 Qt 实例都不建）。
+2. **规则必须可机械判定**："允许 QtCore 但不许 QtWidgets"这类规则会一路滑坡 —— 先加
+   `QTimer`，再加 `QObject` 信号，最后 `core` 就绑上了事件循环与线程亲和性。而
+   "不 import Qt"一条 grep 就能验，没有解释空间。
+
+**需要平台相关能力（配置目录、数据目录、时区等）时，一律由上层解析后以参数注入，
+禁止为此 import Qt。** 现有范例是 `core/cache.py::AudioCache(root=None)`：`core` 只认
+`Path`，平台目录由调用方决定，测试因此可以注入沙箱目录。
+
+**点名两条最容易踩的：**
+
+- **`QSettings` 一律不进 `core`**。它在 Windows 上默认走 `NativeFormat`，落在注册表
+  （实测 `\HKEY_CURRENT_USER\Software\<Org>\<App>`）：用户看不见、删不掉、无法备份，
+  测试也没法像注入目录那样沙箱化。确要跨平台配置，就写成纯 JSON + `Path` 注入 ——
+  `json` 是标准库，不新增依赖，与"能用 Qt 自带的就不加包"并不冲突。
+- **`QStandardPaths` 也进不了 `core`**。实测在没有 `QCoreApplication`（或未设置
+  `applicationName`）时，它只返回泛化目录（如 `AppData/Local`），拿不到带应用名的正确
+  路径；它天然依赖一个已初始化的 app 实例。真要它，就让 `ui` 解析好再注入。
+
+允许与禁止的分界（现状经实测核对）：
+
+| 分层 | 能否 import Qt | 现状 |
+|---|---|---|
+| `core/` | **禁止** | 0 处引用 |
+| `api/` | 顶层禁止（`parse_*` 必须零 Qt） | 0 处引用；`api/bilibili.py` 对 Qt 后端的**延迟导入**是唯一例外，只为让本模块在无 Qt 环境下也能 import |
+| `net/` | 允许（`QtCore` / `QtNetwork`） | 仅 `client.py` 引用；`base.py` 与 `urllib_client.py` 保持零 Qt |
+| `audio/` | 允许（`QtCore` / `QtMultimedia`） | `player.py` 与 `playback.py`（`QObject` 信号）引用；`resolver.py` 与 `__init__.py` 保持零 Qt |
+| `ui/` | 允许（不限） | 唯一可以创建 `QApplication`、使用 `QSettings` / `QStandardPaths` 的地方；`scripts/` 下的独立辅助脚本例外（见 `scripts/_helpers.py::ensure_app`） |
+
+> 这条属于第 4 节的规则，**不在**第 0 节的三条红线之内。真要放宽，按第 8 节走：说明
+> 违反哪一条、为什么必须、影响是什么，并在交付说明里标注 —— 但请先确认上面那两条收益
+> 确实可以放弃。
 
 ---
 
@@ -221,6 +267,10 @@ README 的「B站接口实测笔记」有完整说明，以下是**编写代码�
 - **纯逻辑新增或行为变更 → 必须补对应单测**；修 bug 必须留下能复现该 bug 的用例。
 - 测试文件命名 `tests/test_<模块>.py`；测试类与方法 docstring 用中文说明**在验证什么**。
 - 网络层契约改动要同步更新 `tests/test_backend_contract.py`，保证两种后端仍一致。
+- **需要临时目录的新增测试一律用"可注入路径"**（例如给被测对象传 `Path`，形如
+  `AudioCache(root=tmp_path)`），不要用 `tempfile.TemporaryDirectory()` —— 前者在 DSH
+  沙箱里也能跑，也不依赖目录清理权限。**既有**依赖 `tempfile` 的用例不要为环境去改
+  （原因见第 7.1 节）。
 
 | 目的 | 命令（在仓库根目录执行） |
 |---|---|
@@ -238,7 +288,8 @@ README 的「B站接口实测笔记」有完整说明，以下是**编写代码�
 
 **任何改动了 `.py` 的任务，只有满足以下全部条件才算完成：**
 
-- [ ] `uv run python -m unittest discover -s tests -v` **全绿**（附上真实结果，不许编造）
+- [ ] `uv run python -m unittest discover -s tests -v` **全绿**（附上真实结果，不许编造）；
+  在 DSH 沙箱里 `uv` 本身起不来，改用 venv 直调，见第 7.1 节
 - [ ] 本次新增/修改的每个模块、类、函数、方法都有**中文 docstring**（见第 2 节）
 - [ ] 关键逻辑有中文「为什么」注释；无过时注释、无调试残留
 - [ ] 公开接口有完整类型注解
@@ -259,12 +310,33 @@ README 的「B站接口实测笔记」有完整说明，以下是**编写代码�
 但**读写/删除已存在的临时目录会被拒绝**（`PermissionError: [WinError 5]`，
 并伴随 `[sandbox: file access denied]`）。这会同时打掉 `uv`（写不了 uv 缓存）和
 `tests/test_core.py` 中所有依赖 `tempfile.TemporaryDirectory()` 的用例。
+（2026-09 实测：19 个用例因此报错，报错点全部落在 `tempfile._resetperms` 的 `chmod` 上。
+用例总数会随开发增长，**以实际输出为准**，不要照抄某个数字。）
 
 判定方法：看报错里有没有 `[sandbox: file access denied ...]` 或 "拒绝访问 / os error 5"。
 
 - 这是**环境限制，不是代码缺陷**，不要为此改测试、改 `core/cache.py` 或删用例。
+- **`uv run ...` 在沙箱里根本起不来**（`Failed to initialize cache at ...\uv\cache`，
+  cause 是 `failed to open file ...\sdists-v9\.git: 拒绝访问`）。所以第 6 节与第 7 节
+  里的 `uv run` 命令在此环境下要改成 venv 直调：
+  `.venv\Scripts\python.exe -m unittest discover -s tests -v`（Windows）。
+- **把 `TEMP` / `TMP` 重定向到工作区内的目录并不能绕过**（实测仍报同一个
+  `PermissionError`），不要在这上面反复尝试。
 - 可先跑不依赖临时目录的模块确认主链路健康：
-  `python -m unittest tests.test_api_parsing tests.test_backend_contract tests.test_icons`
+  `.venv\Scripts\python.exe -m unittest tests.test_api_parsing tests.test_backend_contract tests.test_icons`
+  （2026-09 实测：`Ran 49 tests ... OK`）
+- 沙箱拒绝删除而残留的目录，会让每次 `git status` 刷出一屏 `Permission denied` 警告；
+  清理它需要放宽到更宽的沙箱模式。**不要**为了掩盖这类警告去改 `.gitignore`。
+- **应用自己的数据目录同样写不进去**（2026-09 实测）：`workspace-write` 下冒烟脚本走到
+  下载步会报 `PermissionError: [Errno 13]` 指向
+  `%LOCALAPPDATA%\BiliMusic\Cache\*.m4a.part`，并被标成 `[sandbox: file access denied]`。
+  这是**环境限制**，不要为此改 `core/cache.py`；跑 `scripts/smoke_test.py` 需要放宽沙箱。
+- `scripts/smoke_test.py` 是触网的，结果受 B站风控与时段影响：实测同一个 Qt 后端第一次
+  报 `NetworkError: No credentials (HTTP 0)`、紧接着重跑就全 PASS。**不要**因为一次
+  `HTTP 0` 或一次 412 就去改网络层 —— 先重跑，再怀疑代码。
+- **这些失败完全取决于当前的沙箱模式**：同一套测试在 `danger-full-access` 下实测
+  `Ran 210 tests ... OK`（全绿，含 `test_core` 那 19 个）。所以看到成批
+  `PermissionError` 时，先确认当前沙箱模式，而不是去改代码或改测试。
 - 交付说明里必须**如实标注**这类失败是沙箱导致的，并说明完整测试尚未验证，
   **不许声称"全部通过"**。
 
@@ -291,6 +363,7 @@ README 的「B站接口实测笔记」有完整说明，以下是**编写代码�
 3. 反直觉、平台差异、性能取舍的地方写清"为什么"了吗？
 4. 有没有空话 docstring、复读代码、过期注释、`print` 残留？
 5. 类型注解写全了吗？导入顺序对了吗？
-6. 依赖方向对吗？有没有把 Qt 漏进 `core`？两种后端同步改了吗？
+6. 依赖方向对吗？有没有把 Qt（含 `QSettings` / `QStandardPaths`）漏进 `core`？需要平台
+   能力时是走参数注入而不是 import 吗？两种后端同步改了吗？
 7. 有没有引入 `QThread` / 新依赖 / 第 1.4 节的跑偏功能？
 8. 新纯逻辑补单测了吗？跑测试了吗？结果是真实的吗？
