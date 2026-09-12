@@ -1,7 +1,13 @@
 """把 ``Video`` 的某个分P解析成本地可播放的音频文件(异步)。
 
-流程:补全详情(拿分P与 ``cid``) -> 请求 playurl 拿音轨 -> 选音质 -> 下载到缓存。
-命中缓存时立即回调,不发任何请求。
+流程:补全详情(拿分P与 ``cid``) -> **先盲查缓存** -> 请求 playurl 拿音轨 -> 选音质
+-> 下载到缓存。
+
+盲查缓存(见 :func:`pick_best_cached`)发生在请求 playurl **之前**,已经落盘的歌
+因此能省掉整次网络请求直接开播。代价是这条快路径拿不到接口给的 ``bandwidth``,
+音轨只能按档位取标称码率(见 :func:`~bilibili_music.api.bilibili.track_from_quality`)。
+指定了 ``quality_id`` 时**不走**快路径 —— 那时连 codec 都要等接口返回才知道,
+没法提前拼出缓存键。
 
 **这个模块里没有 QThread**。改造成 QNetworkAccessManager 之后,整个下载过程
 就是"发请求 -> 收进度信号 -> 收完成信号",本来就不需要工作线程。之前用
@@ -22,10 +28,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..api.bilibili import BilibiliClient, pick_best
+from ..api.bilibili import BilibiliClient, pick_best, track_from_quality
 from ..core.cache import AudioCache, DownloadSink
 from ..core.errors import NoAudioSourceError
-from ..core.models import AudioTrack, Page, Video
+from ..core.models import AudioTrack, Page, Video, track_subtitle, track_title
 
 #: 常见音轨的 (quality_id, codec) 组合,用于在不发请求的情况下盲查缓存。
 #:
@@ -54,24 +60,37 @@ class ResolvedAudio:
 
     @property
     def display_title(self) -> str:
-        """界面上显示的名字:多P时优先用分P标题。"""
-        if self.video.is_multipart and self.page.title:
-            return self.page.title
-        return self.video.title
+        """界面上显示的名字(多P时是分P标题)。
+
+        具体规则在 :func:`~bilibili_music.core.models.track_title` 里 ——
+        队列列表也要显示同一套名字,复制一份迟早会不一致。
+        """
+        return track_title(self.video, self.page)
 
     @property
     def subtitle(self) -> str:
         """副标题:UP主 + 分P序号(单P时不显示序号)。"""
-        parts = [self.video.author]
-        if self.video.is_multipart:
-            parts.append(f"P{self.page.index}")
-        return " · ".join(p for p in parts if p)
+        return track_subtitle(self.video, self.page)
 
 
-def pick_best_cached(cache: AudioCache, video: Video, page: Page) -> Path | None:
+@dataclass(slots=True)
+class CachedHit:
+    """一次缓存盲查的命中结果。
+
+    带上 ``quality_id`` 与 ``codec`` 而不是只回一个路径:上层要据此重建
+    :class:`~bilibili_music.core.models.AudioTrack` 才能在界面上显示音质 ——
+    只知道文件在哪是拼不出 :class:`ResolvedAudio` 的。
+    """
+
+    quality_id: int
+    codec: str
+    path: Path
+
+
+def pick_best_cached(cache: AudioCache, video: Video, page: Page) -> CachedHit | None:
     """盲查缓存:不知道实际音质时,按常见档位从高到低试。
 
-    用于界面预判(命中时可以直接播放,不用先发 playurl 请求)。
+    用于在请求 playurl **之前**预判:命中就能直接开播,省掉整次网络请求。
 
     Args:
         cache: 音频缓存实例。
@@ -79,12 +98,12 @@ def pick_best_cached(cache: AudioCache, video: Video, page: Page) -> Path | None
         page: 目标分P,提供 ``cid``。
 
     Returns:
-        命中的缓存文件路径;全部档位都未命中时返回 ``None``。
+        命中的档位、codec 与文件路径;全部档位都未命中时返回 ``None``。
     """
     for quality_id, codec in KNOWN_QUALITIES:
-        hit = cache.lookup(video.bvid, page.cid, quality_id, codec)
-        if hit is not None:
-            return hit
+        path = cache.lookup(video.bvid, page.cid, quality_id, codec)
+        if path is not None:
+            return CachedHit(quality_id=quality_id, codec=codec, path=path)
     return None
 
 
@@ -255,6 +274,16 @@ class AudioResolver:
             )
         state.page = page
 
+        # 盲查缓存在请求 playurl 之前:已落盘的歌直接开播,省掉整次网络请求。
+        # 只在"自动选音质"时走这条路 —— 用户指定了档位时,连 codec 都要等接口
+        # 返回才知道,没法提前拼出缓存键。
+        if state.quality_id is None:
+            hit = pick_best_cached(self.cache, state.video, page)
+            if hit is not None:
+                state.track = track_from_quality(hit.quality_id, hit.codec)
+                self._done(state, hit.path)
+                return
+
         state.handle = self.client.fetch_audio_tracks(
             state.video.bvid,
             page.cid,
@@ -323,7 +352,8 @@ class AudioResolver:
 
 __all__ = [
     "AudioResolver",
-    "ResolvedAudio",
+    "CachedHit",
     "KNOWN_QUALITIES",
+    "ResolvedAudio",
     "pick_best_cached",
 ]

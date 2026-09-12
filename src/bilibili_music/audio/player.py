@@ -81,6 +81,16 @@ class PlayerController(QObject):
         """
         return self._duration_ms
 
+    @property
+    def position_ms(self) -> int:
+        """当前播放位置(毫秒);什么都没加载时为 0。
+
+        直接问播放器,而不是复用最近一次 ``position_changed`` 的值:位置信号的
+        触发频率由 Qt 决定,**暂停期间不会刷新**,拿它当"当前位置"会读到过期值。
+        换音质要按这个位置续播,差一点就能听出来。
+        """
+        return self._player.position()
+
     # ------------------------------------------------------------ 操作
 
     def load(self, path: Path, *, autoplay: bool = True) -> None:
