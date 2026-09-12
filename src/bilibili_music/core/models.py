@@ -20,6 +20,8 @@ __all__ = [
     "Video",
     "format_count",
     "format_duration",
+    "track_subtitle",
+    "track_title",
 ]
 
 
@@ -58,6 +60,45 @@ def format_count(count: int) -> str:
     if count >= 10_000:
         return f"{count / 10_000:.1f}万"
     return str(int(count))
+
+
+def track_title(video: Video, page: Page | None) -> str:
+    """取"这一首要显示的名字"。
+
+    音乐区的多P合集里每个分P是一首独立的歌,所以有分P标题时优先用它;单P视频
+    或分P没标题(部分老视频的 ``part`` 是空串)时退回视频标题。
+
+    抽成模块级函数而不是留在某个类里,是因为队列项与解析结果都要显示这个名字,
+    两边各写一份迟早会不一致。
+
+    Args:
+        video: 目标视频。
+        page: 目标分P;详情未补全或序号越界时传 ``None``。
+
+    Returns:
+        显示用标题。``None`` 的 ``page`` 只会让它退回视频标题,不会返回空串。
+    """
+    if video.is_multipart and page is not None and page.title:
+        return page.title
+    return video.title
+
+
+def track_subtitle(video: Video, page: Page | None) -> str:
+    """取"这一首的副标题":UP主,多P时再附上分P序号。
+
+    单P视频不显示 ``P1``:列表里每行都挂个毫无信息量的 ``P1`` 只是噪声。
+
+    Args:
+        video: 目标视频。
+        page: 目标分P;传 ``None`` 时不显示序号。
+
+    Returns:
+        形如 ``"某UP · P3"``;UP主为空时退化为空串。
+    """
+    parts = [video.author]
+    if video.is_multipart and page is not None:
+        parts.append(f"P{page.index}")
+    return " · ".join(p for p in parts if p)
 
 
 @dataclass(slots=True)
