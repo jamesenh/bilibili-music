@@ -35,15 +35,17 @@ from urllib.parse import urlencode
 from ..core.errors import NoAudioSourceError
 from ..core.headers import API_BASE
 from ..core.models import AudioTrack, Page, Video
-from ..net.base import HttpBackend
+from ..net.base import FetchHandle, HttpBackend
 
 __all__ = [
     "BilibiliClient",
+    "QUALITY_FALLBACK_BPS",
     "SearchResult",
     "parse_audio_tracks",
     "parse_search_result",
     "parse_video",
     "pick_best",
+    "track_from_quality",
 ]
 
 #: 搜索结果里的 HTML 标签(主要是关键字高亮用的 ``<em>``)。
@@ -53,8 +55,11 @@ __all__ = [
 _TAG_RE = re.compile(r"<[^>]+>")
 
 #: 已知的音频码率对照(bit/s),用于在接口未给 ``bandwidth`` 时兜底。
+#:
 #: 数值取各档位的标称值,只用于展示"多少 kbps"与排序,不参与任何鉴权判断。
-_QUALITY_FALLBACK_BPS = {
+#: 公开(不带下划线)是因为 :func:`track_from_quality` 也要用它 —— 缓存命中时
+#: 手上已经没有接口响应可读,只能按档位取标称码率。
+QUALITY_FALLBACK_BPS = {
     30216: 64_000,
     30232: 132_000,
     30280: 192_000,
@@ -260,7 +265,7 @@ def _track_from(
     return AudioTrack(
         quality_id=quality_id,
         codec=item.get("codecs") or "",
-        bandwidth=int(item.get("bandwidth") or _QUALITY_FALLBACK_BPS.get(quality_id, 0)),
+        bandwidth=int(item.get("bandwidth") or QUALITY_FALLBACK_BPS.get(quality_id, 0)),
         url=url,
         mime_type=item.get("mimeType") or "audio/mp4",
         is_lossless=lossless,
@@ -328,6 +333,32 @@ def pick_best(tracks: list[AudioTrack]) -> AudioTrack:
     if not tracks:
         raise NoAudioSourceError("音轨列表为空")
     return max(tracks, key=lambda t: t.bandwidth)
+
+
+def track_from_quality(quality_id: int, codec: str = "") -> AudioTrack:
+    """按音质档位直接造一条 ``AudioTrack``。
+
+    用于**缓存命中**的场景:音频文件已经在本地,不需要再请求 playurl,于是也就
+    拿不到接口给的 ``bandwidth`` 与 ``baseUrl``。此时只能按档位取标称码率。
+
+    Args:
+        quality_id: 音质档位 id,如 ``30280``。
+        codec: 编码串;由缓存键里存下来的那一份原样传入。
+
+    Returns:
+        一条 ``url`` 为空、``bandwidth`` 为**标称值**的音轨。
+
+    Note:
+        标称码率可能与文件真实码率有零头差异(界面会显示成 192 kbps 而不是
+        191.9 kbps)。真实值要等缓存索引把元数据写进 sidecar 之后才能提供。
+        ``url`` 为空是刻意的:这条音轨只服务于"展示 + 播本地文件",不参与下载。
+    """
+    return AudioTrack(
+        quality_id=quality_id,
+        codec=codec,
+        bandwidth=int(QUALITY_FALLBACK_BPS.get(quality_id, 0)),
+        url="",
+    )
 
 
 # ====================================================================== 客户端
@@ -482,6 +513,35 @@ class BilibiliClient:
             on_success(parse_audio_tracks(data.get("data") or {}, bvid=bvid))
 
         return self.backend.get_json(url, on_success=handle_data, on_error=on_error)
+
+    # ------------------------------------------------------------ 封面
+
+    def fetch_cover(
+        self,
+        url: str,
+        *,
+        on_success: Callable[[bytes], None],
+        on_error: ErrorCallback,
+    ) -> FetchHandle | None:
+        """取封面图原始字节。
+
+        走 :meth:`HttpBackend.get_bytes` 而不是 ``get_json``:封面是二进制图片,
+        没有业务 ``code`` 可校验。
+
+        请求头**用后端默认的 API 头即可** —— 实测封面 CDN(``i0.hdslb.com`` /
+        ``i1.hdslb.com``)并不介意 ``Origin``:带与不带都返回 ``200`` 且字节数完全相同。
+        这点与音频 CDN **相反**(那边必须摘掉 ``Origin``,见
+        :func:`~bilibili_music.core.headers.media_headers`),所以不要照搬那条规则。
+
+        Args:
+            url: 封面地址;调用方应传 ``Video.cover_https``(已升级成 https)。
+            on_success: 成功回调,参数是图片原始字节。
+            on_error: 失败回调;这条路径**不重试**(拿不到封面就显示占位图)。
+
+        Returns:
+            可取消的请求句柄;后端未返回句柄时为 ``None``。
+        """
+        return self.backend.get_bytes(url, on_success=on_success, on_error=on_error)
 
     # ------------------------------------------------------------ 收尾
 

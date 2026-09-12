@@ -17,6 +17,7 @@ from bilibili_music.api.bilibili import (  # noqa: E402
     parse_search_result,
     parse_video,
     pick_best,
+    track_from_quality,
 )
 from bilibili_music.core.errors import ApiError, NoAudioSourceError, NetworkError  # noqa: E402
 from bilibili_music.net.base import check_payload  # noqa: E402
@@ -272,6 +273,30 @@ class TestParseAudioTracks(unittest.TestCase):
         """空音轨列表调用 pick_best 必须抛 NoAudioSourceError,而不是返回 None 让调用方踩空。"""
         with self.assertRaises(NoAudioSourceError):
             pick_best([])
+
+
+class TestTrackFromQuality(unittest.TestCase):
+    """缓存命中时按档位重建音轨(拿不到接口响应,只能用标称码率)。"""
+
+    def test_uses_nominal_bandwidth_of_the_quality(self) -> None:
+        """标称码率要能对上档位,否则界面会显示 0 kbps。"""
+        track = track_from_quality(30280, "mp4a.40.2")
+        self.assertEqual(track.quality_id, 30280)
+        self.assertEqual(track.codec, "mp4a.40.2")
+        self.assertEqual(track.bandwidth, 192_000)
+        self.assertEqual(track.kbps, 192)
+        self.assertEqual(track.label, "192K")
+
+    def test_url_is_empty_because_nothing_is_downloaded(self) -> None:
+        """这条音轨只服务于播本地文件,不能带一个会被误下载的 URL。"""
+        self.assertEqual(track_from_quality(30216, "mp4a.40.2").url, "")
+
+    def test_unknown_quality_still_returns_a_track(self) -> None:
+        """未知档位也要返回可用对象:缓存键里存什么档位不由我们决定。"""
+        track = track_from_quality(99999, "mp4a.40.2")
+        self.assertEqual(track.quality_id, 99999)
+        self.assertEqual(track.bandwidth, 0)
+        self.assertEqual(track.label, "0K")
 
 
 if __name__ == "__main__":
