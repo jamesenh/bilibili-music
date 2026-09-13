@@ -70,12 +70,14 @@ uv run python -m unittest discover -s tests -v
 
 ```
 src/bilibili_music/
-├── core/            与 UI 无关的纯逻辑,可独立单测
+├── core/            与 UI 无关的纯逻辑,可独立单测(不 import Qt)
 │   ├── errors.py      异常体系
 │   ├── models.py      Video / Page / AudioTrack 数据模型
 │   ├── headers.py     请求头构造、gzip 解压(纯函数,无 Qt)
 │   ├── http.py        常量与调优参数(退避、超时、限速)
-│   └── cache.py       AudioCache / DownloadSink(原子写入)
+│   ├── cache.py       AudioCache / DownloadSink(原子写入)
+│   ├── queue.py       PlayQueue / PlayMode(队列与播放模式)
+│   └── config.py      AppConfig / ConfigStore(纯 JSON 落盘)
 ├── net/             网络后端,两者接口一致可互换
 │   ├── base.py        契约(Protocol)、重试策略、限速器、响应校验
 │   ├── client.py      QtNetworkClient —— QNAM 实现(默认)
@@ -84,9 +86,24 @@ src/bilibili_music/
 │   └── bilibili.py    接口封装 + 纯解析函数(parse_*)
 ├── audio/
 │   ├── resolver.py    AudioResolver —— 异步解析状态机(无线程)
-│   └── player.py      QMediaPlayer 封装
+│   ├── player.py      QMediaPlayer 封装
+│   └── playback.py    PlaybackController —— 队列 / 解析 / 播放的编排
 └── ui/
-    └── main_window.py MVP 界面
+    ├── main_window.py 组装与接线(不写业务逻辑)
+    ├── theme.py       深色主题:QPalette + 全局样式表
+    ├── icons.py       SVG 定位、栅格化与运行时着色
+    ├── pixmaps.py     圆角封面、封面占位图、标题栏图标
+    ├── cover_loader.py 封面加载(缓存 + 一次只发一张)
+    └── widgets/       可单独构造、可单独测的控件
+        ├── window_frame.py  FramelessWindow(无边框 + 边缘缩放把手)
+        ├── title_bar.py     TitleBar(图标 / 搜索框 / 窗口按钮)
+        ├── sidebar.py       Sidebar(导航 + 我的歌单)
+        ├── track_list.py    TrackList(搜索结果与队列共用的曲目列表)
+        ├── player_bar.py    PlayerBar(传输控件 / 进度 / 分P / 音质 / 音量)
+        ├── page_selector.py PageSelector(分P选择器与它的弹出菜单)
+        ├── queue_drawer.py  QueueDrawer(右侧播放队列)
+        ├── placeholder.py   PlaceholderPage(尚未实现的功能的说明页)
+        └── elided_label.py  ElidedLabel(按宽度省略的标签)
 ```
 
 设计原则:**分层单向依赖**,`core` 不认识 Qt 也不认识 B站,`api` 不碰界面,`ui` 依赖全部。
@@ -206,11 +223,19 @@ QObject: Cannot create children for a parent that is in a different thread.
 
 ## 已实现的功能
 
-- [x] 关键字搜索视频(结果表格含标题/UP主/时长/分P数/播放量)
+- [x] **自绘标题栏的无边框窗口**:应用图标 + 圆角搜索框 + 粉色搜索按钮 + 最小化/最大化/关闭,
+      边缘可拖动缩放(缩放手势交给平台处理,吸附与多屏表现与原生窗口一致)
+- [x] **左侧导航栏**:搜索结果页是真的;"发现""本地缓存"与"我的歌单"给出**说明清楚的占位页**
+      (功能分别属于路线图 M3 / M2 / M5,还没有实现)
+- [x] 关键字搜索视频(**结果列表带封面缩略图**,含标题/UP主/时长/分P数/播放量)
 - [x] 自动识别多P合集(**每 P 即一首歌**)
 - [x] **播完自动跳到下一个分P**(多P合集时相当于自动下一首)
-- [x] **播放队列**:双击搜索结果=整个结果成为队列并从该行开始播;右键可"下一首播放 / 加入队列"
-- [x] **右侧可折叠队列抽屉**:显示待播列表、高亮当前项、双击跳转、右键移除、一键清空
+- [x] **播放条上的分P选择器**:菜单锚在选择器上方列出当前视频的每个分P(编号 / 标题 / 该P自己的时长),
+      选中即切到该分P(按该分P的 `cid` 解析与缓存);单P视频或没有当前视频时禁用
+- [x] **播放队列**:双击搜索结果=整个结果成为队列并从该行开始播;行内"+"直接入队;
+      右键可"下一首播放 / 加入队列"
+- [x] **右侧播放队列面板**:待播列表带封面、高亮当前项、双击跳转、右键移除、一键清空;
+      显示/隐藏在播放条与侧栏各有一个开关(两处状态始终一致)
 - [x] **四种播放模式**:顺序 / 列表循环 / 单曲循环 / 随机(模式会被记住)
 - [x] **手动切歌**:上一首 / 下一首 / 播放暂停按钮
 - [x] **手动切换音质**(自动 / 192K / 132K / 64K),切换后**保留播放位置**
@@ -219,8 +244,9 @@ QObject: Cannot create children for a parent that is in a different thread.
 - [x] 音频磁盘缓存(原子写入,二次播放**零请求**直接开播)
 - [x] 详情接口内存缓存(减少请求,降低风控风险)
 - [x] 播放 / 暂停 / 进度拖拽 / 音量 / 播放结束回调
-- [x] **封面显示**(播放条缩略图,内存缓存,失败静默退回占位图)
-- [x] **深色主题**(应用级 `QPalette` + 图标重新染色,切换后记住)
+- [x] **封面显示**(播放条与列表行,内存缓存,失败静默退回占位图);
+      列表封面**一次只取一张**,避免把几十个请求一起甩给 CDN
+- [x] **深色单主题**:近黑底 + B站粉强调色,`QPalette` 与全局样式表一起上(设计稿即深色,不做浅色变体)
 - [x] 音量、播放模式与上次播放位置持久化到配置文件(`%APPDATA%\BiliMusic\config.json`)
 - [x] 两种网络后端可互换(Qt / urllib)
 
@@ -229,6 +255,9 @@ QObject: Cannot create children for a parent that is in a different thread.
 - [ ] 登录(扫码 / Cookie 导入)与收藏夹同步为歌单
 - [ ] WBI 签名(`w_rid` + `wts`),收藏夹等接口的前提
 - [ ] 歌词:目前匿名拿不到 CC 字幕;可考虑从视频弹幕或第三方歌词库补齐
+- [ ] "发现"(音乐区排行榜)与"本地缓存"(本地曲库)两个页面:侧栏已留入口,点开是占位页
+- [ ] 歌单(含"喜欢"按钮):侧栏已留分组,点开是占位页
+- [ ] 全屏播放(播放条右下角的按钮当前**禁用**,没有假装能用)
 - [ ] 上次播放位置**续播**:配置里已经在记录,但启动时不会自动接着放
       (开机自动出声比较打扰,要不要做得先定;见 `docs/ROADMAP.md`)
 - [ ] 队列跨重启恢复(当前只记播放模式与位置,不记住队列内容)

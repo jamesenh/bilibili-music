@@ -35,9 +35,7 @@ __all__ = [
     "AppConfig",
     "CONFIG_FILE_NAME",
     "ConfigStore",
-    "DEFAULT_THEME",
     "DEFAULT_VOLUME",
-    "THEMES",
     "config_root",
 ]
 
@@ -52,12 +50,6 @@ CONFIG_FILE_NAME = "config.json"
 #: 取 80 而不是 100:音乐区素材的响度差异极大,默认拉满会让部分视频削波,
 #: 而用户很少主动往回拧(与 ``audio/player.py`` 的 ``DEFAULT_VOLUME`` 保持一致)。
 DEFAULT_VOLUME = 80
-
-#: 默认主题名。
-DEFAULT_THEME = "light"
-
-#: 允许的主题名。写成元组而不是集合:需要按固定顺序报错与断言。
-THEMES: tuple[str, ...] = ("light", "dark")
 
 
 def config_root() -> Path:
@@ -119,9 +111,6 @@ class AppConfig:
     play_mode: PlayMode = PlayMode.SEQUENCE
     """播放模式,取值范围由 :class:`~bilibili_music.core.queue.PlayMode` 决定。"""
 
-    theme: str = DEFAULT_THEME
-    """主题名,取值见 :data:`THEMES`。"""
-
     last_bvid: str = ""
     """上次播放的视频 BV 号;空串表示没有记录。"""
 
@@ -137,9 +126,9 @@ class AppConfig:
     def normalized(self) -> AppConfig:
         """返回一份把非法值收敛到合法范围的**新**配置。
 
-        每个字段都要过一道:音量夹到 0 ~ 100,模式与主题不合法就退回默认值,
-        位置为负就归零。收敛放在这里而不是读取时,是因为 :meth:`ConfigStore.save`
-        也要用它 —— 保证非法值永远不会落盘。
+        每个字段都要过一道:音量夹到 0 ~ 100,模式不合法就退回默认值,位置为负就
+        归零。收敛放在这里而不是读取时,是因为 :meth:`ConfigStore.save` 也要用它
+        —— 保证非法值永远不会落盘。
 
         Returns:
             新的 :class:`AppConfig`;``self`` 不被修改。
@@ -154,7 +143,6 @@ class AppConfig:
         return AppConfig(
             volume=max(0, min(100, _as_int(self.volume, DEFAULT_VOLUME))),
             play_mode=mode,
-            theme=self.theme if self.theme in THEMES else DEFAULT_THEME,
             last_bvid=str(self.last_bvid or ""),
             last_cid=max(0, _as_int(self.last_cid, 0)),
             last_position_ms=max(0, _as_int(self.last_position_ms, 0)),

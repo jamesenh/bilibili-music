@@ -312,6 +312,35 @@ class PlaybackController(QObject):
         # 必须显式带上当前分P:合集播到第 5P 时换音质,不能把用户踢回该项的入队分P
         self._start_current(position_ms=self.player.position_ms, page_index=self._page_index)
 
+    def play_page(self, page_index: int) -> bool:
+        """切到当前视频的另一个分P播放。
+
+        多P合集在队列里只占一行,而它内部有 N 首独立的歌(领域铁律),所以"换这一行
+        内部的哪一首"不改动队列,只把播放目标挪到另一个分P上。切换沿用
+        :meth:`_start_current` 这条既有路径:取消在飞的解析、按**该分P自己的** ``cid``
+        重新解析(缓存键因此也带上那个 ``cid``)、加载本地新媒体文件并自动播放 ——
+        行为与手动换歌完全一致,也与"播放中换音质"同一套策略(不做特殊暂停/续播处理,
+        新分P从头播)。
+
+        Args:
+            page_index: 目标分P序号,从 1 开始。
+
+        Returns:
+            是否切成功;没有当前项、或该视频的分P列表里没有这个序号时返回 ``False``
+            且不影响当前播放。**已经在这一P上**时返回 ``True`` 但不重新解析 ——
+            重播会把正在放的那一首打断,而菜单里点到当前行本就是想"关掉菜单"。
+        """
+        item = self.current
+        if item is None:
+            return False
+        if item.video.page(page_index) is None:
+            return False
+        target = int(page_index)
+        if target == self._page_index:
+            return True
+        self._start_current(page_index=target)
+        return True
+
     # ------------------------------------------------------------ 内部
 
     def _start_current(self, *, position_ms: int = 0, page_index: int | None = None) -> None:

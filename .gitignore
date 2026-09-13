@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local UI design mockups (large binaries, deliberately not tracked)
+ui设计图/

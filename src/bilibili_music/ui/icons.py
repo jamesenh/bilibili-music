@@ -65,37 +65,12 @@ class Palette:
     on_accent: str
     """叠在强调色底上的图标颜色。"""
 
-    @property
-    def qcolor_text(self) -> QColor:
-        """``text`` 的 :class:`QColor` 形式(``QPainter`` 只认 QColor)。"""
-        return QColor(self.text)
 
-    @property
-    def qcolor_muted(self) -> QColor:
-        """``muted`` 的 :class:`QColor` 形式。"""
-        return QColor(self.muted)
-
-    @property
-    def qcolor_accent(self) -> QColor:
-        """``accent`` 的 :class:`QColor` 形式。"""
-        return QColor(self.accent)
-
-    @property
-    def qcolor_disabled(self) -> QColor:
-        """``disabled`` 的 :class:`QColor` 形式。"""
-        return QColor(self.disabled)
-
-
-#: 亮色主题。``accent`` 取 B站粉 ``#FB7299``。
-LIGHT = Palette(
-    text="#1F1F1F",
-    muted="#666666",
-    accent="#FB7299",
-    disabled="#BFBFBF",
-    on_accent="#FFFFFF",
-)
-
-#: 深色主题,为后续"深色主题"待办预留 —— 图标源文件不用改,换这一套即可。
+#: 应用调色板。
+#:
+#: **只有一套**。界面在设计上就是深色单主题(见 ``ui/theme.py`` 的说明),所以这里
+#: 不再维护"深浅两套同色键"的映射表 —— 那种表只在能切换主题时才有意义,单主题下
+#: 它只会退化成"一个键对一份值"的绕路。
 DARK = Palette(
     text="#EAEAEA",
     muted="#9A9A9A",
@@ -103,28 +78,6 @@ DARK = Palette(
     disabled="#5A5A5A",
     on_accent="#FFFFFF",
 )
-
-#: 名字到调色板的映射,供 :func:`palette` 查表(``MainWindow`` 用的是 ``"light"``)。
-_PALETTES = {"light": LIGHT, "dark": DARK}
-
-
-def palette(name: str = "light") -> Palette:
-    """按名字取调色板。未知名字抛 :class:`ValueError`。
-
-    Args:
-        name: ``"light"`` 或 ``"dark"``。
-
-    Returns:
-        对应的 :class:`Palette`(不可变,可安全共享)。
-
-    Raises:
-        ValueError: 名字不在 :data:`_PALETTES` 里;消息里会列出所有可用名字。
-    """
-    try:
-        return _PALETTES[name]
-    except KeyError:
-        known = "、".join(sorted(_PALETTES))
-        raise ValueError(f"未知调色板 {name!r},可用:{known}") from None
 
 
 # ================================================================ 资源定位
@@ -286,12 +239,12 @@ def clear_cache() -> None:
 
 
 __all__ = [
+    "DARK",
     "ICONS_DIR",
     "Palette",
     "available_icons",
     "clear_cache",
     "get_icon",
     "icon_path",
-    "palette",
     "render_pixmap",
 ]

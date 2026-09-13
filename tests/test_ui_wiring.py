@@ -29,17 +29,20 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # 注意导入顺序:先 QtWidgets/QtGui 再 QtCore(见 AGENTS.md 第 5 节)
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
-from PySide6.QtGui import QColor, QPalette, QPixmap, QPixmapCache  # noqa: E402
+from PySide6.QtGui import QPalette, QPixmap, QPixmapCache  # noqa: E402
 from PySide6.QtCore import QBuffer, QIODevice, QObject, Qt, Signal  # noqa: E402
 
 from bilibili_music.api.bilibili import SearchResult, track_from_quality  # noqa: E402
 from bilibili_music.audio.playback import PlaybackController  # noqa: E402
 from bilibili_music.audio.resolver import ResolvedAudio  # noqa: E402
 from bilibili_music.core.config import AppConfig, ConfigStore  # noqa: E402
+from bilibili_music.core.cover_cache import CoverCache  # noqa: E402
 from bilibili_music.core.models import Page, Video  # noqa: E402
 from bilibili_music.core.queue import PlayMode  # noqa: E402
 from bilibili_music.ui.icons import DARK  # noqa: E402
 from bilibili_music.ui.main_window import MainWindow  # noqa: E402
+from bilibili_music.ui.theme import SURFACES  # noqa: E402
+from bilibili_music.ui.widgets.page_selector import EMPTY_LABEL  # noqa: E402
 
 #: 落盘类用例的临时目录根(与 test_config 同一套做法:不用 tempfile)。
 _SCRATCH = Path(__file__).resolve().parent / "_scratch"
@@ -183,7 +186,9 @@ class _FakeClient:
         self.keywords: list[str] = []
         self.closed = 0
         self.cover_calls: list[str] = []
-        self._cover_callbacks: dict[str, tuple[Callable, Callable]] = {}
+        #: URL -> 还没被应答的回调组**列表**。列表而不是单个回调:搜索列表、队列面板与
+        #: 播放条各有自己的封面加载器,同一张图会被请求多次,每次请求都是独立的一笔。
+        self._cover_callbacks: dict[str, list[tuple[Callable, Callable]]] = {}
 
     def search_video(
         self,
@@ -206,15 +211,21 @@ class _FakeClient:
     ) -> None:
         """记录封面请求,把回调攒下来交给用例触发(按 URL 存,能模拟慢响应)。"""
         self.cover_calls.append(url)
-        self._cover_callbacks[url] = (on_success, on_error)
+        self._cover_callbacks.setdefault(url, []).append((on_success, on_error))
+
+    def pending_cover_urls(self) -> list[str]:
+        """还有回调没被应答的封面地址(按注册顺序)。"""
+        return [url for url, callbacks in self._cover_callbacks.items() if callbacks]
 
     def succeed_cover(self, url: str, data: bytes) -> None:
-        """触发某个封面 URL 的成功回调。"""
-        self._cover_callbacks[url][0](data)
+        """触发某个封面 URL 的**全部**成功回调(几个加载器可能都在等这张图)。"""
+        for on_success, _ in self._cover_callbacks.pop(url, []):
+            on_success(data)
 
     def fail_cover(self, url: str, exc: Exception) -> None:
-        """触发某个封面 URL 的失败回调。"""
-        self._cover_callbacks[url][1](exc)
+        """触发某个封面 URL 的全部失败回调。"""
+        for _, on_error in self._cover_callbacks.pop(url, []):
+            on_error(exc)
 
     def close(self) -> None:
         """记录一次关闭。"""
@@ -296,6 +307,9 @@ class _WindowCase(unittest.TestCase):
         self.window = MainWindow(
             client=self.client,  # type: ignore[arg-type]
             cache=object(),  # type: ignore[arg-type]
+            # 封面必须落进沙箱目录:默认值会写到真实用户的 %LOCALAPPDATA%,
+            # 而且第二个用例会因为"上一轮的图还在磁盘上"而不再发假请求,断言随之失灵
+            cover_cache=CoverCache(self.tmp / "covers"),
             config_store=self.store,
             playback=self.playback,
         )
@@ -306,7 +320,7 @@ class _WindowCase(unittest.TestCase):
 
     def _search(self, keyword: str = "周杰伦") -> None:
         """走一遍"输入关键字 + 点搜索"。"""
-        self.window.search_input.setText(keyword)
+        self.window.title_bar.search_input.setText(keyword)
         self.window.on_search()
 
     def _search_and_play(self, row: int) -> None:
@@ -326,14 +340,28 @@ class TestSearchWiring(_WindowCase):
         self._search()
         self.assertEqual(self.client.keywords, ["周杰伦"])
         self.assertEqual(self.window.result_list.rowCount(), 3)
-        self.assertEqual(self.window.result_list.item(0, 0).text(), "视频A")
-        self.assertEqual(self.window.result_list.item(0, 3).text(), "?")
+        self.assertEqual(self.window.result_list.title_at(0), "视频A")
+        self.assertEqual(self.window.result_list.item(0, 2).text(), "某UP")
+        self.assertEqual(self.window.result_list.item(0, 4).text(), "?")
+        self.assertEqual(self.window.result_list.item(0, 0).text(), "1")
+
+    def test_header_shows_the_keyword_and_the_total(self) -> None:
+        """标题行要显示搜了什么、命中多少条,否则用户不知道看的是哪次搜索的结果。"""
+        self._search()
+        self.assertIn("周杰伦", self.window.query_label.text())
+        self.assertIn("3", self.window.total_label.text())
 
     def test_empty_keyword_does_not_search(self) -> None:
         """空关键字不发请求(否则会白挨一次风控)。"""
-        self.window.search_input.setText("   ")
+        self.window.title_bar.search_input.setText("   ")
         self.window.on_search()
         self.assertEqual(self.client.keywords, [])
+
+    def test_search_button_is_reused_from_the_title_bar(self) -> None:
+        """搜索按钮在自绘标题栏里;点它要真的发请求(接线别落在空处)。"""
+        self.window.title_bar.search_input.setText("晴天")
+        self.window.title_bar.search_button.click()
+        self.assertEqual(self.client.keywords, ["晴天"])
 
     def test_double_click_replaces_the_queue_from_that_row(self) -> None:
         """双击搜索结果:整个结果成为队列,并从那一行开始播。"""
@@ -356,7 +384,29 @@ class TestSearchWiring(_WindowCase):
         """详情补全后,结果表里那一行的分P数要变成真实值。"""
         self._search_and_play(1)
         self.resolver.succeed(_resolved(self.videos[1]))
-        self.assertEqual(self.window.result_list.item(1, 3).text(), "2")
+        self.assertEqual(self.window.result_list.item(1, 4).text(), "2")
+
+    def test_cover_is_requested_for_the_listed_videos(self) -> None:
+        """列表一填上就要去取封面(带封面的行没有图等于没做)。"""
+        self._search()
+        self.assertEqual(self.window.result_list.cover_url_at(0), self.videos[0].cover_https)
+        self.assertIn(self.videos[0].cover_https, self.client.cover_calls)
+
+    def test_row_cover_is_shown_when_it_arrives(self) -> None:
+        """封面到了要贴到对应的行上,而且只贴那几行。"""
+        self._search()
+        url = self.videos[0].cover_https
+        self.assertFalse(self.window.result_list.has_cover_at(0))
+        self.client.succeed_cover(url, _png_bytes())
+        self.assertTrue(self.window.result_list.has_cover_at(0))
+        self.assertFalse(self.window.result_list.has_cover_at(1))
+
+    def test_row_add_button_enqueues(self) -> None:
+        """行内"+"要真的把这一首加进队列(按钮不能只是画着好看)。"""
+        self._search()
+        self.window.result_list.add_requested.emit(2)
+        self.assertEqual(len(self.playback.queue), 1)
+        self.assertEqual(self.playback.queue.items[0].video.bvid, "C")
 
 
 class TestPlayerBarWiring(_WindowCase):
@@ -415,8 +465,88 @@ class TestPlayerBarWiring(_WindowCase):
         self.assertEqual(self.player.seeks[-1], 12_345)
 
 
+class TestPageSelectorWiring(_WindowCase):
+    """播放条上的分P选择器:状态由编排层推下来,选择交给编排层。"""
+
+    @property
+    def _selector(self):  # noqa: ANN201 - PageSelector
+        """被接线的分P选择器。"""
+        return self.window.player_bar.page_selector
+
+    def test_disabled_before_anything_plays(self) -> None:
+        """还没有当前视频:选择器禁用并显示占位,而不是留着空按钮可点。"""
+        self.assertFalse(self._selector.isEnabled())
+        self.assertEqual(self._selector.full_label_text(), EMPTY_LABEL)
+
+    def test_shows_the_current_video_page_as_soon_as_it_plays(self) -> None:
+        """开始播某个视频后,选择器要显示这个视频当前那P的标题。"""
+        self._search_and_play(1)  # 视频 B:两个分P
+        self.assertTrue(self._selector.isEnabled())
+        self.assertEqual(self._selector.full_label_text(), "分P:P1 第1首")
+
+    def test_menu_lists_the_current_videos_pages_only(self) -> None:
+        """菜单里只有当前视频的分P,并且标出正在播的那一P。"""
+        self._search_and_play(1)
+        self._selector.click()
+        self.addCleanup(self._selector.close_popup)
+        rows = self._selector.popup_rows()
+        self.assertEqual([row.page_index for row in rows], [1, 2])
+        self.assertEqual([row.is_current for row in rows], [True, False])
+        self.assertEqual(rows[1].title_label.full_text(), "第2首")
+
+    def test_choosing_a_menu_row_switches_the_playback_target(self) -> None:
+        """在菜单里点第 2P:编排层按该分P重新解析,选择器跟着挪过去。"""
+        self._search_and_play(1)
+        self._selector.click()
+        self._selector.popup_rows()[1].click()
+        self.assertEqual(self.resolver.calls[-1][1], 2)
+        self.assertFalse(self._selector.is_popup_open)
+        self.assertEqual(self._selector.full_label_text(), "分P:P2 第2首")
+
+    def test_audio_ready_refreshes_the_selector_with_the_page_title(self) -> None:
+        """详情补全后分P标题才知道:音源就绪时要把选择器再刷一遍。"""
+        # 先摘掉分P列表,模拟"搜索阶段只有视频标题、详情还没补全"的状态
+        pages = self.videos[1].pages
+        self.videos[1].pages = []
+        self._search_and_play(1)
+        self.assertEqual(self._selector.full_label_text(), "分P:P1")
+        self.assertFalse(self._selector.isEnabled())  # 详情未知,先不给点
+        # 解析器补全详情时会把分P列表写回**同一个** Video 对象(audio/resolver.py)
+        self.videos[1].pages = pages
+        self.resolver.succeed(_resolved(self.videos[1]))
+        self.assertTrue(self._selector.isEnabled())
+        self.assertEqual(self._selector.full_label_text(), "分P:P1 第1首")
+
+    def test_single_page_video_shows_the_page_but_is_disabled(self) -> None:
+        """单P视频也照样显示当前分P,只是点不开(控件位置因此不会跳)。"""
+        self._search_and_play(0)  # 视频 A:一个分P
+        self.resolver.succeed(_resolved(self.videos[0]))
+        self.assertFalse(self._selector.isEnabled())
+        self.assertEqual(self._selector.full_label_text(), "分P:P1 第1首")
+
+    def test_switching_to_another_queue_video_resets_the_selector(self) -> None:
+        """队列换到另一行时,选择器跟着换成那个视频与它自己的分P。"""
+        self._search_and_play(1)
+        self._selector.page_selected.emit(2)
+        self.resolver.succeed(_resolved(self.videos[1], page_index=2))
+        self.window.player_bar.next_button.click()  # → 视频 C(单P)
+        self.assertFalse(self._selector.isEnabled())
+        self.assertEqual(self._selector.full_label_text(), "分P:P1 第1首")
+
+    def test_clearing_the_queue_disables_the_selector(self) -> None:
+        """清空队列后没有当前视频:选择器要收回占位并禁用。"""
+        self._search_and_play(1)
+        self.playback.clear()
+        self.assertFalse(self._selector.isEnabled())
+        self.assertEqual(self._selector.full_label_text(), EMPTY_LABEL)
+
+    def test_menu_avoids_the_queue_drawer(self) -> None:
+        """菜单要避开的正是右侧队列面板 —— 这层关系由主窗口接线。"""
+        self.assertIs(self._selector.avoid_widget, self.window.queue_drawer)
+
+
 class TestQueueDrawerWiring(_WindowCase):
-    """右侧队列抽屉。"""
+    """右侧队列面板。"""
 
     def test_drawer_lists_the_queue_and_marks_current(self) -> None:
         """队列内容与数量要跟着编排层走。"""
@@ -424,6 +554,13 @@ class TestQueueDrawerWiring(_WindowCase):
         self.assertEqual(self.window.queue_drawer.list.rowCount(), 3)
         self.assertEqual(self.window.queue_drawer.count_label.text(), "3 首")
         self.assertEqual(self.window.queue_drawer.list.highlighted_row(), 1)
+
+    def test_drawer_rows_show_the_expected_fields(self) -> None:
+        """队列行要有曲名与时长(设计稿里每一行就是这两样)。"""
+        self._search_and_play(0)
+        row0 = self.window.queue_drawer.list
+        self.assertEqual(row0.title_at(0), self.videos[0].title)
+        self.assertEqual(row0.item(0, 2).text(), self.videos[0].pages[0].duration_text)
 
     def test_activating_a_row_jumps_to_it(self) -> None:
         """双击队列某一行要跳到那一首。"""
@@ -443,20 +580,98 @@ class TestQueueDrawerWiring(_WindowCase):
         self.window.queue_drawer.clear_requested.emit()
         self.assertEqual(len(self.playback.queue), 0)
 
-    def test_collapse_hides_the_list(self) -> None:
-        """折叠后只留标题栏,列表与清空按钮都藏起来。"""
-        self.assertFalse(self.window.queue_drawer.collapsed)
-        self.window.queue_drawer.toggle_button.click()
-        self.assertTrue(self.window.queue_drawer.collapsed)
-        self.assertTrue(self.window.queue_drawer.list.isHidden())
-        self.assertTrue(self.window.queue_drawer.clear_button.isHidden())
 
-    def test_expanding_again_restores_the_list(self) -> None:
-        """再点一次要能展开回来。"""
-        self.window.queue_drawer.toggle_button.click()
-        self.window.queue_drawer.toggle_button.click()
-        self.assertFalse(self.window.queue_drawer.collapsed)
-        self.assertFalse(self.window.queue_drawer.list.isHidden())
+class TestQueueVisibilityWiring(_WindowCase):
+    """队列面板的显示/隐藏:播放条与侧栏两个开关必须显示同一个状态。"""
+
+    def _visible(self) -> bool:
+        """队列面板当前是否可见。"""
+        return not self.window.queue_drawer.isHidden()
+
+    def test_queue_is_visible_on_start(self) -> None:
+        """设计稿里队列面板默认是展开的,两个开关也要是选中态。"""
+        self.assertTrue(self._visible())
+        self.assertTrue(self.window.player_bar.queue_button.isChecked())
+        self.assertTrue(self.window.sidebar.nav_buttons["queue"].isChecked())
+
+    def test_player_bar_button_hides_and_shows(self) -> None:
+        """播放条上的队列开关要真的收起面板,并把侧栏的开关一起同步。"""
+        self.window.player_bar.queue_button.click()
+        self.assertFalse(self._visible())
+        self.assertFalse(self.window.sidebar.nav_buttons["queue"].isChecked())
+        self.window.player_bar.queue_button.click()
+        self.assertTrue(self._visible())
+        self.assertTrue(self.window.sidebar.nav_buttons["queue"].isChecked())
+
+    def test_sidebar_entry_toggles_the_panel(self) -> None:
+        """侧栏的"播放队列"是面板开关而不是一页,点它不该把内容页换掉。"""
+        self.window.sidebar.nav_buttons["results"].click()
+        current = self.window.pages.currentWidget()
+        self.window.sidebar.nav_buttons["queue"].click()
+        self.assertFalse(self._visible())
+        self.assertIs(self.window.pages.currentWidget(), current)
+
+
+class TestNavigationWiring(_WindowCase):
+    """侧栏导航:哪一页是真的、哪一页是占位。"""
+
+    def test_results_entry_shows_the_results_page(self) -> None:
+        """点"搜索结果"要回到结果页。"""
+        self.window.sidebar.nav_buttons["discover"].click()
+        self.window.sidebar.nav_buttons["results"].click()
+        self.assertIs(self.window.pages.currentWidget(), self.window.results_page)
+
+    def test_unimplemented_entries_show_a_placeholder(self) -> None:
+        """"发现""本地缓存"都还没有功能:必须给占位页,而不是点了没反应。"""
+        for key, title in (("discover", "发现"), ("cache", "本地缓存")):
+            with self.subTest(entry=key):
+                self.window.sidebar.nav_buttons[key].click()
+                self.assertIs(
+                    self.window.pages.currentWidget(), self.window.placeholder_page
+                )
+                self.assertEqual(self.window.placeholder_page.title_label.full_text(), title)
+                self.assertIn("还没实现", self.window.placeholder_page.hint_label.full_text())
+
+    def test_playlist_entry_shows_a_placeholder(self) -> None:
+        """歌单同样是占位页(路线图 M5 冻结),标题要写清是哪个歌单。"""
+        self.window.sidebar.playlist_buttons["周杰伦"].click()
+        self.assertIs(self.window.pages.currentWidget(), self.window.placeholder_page)
+        self.assertEqual(
+            self.window.placeholder_page.title_label.full_text(), "周杰伦"
+        )
+        self.assertIn("歌单", self.window.placeholder_page.hint_label.full_text())
+
+    def test_create_playlist_button_shows_a_placeholder(self) -> None:
+        """"+"按钮也要有反馈,不能是个哑按钮。"""
+        self.window.sidebar.create_button.click()
+        self.assertIs(self.window.pages.currentWidget(), self.window.placeholder_page)
+        self.assertEqual(
+            self.window.placeholder_page.title_label.full_text(), "新建歌单"
+        )
+
+
+class TestTitleBarWiring(_WindowCase):
+    """自绘标题栏:搜索、窗口按钮与无边框窗口的状态。"""
+
+    def test_window_is_frameless(self) -> None:
+        """既然自绘了标题栏,就不能再留着系统边框(否则会出现两条标题栏)。"""
+        self.assertTrue(
+            self.window.windowFlags() & Qt.WindowType.FramelessWindowHint
+        )
+
+    def test_close_button_closes_the_window(self) -> None:
+        """关闭键要真的关窗(并走退出清理:落盘配置、停播放、关客户端)。"""
+        closed: list[bool] = []
+        self.window.closeEvent = lambda event: closed.append(True)  # type: ignore[method-assign]
+        self.window.title_bar.close_button.click()
+        self.assertTrue(closed)
+
+    def test_search_signal_is_raised_by_return_pressed(self) -> None:
+        """在搜索框里回车等同于点"搜索"。"""
+        got: list[bool] = []
+        self.window.title_bar.search_requested.connect(lambda: got.append(True))
+        self.window.title_bar.search_input.returnPressed.emit()
+        self.assertEqual(got, [True])
 
 
 class TestPlaybackFeedbackWiring(_WindowCase):
@@ -470,7 +685,6 @@ class TestPlaybackFeedbackWiring(_WindowCase):
         self.assertIn("192K", self.window.player_bar.subtitle_label.text())
         self.assertIn("A.m4a", self.window.status_label.text())
         self.assertTrue(self.window.progress.isHidden())  # 缓存完成,进度条收起
-
     def test_progress_bar_tracks_cache_progress(self) -> None:
         """下载进度要显示成百分比。"""
         self._search_and_play(0)
@@ -521,6 +735,7 @@ class TestConfigWiring(_WindowCase):
         window = MainWindow(
             client=_FakeClient([]),  # type: ignore[arg-type]
             cache=object(),  # type: ignore[arg-type]
+            cover_cache=CoverCache(self.tmp / "covers"),
             config_store=self.store,
             playback=PlaybackController(_FakeResolver(), _FakePlayer()),  # type: ignore[arg-type]
         )
@@ -569,12 +784,14 @@ class TestCoverWiring(_WindowCase):
         return self.client.cover_calls[-1]
 
     def test_audio_ready_requests_the_https_cover(self) -> None:
-        """详情就绪后要去取封面,而且用的是升级成 https 的地址。"""
+        """详情就绪后要去取封面,而且用的是升级成 https 的地址。
+
+        列表与队列也会为同一批视频取封面(各有各的加载器),所以这里只看**最后一次**
+        请求 —— 那一次是播放条为当前曲目发的。
+        """
         self._play_and_request_cover()
-        self.assertEqual(
-            self.client.cover_calls, [self.videos[0].cover_https]
-        )
-        self.assertTrue(self.client.cover_calls[0].startswith("https://"))
+        self.assertEqual(self.client.cover_calls[-1], self.videos[0].cover_https)
+        self.assertTrue(self.client.cover_calls[-1].startswith("https://"))
 
     def test_cover_is_shown_when_it_arrives(self) -> None:
         """封面到达后要真的贴上,而不是一直挂占位图。"""
@@ -611,14 +828,38 @@ class TestCoverWiring(_WindowCase):
         self.client.succeed_cover(url, _png_bytes())
         self.assertFalse(self.window.player_bar.has_cover)
 
+    def test_fetched_cover_is_reused_by_the_next_run(self) -> None:
+        """封面要落进磁盘缓存:重开应用(新窗口 + 清空的内存缓存)能直接贴出来,不再请求。
+
+        这是磁盘缓存存在的**唯一理由** —— 封面与 API 共用限速器,冷启动首屏每张图都
+        重新下载的话,十几行要等十几秒。列表里其余几行仍然走网络(它们本来就没缓存过),
+        所以这里只断言"这一张没被再请求"。
+        """
+        url = self._play_and_request_cover()
+        self.client.succeed_cover(url, _png_bytes())
+        self.assertIsNotNone(CoverCache(self.tmp / "covers").read(url))
+
+        # 模拟重启:内存缓存清空,QMessageBox 记录器与配置沿用同一个沙箱
+        QPixmapCache.clear()
+        restarted = _FakeClient(self.videos)
+        window = MainWindow(
+            client=restarted,  # type: ignore[arg-type]
+            cache=object(),  # type: ignore[arg-type]
+            cover_cache=CoverCache(self.tmp / "covers"),
+            config_store=self.store,
+            playback=PlaybackController(_FakeResolver(), _FakePlayer()),  # type: ignore[arg-type]
+        )
+        self.addCleanup(window.close)
+        window.title_bar.search_input.setText("周杰伦")
+        window.on_search()
+
+        self.assertEqual(window.result_list.cover_url_at(0), url)
+        self.assertTrue(window.result_list.has_cover_at(0))  # 列表填上时就已经有图
+        self.assertNotIn(url, restarted.cover_calls)
+
 
 class TestThemeWiring(_WindowCase):
-    """主题切换、落盘与启动时套用。"""
-
-    def setUp(self) -> None:
-        """跑完把应用恢复成浅色:主题是应用级的,会影响到同进程的其它测试模块。"""
-        super().setUp()
-        self.addCleanup(self.window._apply_theme, "light")
+    """深色主题的应用(单主题,没有切换按钮)。"""
 
     def _window_color(self) -> str:
         """当前应用级窗口底色。"""
@@ -626,40 +867,28 @@ class TestThemeWiring(_WindowCase):
         assert app is not None
         return app.palette().color(QPalette.ColorRole.Window).name()
 
-    def test_toggle_switches_to_dark_and_persists(self) -> None:
-        """点一下切深色:应用底色变、按钮文字变、配置落盘。"""
-        self.assertEqual(self.window.theme_button.text(), "深色")  # 写的是"点了会变成什么"
-        self.window.theme_button.click()
-        self.assertEqual(self._window_color(), "#2b2b2b")
-        self.assertEqual(self.window.theme_button.text(), "浅色")
-        self.assertEqual(self.store.load().theme, "dark")
+    def test_dark_palette_and_stylesheet_are_applied_on_start(self) -> None:
+        """造出主窗口就该是深色的:调色板与样式表两样都要落到应用上。"""
+        app = QApplication.instance()
+        assert app is not None
+        self.assertEqual(self._window_color(), SURFACES.window.lower())
+        self.assertIn(DARK.accent, app.styleSheet())
 
-    def test_toggle_twice_returns_to_light(self) -> None:
-        """再点一下切回浅色并落盘。"""
-        self.window.theme_button.click()
-        self.window.theme_button.click()
-        self.assertNotEqual(self._window_color(), "#2b2b2b")
-        self.assertEqual(self.store.load().theme, "light")
+    def test_no_theme_switch_button(self) -> None:
+        """深色单主题:标题栏上不该再有"深浅色"切换按钮。"""
+        self.assertFalse(hasattr(self.window, "theme_button"))
+        self.assertFalse(hasattr(self.window.title_bar, "theme_button"))
 
-    def test_saved_theme_is_applied_on_start(self) -> None:
-        """启动时要套用上次的主题。"""
-        self.store.save(AppConfig(theme="dark"))
-        window = MainWindow(
-            client=_FakeClient([]),  # type: ignore[arg-type]
-            cache=object(),  # type: ignore[arg-type]
-            config_store=self.store,
-            playback=PlaybackController(_FakeResolver(), _FakePlayer()),  # type: ignore[arg-type]
-        )
-        self.addCleanup(window.close)
-        self.assertEqual(window.theme_button.text(), "浅色")
-        self.assertEqual(self._window_color(), "#2b2b2b")
+    def test_labels_carry_the_styled_object_names(self) -> None:
+        """样式全部按 ``#objectName`` 选,所以控件必须挂上约定好的名字。
 
-    def test_icon_colors_are_pushed_to_widgets(self) -> None:
-        """图标调色板要真的下发到各控件:否则深色下图标仍是浅色主题的颜色。"""
-        self.window.theme_button.click()
-        self.assertIn(DARK.muted, self.window.player_bar.subtitle_label.styleSheet())
-        self.assertIn(DARK.muted, self.window.queue_drawer.count_label.styleSheet())
-        self.assertIn(DARK.muted, self.window.status_label.styleSheet())
+        这是"样式表写好了但没人命中"的唯一防线 —— 挂错名字在界面上表现为"没样式",
+        靠肉眼很难发现是哪个控件漏了。
+        """
+        self.assertEqual(self.window.status_label.objectName(), "StatusLabel")
+        self.assertEqual(self.window.player_bar.subtitle_label.objectName(), "TrackSubtitle")
+        self.assertEqual(self.window.queue_drawer.count_label.objectName(), "MutedLabel")
+        self.assertEqual(self.window.result_list.objectName(), "TrackTable")
 
 
 if __name__ == "__main__":

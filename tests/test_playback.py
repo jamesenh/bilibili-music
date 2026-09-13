@@ -592,5 +592,73 @@ class TestMultipartPages(_PlaybackCase):
         self.assertEqual(item.page_index, 1)
 
 
+class TestPageSwitching(_PlaybackCase):
+    """手动换分P(播放条上的分P选择器走的就是这条)。"""
+
+    def test_switches_to_the_requested_page(self) -> None:
+        """选了另一P就按该P重新解析,并把它当成"当前正在播"的那一P。"""
+        self.playback.play_queue([QueueItem(_video("A", pages=3))])
+        self.assertTrue(self.playback.play_page(3))
+        self.assertEqual(self.resolver.last_call["video"].bvid, "A")
+        self.assertEqual(self.resolver.last_call["page_index"], 3)
+        self.assertEqual(self.playback.page_index, 3)
+
+    def test_switch_reports_the_track_as_changed(self) -> None:
+        """切分P要发 track_changed:界面靠它换标题、把选择器挪到新的一P上。"""
+        item = QueueItem(_video("A", pages=3))
+        self.playback.play_queue([item])
+        events = _record(self.playback.track_changed)
+        self.playback.play_page(2)
+        self.assertEqual(events, [(item,)])
+
+    def test_switch_does_not_touch_the_queue_item(self) -> None:
+        """队列项记的仍是入队时的分P:换分P不是换歌,队列内容不该被改写。"""
+        item = QueueItem(_video("A", pages=3))
+        self.playback.play_queue([item])
+        self.playback.play_page(3)
+        self.assertEqual(item.page_index, 1)
+        self.assertEqual(len(self.playback.queue), 1)
+
+    def test_switch_starts_from_zero_instead_of_resuming(self) -> None:
+        """换的是另一首歌,从头播;不能残留换音质那套"续播位置"。"""
+        self.playback.play_queue([QueueItem(_video("A", pages=2))])
+        self.player._position_ms = 30_000
+        self.playback.play_page(2)
+        self.player.position_changed.emit(0, 200_000)
+        self.assertEqual(self.player.seeks, [])
+
+    def test_unknown_page_is_refused(self) -> None:
+        """序号越界时不动当前播放(界面不该因为点错行就换歌)。"""
+        self.playback.play_queue([QueueItem(_video("A", pages=2))])
+        self.assertFalse(self.playback.play_page(9))
+        self.assertEqual(len(self.resolver.calls), 1)
+        self.assertEqual(self.playback.page_index, 1)
+
+    def test_without_a_current_item_it_returns_false(self) -> None:
+        """没有当前视频时返回 False,而不是抛异常。"""
+        self.assertFalse(self.playback.play_page(1))
+        self.assertEqual(self.resolver.calls, [])
+
+    def test_choosing_the_page_already_playing_is_a_noop(self) -> None:
+        """点当前这一P不该重新解析:那会把正在放的那首歌打断并重下一遍。"""
+        self.playback.play_queue([QueueItem(_video("A", pages=3))])
+        self.assertTrue(self.playback.play_page(1))
+        self.assertEqual(len(self.resolver.calls), 1)
+
+    def test_switch_keeps_the_selected_quality(self) -> None:
+        """换分P沿用当前音质档位(与换歌一致),不该悄悄退回自动。"""
+        self.playback.play_queue([QueueItem(_video("A", pages=2))])
+        self.playback.set_quality(30216)
+        self.playback.play_page(2)
+        self.assertEqual(self.resolver.last_call["quality_id"], 30216)
+        self.assertEqual(self.resolver.last_call["page_index"], 2)
+
+    def test_detail_is_fetched_before_switching_is_possible(self) -> None:
+        """详情没补全(分P列表为空)时拒绝切换:那时连有哪些分P都不知道。"""
+        self.playback.play_queue([QueueItem(Video(bvid="A", title="视频A"))])
+        self.assertFalse(self.playback.play_page(2))
+        self.assertEqual(len(self.resolver.calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,18 +1,20 @@
-"""右侧可折叠的播放队列抽屉。
+"""右侧播放队列面板。
 
-抽屉本身**不知道**"下一首放什么",它只做两件事:把上层给的队列渲染成列表、
-把用户操作(跳转 / 移除 / 清空 / 折叠)转成信号。队列的真源在
+面板本身**不知道**"下一首放什么",它只做两件事:把上层给的队列渲染成列表、把用户操作
+(跳转 / 移除 / 清空)转成信号。队列的真源在
 :class:`~bilibili_music.audio.playback.PlaybackController`。
 
-折叠的实现刻意不用 ``QSplitter``:折叠时把列表隐藏、把整个抽屉压到只够放标题栏的
-宽度,比让 splitter 去记住两套尺寸简单得多,也不会在窗口缩放时把主列表挤变形。
+与旧版的差别:不再自带"折叠"按钮。折叠原本是为了把面板收窄腾地方,而设计稿把"显示/
+隐藏队列"这件事放在了播放条与侧栏的队列开关上(见 ``player_bar.PlayerBar.queue_toggled``)
+—— 同一个动作有两个入口已经够了,再多一个折叠按钮只会让人猜"折叠和隐藏有什么不一样"。
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
-from PySide6.QtCore import QPoint, Signal
+from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -23,84 +25,85 @@ from PySide6.QtWidgets import (
 )
 
 from ...core.queue import QueueItem
-from ..icons import Palette, get_icon, palette
-from .track_list import TrackList
+from ..cover_loader import CoverLoader
+from ..icons import DARK, get_icon
+from .track_list import TrackList, TrackRow, split_title_prefix
 
 __all__ = [
-    "COLLAPSED_WIDTH",
-    "EXPANDED_MIN_WIDTH",
+    "PANEL_MIN_WIDTH",
     "QueueDrawer",
 ]
 
-#: 折叠后只保留标题栏时的抽屉宽度(像素)。
-COLLAPSED_WIDTH = 112
+#: 面板最小宽度(像素);再窄标题与时长就挤在一起了。
+PANEL_MIN_WIDTH = 268
 
-#: 展开时的最小宽度;再窄列就挤成一团了。
-EXPANDED_MIN_WIDTH = 280
-
-#: 抽屉里表格的列标题。
-_COLUMNS = ("标题", "UP主", "时长")
+#: 面板里列表的列标题。第 0 / 1 列由 ``TrackList`` 自己填(序号、封面 + 曲名)。
+_COLUMNS = ("#", "曲目", "时长")
 
 
 class QueueDrawer(QWidget):
-    """播放队列面板:标题栏(数量 / 清空 / 折叠) + 曲目列表。
+    """播放队列面板:标题栏(数量 / 清空) + 曲目列表。
 
     信号:
         row_activated(int): 双击队列第几行(跳到那一首)
         remove_requested(int): 请求移除第几行
         clear_requested(): 请求清空队列
-        collapsed_changed(bool): 折叠状态变化(``True`` 表示已折叠)
+
+    Args:
+        covers: 封面加载器;``None`` 表示队列行不取封面(测试可以省略)。
+        parent: Qt 父对象。
     """
 
     row_activated = Signal(int)
     remove_requested = Signal(int)
     clear_requested = Signal()
-    collapsed_changed = Signal(bool)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
-        """建好标题栏与列表;初始是展开状态。
+    def __init__(
+        self,
+        covers: CoverLoader | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        """建好标题栏与列表。
 
         Args:
+            covers: 封面加载器。
             parent: Qt 父对象。
         """
         super().__init__(parent)
-        self._palette = palette("light")
-        self._collapsed = False
+        self.setObjectName("QueuePanel")
+        self.setMinimumWidth(PANEL_MIN_WIDTH)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(4)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
         root.addLayout(self._build_header())
 
-        self.list = TrackList(_COLUMNS, stretch_column=0)
+        self.list = TrackList(_COLUMNS, covers=covers, centered=(2,))
         self.list.row_activated.connect(self.row_activated.emit)
         self.list.row_menu_requested.connect(self._on_row_menu)
         root.addWidget(self.list, 1)
 
-        self.setMinimumWidth(EXPANDED_MIN_WIDTH)
-
     # ------------------------------------------------------------ 构建界面
 
     def _build_header(self) -> QHBoxLayout:
-        """建"折叠按钮 + 数量 + 清空"这一行。"""
+        """建"标题 + 数量 + 清空"这一行。"""
         row = QHBoxLayout()
-        row.setSpacing(4)
+        row.setSpacing(6)
 
-        self.toggle_button = QPushButton("队列")
-        self.toggle_button.setToolTip("折叠/展开播放队列")
-        self.toggle_button.setIcon(
-            get_icon("list", self._palette.text, 16, disabled_color=self._palette.disabled)
-        )
-        self.toggle_button.clicked.connect(self.toggle_collapsed)
+        self.title_label = QLabel("播放队列")
+        self.title_label.setObjectName("PanelTitle")
 
         self.count_label = QLabel("0 首")
-        self.count_label.setStyleSheet(f"color: {self._palette.muted};")
+        self.count_label.setObjectName("MutedLabel")
 
         self.clear_button = QPushButton("清空")
+        self.clear_button.setObjectName("GhostTextButton")
+        self.clear_button.setIcon(get_icon("trash", DARK.muted, 14))
         self.clear_button.setToolTip("清空播放队列")
+        self.clear_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clear_button.clicked.connect(self.clear_requested.emit)
 
-        row.addWidget(self.toggle_button)
+        row.addWidget(self.title_label)
         row.addWidget(self.count_label)
         row.addStretch(1)
         row.addWidget(self.clear_button)
@@ -115,72 +118,51 @@ class QueueDrawer(QWidget):
             items: 队列内容(插入顺序)。
             current_index: 当前项在 ``items`` 里的下标;``-1`` 表示没有当前项。
         """
-        self.list.set_rows(
-            [
-                (item.title, item.subtitle, item.page.duration_text if item.page else "")
-                for item in items
-            ]
-        )
+        self.list.set_tracks([self._row_of(item) for item in items])
         self.list.set_highlight(current_index)
         self.count_label.setText(f"{len(items)} 首")
 
     def set_current(self, current_index: int) -> None:
         """只更新高亮,不重建列表。
 
-        切歌时用这个而不是 :meth:`set_items`:队列内容没变,重建整表会把用户的滚动
-        位置和选中行一起冲掉。
+        切歌时用这个而不是 :meth:`set_items`:队列内容没变,重建整表会把用户的滚动位置
+        和封面一起冲掉,还要为同一批封面再走一遍取图流程。
 
         Args:
             current_index: 当前项下标;``-1`` 表示没有当前项。
         """
         self.list.set_highlight(current_index)
 
-    def set_collapsed(self, collapsed: bool) -> None:
-        """切换折叠状态。
+    def set_cover(self, url: str, pixmap: QPixmap) -> None:
+        """把取到的封面转给列表(转接给 ``TrackList`` 的同名方法)。
 
         Args:
-            collapsed: ``True`` 折叠(只留标题栏),``False`` 展开。
+            url: 封面地址。
+            pixmap: 已下载好的原图。
         """
-        collapsed = bool(collapsed)
-        if collapsed == self._collapsed:
-            return
-        self._collapsed = collapsed
-        self.list.setVisible(not collapsed)
-        self.clear_button.setVisible(not collapsed)
-        self.count_label.setVisible(not collapsed)
-        if collapsed:
-            self.setMinimumWidth(0)
-            self.setMaximumWidth(COLLAPSED_WIDTH)
-        else:
-            self.setMaximumWidth(16777215)  # Qt 的 QWIDGETSIZE_MAX
-            self.setMinimumWidth(EXPANDED_MIN_WIDTH)
-        self.toggle_button.setToolTip("展开播放队列" if collapsed else "折叠播放队列")
-        self.collapsed_changed.emit(collapsed)
+        self.list.set_cover(url, pixmap)
 
-    def toggle_collapsed(self) -> None:
-        """在折叠与展开之间切换。"""
-        self.set_collapsed(not self._collapsed)
+    @staticmethod
+    def _row_of(item: QueueItem) -> TrackRow:
+        """把队列项摊成列表行。
 
-    @property
-    def collapsed(self) -> bool:
-        """当前是否处于折叠状态。"""
-        return self._collapsed
-
-    def apply_palette(self, colors: Palette) -> None:
-        """套用一套主题配色(数量文字的灰色与折叠按钮的图标色)。
+        曲名用 ``QueueItem.title``:多P合集里它已经是分P标题(领域铁律),不该在这里
+        再判断一次"是不是合集"。
 
         Args:
-            colors: 来自 :func:`bilibili_music.ui.theme.apply_theme` 的调色板。
+            item: 队列项。
+
+        Returns:
+            可以直接交给 ``TrackList`` 的展示数据。
         """
-        self._palette = colors
-        self.count_label.setStyleSheet(f"color: {self._palette.muted};")
-        self.toggle_button.setIcon(
-            get_icon(
-                "list",
-                self._palette.text,
-                16,
-                disabled_color=self._palette.disabled,
-            )
+        duration = item.page.duration_text if item.page is not None else ""
+        prefix, title = split_title_prefix(item.title)
+        return TrackRow(
+            title=title,
+            prefix=prefix,
+            subtitle=item.subtitle,
+            cover_url=item.video.cover_https,
+            columns=(duration,),
         )
 
     # ------------------------------------------------------------ 内部槽

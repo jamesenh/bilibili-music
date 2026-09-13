@@ -20,9 +20,7 @@ from bilibili_music.core.config import (  # noqa: E402
     AppConfig,
     CONFIG_FILE_NAME,
     ConfigStore,
-    DEFAULT_THEME,
     DEFAULT_VOLUME,
-    THEMES,
     config_root,
 )
 from bilibili_music.core.queue import PlayMode  # noqa: E402
@@ -60,7 +58,6 @@ class TestAppConfig(unittest.TestCase):
         config = AppConfig()
         self.assertEqual(config.volume, DEFAULT_VOLUME)
         self.assertIs(config.play_mode, PlayMode.SEQUENCE)
-        self.assertEqual(config.theme, DEFAULT_THEME)
         self.assertEqual(config.last_bvid, "")
         self.assertEqual(config.last_cid, 0)
         self.assertEqual(config.last_position_ms, 0)
@@ -88,11 +85,6 @@ class TestAppConfig(unittest.TestCase):
         self.assertIs(AppConfig(play_mode="bogus").normalized().play_mode, PlayMode.SEQUENCE)
         self.assertIs(AppConfig(play_mode=123).normalized().play_mode, PlayMode.SEQUENCE)
 
-    def test_normalized_recovers_from_unknown_theme(self) -> None:
-        """未知主题退回默认主题。"""
-        self.assertEqual(AppConfig(theme="neon").normalized().theme, DEFAULT_THEME)
-        self.assertIn(AppConfig().normalized().theme, THEMES)
-
     def test_normalized_clamps_negative_position(self) -> None:
         """负数的续播位置要归零,否则会拿着非法值去 seek。"""
         config = AppConfig(last_cid=-3, last_position_ms=-1000).normalized()
@@ -101,14 +93,14 @@ class TestAppConfig(unittest.TestCase):
 
     def test_normalized_does_not_mutate_original(self) -> None:
         """收敛必须返回新对象:就地改会让"原始输入"和"合法化结果"无法对照。"""
-        original = AppConfig(volume=999, theme="neon")
+        original = AppConfig(volume=999, play_mode="bogus")
         original.normalized()
         self.assertEqual(original.volume, 999)
-        self.assertEqual(original.theme, "neon")
+        self.assertEqual(original.play_mode, "bogus")
 
     def test_normalized_is_idempotent(self) -> None:
         """已合法的配置再收敛一次不应发生变化(保存路径会重复调用它)。"""
-        once = AppConfig(volume=999, play_mode="shuffle", theme="dark").normalized()
+        once = AppConfig(volume=999, play_mode="shuffle").normalized()
         twice = once.normalized()
         self.assertEqual(once, twice)
 
@@ -132,7 +124,6 @@ class TestConfigStore(_ScratchCase):
         saved = AppConfig(
             volume=55,
             play_mode=PlayMode.REPEAT_ONE,
-            theme="dark",
             last_bvid="BV1xx411c7mD",
             last_cid=998877,
             last_position_ms=42000,
@@ -163,11 +154,10 @@ class TestConfigStore(_ScratchCase):
     def test_save_normalizes_before_writing(self) -> None:
         """非法值不能落盘:否则坏数据会被固化,下次启动还得再救一次。"""
         store = self._store()
-        store.save(AppConfig(volume=999, play_mode="bogus", theme="neon"))
+        store.save(AppConfig(volume=999, play_mode="bogus"))
         raw = json.loads(store.path.read_text(encoding="utf-8"))
         self.assertEqual(raw["volume"], 100)
         self.assertEqual(raw["play_mode"], PlayMode.SEQUENCE.value)
-        self.assertEqual(raw["theme"], DEFAULT_THEME)
 
     def test_saved_json_keeps_play_mode_as_plain_string(self) -> None:
         """模式要写成普通字符串,配置文件才是人能看懂、也能手改的。"""
@@ -201,13 +191,12 @@ class TestConfigStore(_ScratchCase):
         """手改坏的值在读入时就被收敛,调用方拿到的永远合法。"""
         store = self._store()
         store.path.write_text(
-            json.dumps({"volume": 999, "play_mode": "bogus", "theme": "neon", "last_cid": -1}),
+            json.dumps({"volume": 999, "play_mode": "bogus", "last_cid": -1}),
             encoding="utf-8",
         )
         loaded = store.load()
         self.assertEqual(loaded.volume, 100)
         self.assertIs(loaded.play_mode, PlayMode.SEQUENCE)
-        self.assertEqual(loaded.theme, DEFAULT_THEME)
         self.assertEqual(loaded.last_cid, 0)
 
     def test_load_tolerates_wrong_types_for_every_field(self) -> None:
@@ -218,7 +207,6 @@ class TestConfigStore(_ScratchCase):
                 {
                     "volume": {"nested": 1},
                     "play_mode": ["shuffle"],
-                    "theme": 7,
                     "last_bvid": None,
                     "last_cid": "abc",
                     "last_position_ms": [],

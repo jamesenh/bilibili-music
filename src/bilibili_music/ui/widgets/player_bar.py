@@ -1,11 +1,21 @@
-"""底部播放条:传输控件、进度、音量、播放模式与音质。
+"""底部播放条:封面、曲目信息、传输控件、进度、分P、音质与音量。
 
 控件**不自己保存播放状态**。``set_*`` 方法由上层把状态推下来,信号把用户操作送上去,
 这样"当前在播什么、在播第几秒"只有一个真源(``audio.playback``),不会出现
 "界面显示在播、实际已经停了"这种两边各存一份状态导致的错位。
+
+版式(对着设计稿):左边封面 + 曲名/UP主,中间上面一行传输控件、下面一行进度,
+右边上面是"分P选择器 + 音质下拉"、下面是音量。分P选择器挨着音质下拉:两者都属于
+"这一首怎么播",同处一行既贴着播放控制按钮的右侧,又不会挤到中间的进度条
+(多P合集在队列里只占一行,换分P的入口见 :mod:`.page_selector`)。
+
+两个空按钮的处理见 :meth:`_build_like_button` 与 :meth:`_build_expand_button` ——
+**能点的东西必须真的有用**,装饰性的假按钮一律禁用并说明原因。
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QIcon, QPixmap
@@ -19,22 +29,35 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...core.models import format_duration
+from ...core.models import Page, format_duration
 from ...core.queue import PlayMode
-from ..icons import Palette, get_icon, palette
+from ..icons import DARK, get_icon, render_pixmap
+from ..pixmaps import cover_pixmap
+from .elided_label import ElidedLabel
+from .page_selector import PageSelector
 
 __all__ = [
     "BUTTON_ICON_SIZE",
+    "COVER_SIZE",
     "MODE_CYCLE",
     "QUALITY_CHOICES",
     "PlayerBar",
 ]
 
-#: 播放控件图标的逻辑尺寸。按钮给 32×32,留出内边距。
-BUTTON_ICON_SIZE = 20
+#: 播放控件图标的逻辑尺寸。
+BUTTON_ICON_SIZE = 22
 
 #: 封面缩略图的边长(正方形)。
-COVER_SIZE = 56
+COVER_SIZE = 48
+
+#: 曲目信息区的固定宽度(像素)。固定住是为了让长标题**省略**而不是把中间的进度条挤扁。
+INFO_WIDTH = 176
+
+#: 圆形播放按钮的直径(像素)。
+PLAY_BUTTON_SIZE = 44
+
+#: 其余传输按钮的尺寸(像素)。
+TRANSPORT_BUTTON_SIZE = 32
 
 #: 音质下拉框的固定选项 ``(显示文本, quality_id)``。
 #:
@@ -77,8 +100,10 @@ class PlayerBar(QWidget):
         previous_requested(): 请求上一首
         mode_changed(object): 模式已切换,携带新的 :class:`PlayMode`
         quality_changed(object): 音质已选,携带 ``quality_id``(``None`` 表示自动)
+        page_selected(int): 分P已选,携带目标分P序号(从 1 开始)
         seek_requested(int): 用户拖完进度条,携带目标毫秒
         volume_changed(float): 音量滑块变化,携带 0.0 ~ 1.0
+        queue_toggled(bool): 队列开关被点,携带期望的可见性
     """
 
     play_toggled = Signal()
@@ -86,8 +111,10 @@ class PlayerBar(QWidget):
     previous_requested = Signal()
     mode_changed = Signal(object)
     quality_changed = Signal(object)
+    page_selected = Signal(int)
     seek_requested = Signal(int)
     volume_changed = Signal(float)
+    queue_toggled = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         """建好所有控件并接上内部信号。
@@ -96,13 +123,13 @@ class PlayerBar(QWidget):
             parent: Qt 父对象。
         """
         super().__init__(parent)
-        self._palette = palette("light")
+        self.setObjectName("PlayerBar")
         self._mode = PlayMode.SEQUENCE
         #: 拖动进度条期间不要被播放位置回写打断
         self._seeking = False
         self._duration_ms = 0
-        #: 记住播放态与封面,**只为了换主题时能按新配色重绘**。它们不是播放状态的
-        #: 真源(真源在 audio.playback),这里存的是"上次画成什么样"
+        #: 记住播放态与封面,**只为了换状态时能重绘**。它们不是播放状态的真源
+        #: (真源在 audio.playback),这里存的是"上次画成什么样"
         self._playing = False
         self._cover: QPixmap | None = None
 
@@ -113,42 +140,69 @@ class PlayerBar(QWidget):
     # ------------------------------------------------------------ 构建界面
 
     def _build_ui(self) -> None:
-        """组装封面、曲目信息、传输控件、进度与音量。"""
+        """组装封面、曲目信息、传输控件、进度、音质与音量。"""
         root = QHBoxLayout(self)
-        root.setContentsMargins(8, 6, 8, 6)
-        root.setSpacing(10)
+        root.setContentsMargins(16, 10, 16, 10)
+        root.setSpacing(14)
 
         self.cover = QLabel()
+        self.cover.setObjectName("CoverThumb")
         self.cover.setFixedSize(COVER_SIZE, COVER_SIZE)
-        self.cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self.cover)
         self.set_cover(None)
 
-        info = QVBoxLayout()
-        info.setSpacing(2)
-        self.title_label = QLabel("未播放")
-        self.title_label.setStyleSheet("font-weight: 600;")
-        # 标题过长时自己省略,而不是把播放条撑宽
-        self.title_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        self.subtitle_label = QLabel("")
-        self.subtitle_label.setStyleSheet(f"color: {self._palette.muted};")
-        info.addWidget(self.title_label)
-        info.addWidget(self.subtitle_label)
-        info.addStretch(1)
-        root.addLayout(info, 1)
+        root.addWidget(self._build_info())
+        root.addWidget(self._build_like_button())
 
-        controls = QVBoxLayout()
-        controls.setSpacing(4)
-        controls.addLayout(self._build_transport_row())
-        controls.addLayout(self._build_progress_row())
-        root.addLayout(controls, 2)
+        center = QVBoxLayout()
+        center.setSpacing(10)
+        center.addStretch(1)
+        center.addLayout(self._build_transport_row())
+        center.addLayout(self._build_progress_row())
+        center.addStretch(1)
+        root.addLayout(center, 1)
 
-        root.addLayout(self._build_volume_box())
+        root.addLayout(self._build_right_column())
+
+    def _build_info(self) -> QWidget:
+        """建"曲名 + UP主"这一块。"""
+        box = QWidget()
+        box.setFixedWidth(INFO_WIDTH)
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addStretch(1)
+
+        self.title_label = ElidedLabel("未播放")
+        self.title_label.setObjectName("TrackTitle")
+        self.subtitle_label = ElidedLabel("")
+        self.subtitle_label.setObjectName("TrackSubtitle")
+
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.subtitle_label)
+        layout.addStretch(1)
+        return box
+
+    def _build_like_button(self) -> QPushButton:
+        """建"喜欢"按钮:设计稿里有它,但"喜欢"要落到歌单上,而歌单功能还没做。
+
+        做成**禁用**而不是"点了没反应":禁用的按钮一眼就能看出"现在用不了",
+        比一个看起来能点、点完什么都不发生的按钮诚实。
+        """
+        self.like_button = QPushButton()
+        self.like_button.setObjectName("TransportButton")
+        self.like_button.setFixedSize(TRANSPORT_BUTTON_SIZE, TRANSPORT_BUTTON_SIZE)
+        self.like_button.setIconSize(QSize(18, 18))
+        self.like_button.setIcon(get_icon("heart", DARK.disabled, 18))
+        self.like_button.setToolTip("喜欢(歌单功能开发中)")
+        self.like_button.setEnabled(False)
+        return self.like_button
 
     def _build_transport_row(self) -> QHBoxLayout:
-        """建"模式 / 上一首 / 播放 / 下一首 / 音质"这一行。"""
+        """建"模式 / 上一首 / 播放 / 下一首 / 队列"这一行(整行居中)。"""
         row = QHBoxLayout()
-        row.setSpacing(6)
+        row.setSpacing(8)
+        row.addStretch(1)
 
         self.mode_button = self._icon_button("repeat", "顺序播放(点击切换)")
         self.mode_button.clicked.connect(self._on_mode_clicked)
@@ -156,36 +210,41 @@ class PlayerBar(QWidget):
         self.previous_button = self._icon_button("prev", "上一首")
         self.previous_button.clicked.connect(self.previous_requested.emit)
 
-        self.play_button = self._icon_button("play", "播放")
+        self.play_button = QPushButton()
+        self.play_button.setObjectName("PlayButton")
+        self.play_button.setFixedSize(PLAY_BUTTON_SIZE, PLAY_BUTTON_SIZE)
+        self.play_button.setIconSize(QSize(22, 22))
+        self.play_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.play_button.clicked.connect(self.play_toggled.emit)
 
         self.next_button = self._icon_button("next", "下一首")
         self.next_button.clicked.connect(self.next_requested.emit)
+
+        self.queue_button = self._icon_button("list", "显示/隐藏播放队列")
+        self.queue_button.setCheckable(True)
+        # 选中态要换图标颜色:SVG 是栅格化成位图后染色的,样式表管不到它
+        self.queue_button.toggled.connect(self._on_queue_toggled)
 
         for button in (
             self.mode_button,
             self.previous_button,
             self.play_button,
             self.next_button,
+            self.queue_button,
         ):
             row.addWidget(button)
-
         row.addStretch(1)
-
-        self.quality_combo = QComboBox()
-        for label, quality_id in QUALITY_CHOICES:
-            self.quality_combo.addItem(label, quality_id)
-        self.quality_combo.currentIndexChanged.connect(self._on_quality_changed)
-        row.addWidget(self.quality_combo)
         return row
 
     def _build_progress_row(self) -> QHBoxLayout:
         """建"当前时间 / 进度条 / 总时长"这一行。"""
         row = QHBoxLayout()
-        row.setSpacing(6)
+        row.setSpacing(10)
 
         self.position_label = QLabel("0:00")
+        self.position_label.setObjectName("MutedLabel")
         self.duration_label = QLabel("0:00")
+        self.duration_label.setObjectName("MutedLabel")
         self.position_slider = QSlider(Qt.Orientation.Horizontal)
         self.position_slider.setRange(0, 0)
         self.position_slider.sliderPressed.connect(self._on_slider_pressed)
@@ -196,22 +255,72 @@ class PlayerBar(QWidget):
         row.addWidget(self.duration_label)
         return row
 
-    def _build_volume_box(self) -> QVBoxLayout:
-        """建音量标签 + 滑块。"""
-        box = QVBoxLayout()
-        box.setSpacing(2)
-        self.volume_label = QLabel("音量")
-        self.volume_label.setStyleSheet(f"color: {self._palette.muted};")
+    def _build_right_column(self) -> QVBoxLayout:
+        """建右侧一列:上面"分P选择器 + 音质下拉",下面音量。
+
+        分P选择器与音质下拉同处一行、排在音质**之前**:两者都是"这一首怎么播"的控制,
+        放在播放控制按钮右侧既不打断中间的进度条,也和设计稿一致。两个控件高度不同
+        (36 / 30),所以显式写 ``AlignVCenter`` —— 布局默认会把矮的那个顶到行顶。
+        """
+        column = QVBoxLayout()
+        column.setSpacing(8)
+        column.addStretch(1)
+
+        self.page_selector = PageSelector()
+        self.page_selector.page_selected.connect(self.page_selected.emit)
+
+        self.quality_combo = QComboBox()
+        self.quality_combo.setObjectName("QualityCombo")
+        self.quality_combo.setFixedWidth(118)
+        for label, quality_id in QUALITY_CHOICES:
+            self.quality_combo.addItem(label, quality_id)
+        self.quality_combo.currentIndexChanged.connect(self._on_quality_changed)
+
+        quality_row = QHBoxLayout()
+        quality_row.setSpacing(8)
+        quality_row.addStretch(1)
+        quality_row.addWidget(self.page_selector, 0, Qt.AlignmentFlag.AlignVCenter)
+        quality_row.addWidget(self.quality_combo, 0, Qt.AlignmentFlag.AlignVCenter)
+        column.addLayout(quality_row)
+        column.addLayout(self._build_volume_row())
+        column.addStretch(1)
+        return column
+
+    def _build_volume_row(self) -> QHBoxLayout:
+        """建"音量图标 + 滑块 + 展开"这一行。
+
+        音量图标是**标签**而不是按钮:B站播放器里那颗喇叭点了要静音,静音属于新的
+        播放行为,不在这一轮(只改版式)的范围里;做成标签就只表达"当前音量状态"。
+        """
+        row = QHBoxLayout()
+        row.setSpacing(6)
+
+        self.volume_icon = QLabel()
+        self.volume_icon.setFixedSize(18, 18)
+        self.volume_icon.setPixmap(render_pixmap("volume", DARK.muted, 18))
+
         self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setObjectName("VolumeSlider")
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setFixedWidth(110)
         self.volume_slider.valueChanged.connect(self._on_volume_changed)
-        box.addWidget(self.volume_label)
-        box.addWidget(self.volume_slider)
-        return box
+
+        self.expand_button = QPushButton()
+        self.expand_button.setObjectName("TransportButton")
+        self.expand_button.setFixedSize(TRANSPORT_BUTTON_SIZE, TRANSPORT_BUTTON_SIZE)
+        self.expand_button.setIconSize(QSize(16, 16))
+        self.expand_button.setIcon(get_icon("expand", DARK.disabled, 16))
+        self.expand_button.setToolTip("全屏播放(尚未实现)")
+        self.expand_button.setEnabled(False)
+
+        row.addStretch(1)
+        row.addWidget(self.volume_icon)
+        row.addWidget(self.volume_slider)
+        row.addWidget(self.expand_button)
+        return row
 
     def _icon_button(self, icon_name: str, tooltip: str) -> QPushButton:
-        """造一个只放图标的按钮。
+        """造一个只放图标的传输按钮。
 
         Args:
             icon_name: 图标名(``resources/icons`` 下的文件名)。
@@ -221,10 +330,12 @@ class PlayerBar(QWidget):
             固定尺寸的按钮。
         """
         button = QPushButton()
-        button.setFixedSize(32, 32)
+        button.setObjectName("TransportButton")
+        button.setFixedSize(TRANSPORT_BUTTON_SIZE, TRANSPORT_BUTTON_SIZE)
         button.setIconSize(QSize(BUTTON_ICON_SIZE, BUTTON_ICON_SIZE))
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.setToolTip(tooltip)
-        button.setIcon(self._themed_icon(icon_name, self._palette.text))
+        button.setIcon(self._themed_icon(icon_name, DARK.text))
         return button
 
     def _themed_icon(self, icon_name: str, color: str) -> QIcon:
@@ -233,7 +344,7 @@ class PlayerBar(QWidget):
             icon_name,
             color,
             BUTTON_ICON_SIZE,
-            disabled_color=self._palette.disabled,
+            disabled_color=DARK.disabled,
         )
 
     # ------------------------------------------------------------ 上层推状态
@@ -247,7 +358,8 @@ class PlayerBar(QWidget):
         self._playing = bool(playing)
         name = "pause" if self._playing else "play"
         tooltip = "暂停" if self._playing else "播放"
-        self.play_button.setIcon(self._themed_icon(name, self._palette.text))
+        # 圆形按钮底色是强调色,所以图标要用叠在强调色上的白,而不是普通文字色
+        self.play_button.setIcon(get_icon(name, DARK.on_accent, 22))
         self.play_button.setToolTip(tooltip)
 
     def set_now_playing(self, title: str, subtitle: str) -> None:
@@ -258,7 +370,6 @@ class PlayerBar(QWidget):
             subtitle: 副标题(UP主、音质等)。
         """
         self.title_label.setText(title or "未播放")
-        self.title_label.setToolTip(title or "")
         self.subtitle_label.setText(subtitle or "")
 
     def set_position(self, position_ms: int, duration_ms: int) -> None:
@@ -285,11 +396,7 @@ class PlayerBar(QWidget):
         self._mode = PlayMode(mode)
         icon_name, tooltip = MODE_ICONS[self._mode]
         # 顺序播放用弱化色:图标一样,颜色就是"循环开没开"的唯一区别
-        color = (
-            self._palette.muted
-            if self._mode is PlayMode.SEQUENCE
-            else self._palette.accent
-        )
+        color = DARK.muted if self._mode is PlayMode.SEQUENCE else DARK.accent
         self.mode_button.setIcon(self._themed_icon(icon_name, color))
         self.mode_button.setToolTip(tooltip)
 
@@ -306,61 +413,56 @@ class PlayerBar(QWidget):
         self.quality_combo.setCurrentIndex(index)
         self.quality_combo.blockSignals(False)
 
+    def set_pages(self, pages: Sequence[Page], current_index: int = 0) -> None:
+        """把"当前视频的分P列表 + 正在播的那一P"推给分P选择器。
+
+        Args:
+            pages: 当前视频的分P列表;空序列表示没有当前视频(或详情还没补全)。
+            current_index: 正在播的分P序号,从 1 开始;``0`` 表示没有当前视频。
+        """
+        self.page_selector.set_pages(pages, current_index)
+
+    def set_page_menu_avoid_widget(self, widget: QWidget | None) -> None:
+        """指定分P菜单**不该压住**的控件(实际用法是右侧的播放队列面板)。
+
+        播放条看不到队列面板(那是主窗口组装的),所以引用由上层递进来。
+
+        Args:
+            widget: 要避开的控件;``None`` 表示不需要避让。
+        """
+        self.page_selector.set_avoid_widget(widget)
+
+    def set_queue_visible(self, visible: bool) -> None:
+        """同步队列开关的选中态(不触发 ``queue_toggled``)。
+
+        播放条与侧栏各有一个队列开关,必须显示同一个状态。
+
+        Args:
+            visible: 队列面板当前是否可见。
+        """
+        if self.queue_button.isChecked() == bool(visible):
+            return
+        self.queue_button.blockSignals(True)
+        self.queue_button.setChecked(bool(visible))
+        self.queue_button.blockSignals(False)
+
     def set_cover(self, pixmap: QPixmap | None) -> None:
-        """设置封面缩略图;``None`` 时用音乐图标占位。
+        """设置封面缩略图;``None`` 时用占位图。
 
         Args:
             pixmap: 已下载好的封面;传 ``None`` 表示没有封面(或下载失败)。
         """
         self._cover = pixmap if (pixmap is not None and not pixmap.isNull()) else None
-        self._render_cover()
+        self.cover.setPixmap(cover_pixmap(self._cover, COVER_SIZE))
 
     @property
     def has_cover(self) -> bool:
-        """当前显示的是真封面还是占位图标。
+        """当前显示的是真封面还是占位图。
 
-        封面槽位**永远**有图(没有就画占位图标),所以光看 ``cover.pixmap()`` 非空
-        判断不出"到底有没有封面";界面自检与测试都需要这个明确的答案。
+        封面槽位**永远**有图(没有就画占位图),所以光看 ``cover.pixmap()`` 非空判断不出
+        "到底有没有封面";界面自检与测试都需要这个明确的答案。
         """
         return self._cover is not None
-
-    def _render_cover(self) -> None:
-        """把当前封面(或占位图标)画进封面槽位。
-
-        单独抽出来是因为换主题时也要按新配色重画一遍占位图标。
-        """
-        if self._cover is None:
-            self.cover.setPixmap(
-                self._themed_icon("music", self._palette.muted).pixmap(
-                    COVER_SIZE // 2, COVER_SIZE // 2
-                )
-            )
-            return
-        self.cover.setPixmap(
-            self._cover.scaled(
-                COVER_SIZE,
-                COVER_SIZE,
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
-
-    def apply_palette(self, colors: Palette) -> None:
-        """套用一套主题配色:按新颜色重绘所有图标与文字。
-
-        Args:
-            colors: 来自 :func:`bilibili_music.ui.theme.apply_theme` 的调色板。
-        """
-        self._palette = colors
-        self.subtitle_label.setStyleSheet(f"color: {self._palette.muted};")
-        self.volume_label.setStyleSheet(f"color: {self._palette.muted};")
-        self.previous_button.setIcon(self._themed_icon("prev", self._palette.text))
-        self.next_button.setIcon(self._themed_icon("next", self._palette.text))
-        # 播放按钮与模式按钮的颜色取决于状态,交给各自的方法重画,避免在这里
-        # 复制一遍"哪种状态配哪个图标"的判断
-        self.set_playing(self._playing)
-        self.set_mode(self._mode)
-        self._render_cover()
 
     def set_volume(self, volume: float) -> None:
         """把音量滑块同步到指定值(不触发 ``volume_changed``)。
@@ -372,11 +474,17 @@ class PlayerBar(QWidget):
         self.volume_slider.blockSignals(True)
         self.volume_slider.setValue(value)
         self.volume_slider.blockSignals(False)
+        self._render_volume_icon(value / 100.0)
 
     @property
     def mode(self) -> PlayMode:
         """当前显示的播放模式。"""
         return self._mode
+
+    def _render_volume_icon(self, volume: float) -> None:
+        """按音量大小换喇叭图标(0 的时候是静音图标)。"""
+        name = "volume-mute" if volume <= 0.001 else "volume"
+        self.volume_icon.setPixmap(render_pixmap(name, DARK.muted, 18))
 
     # ------------------------------------------------------------ 内部槽
 
@@ -385,6 +493,13 @@ class PlayerBar(QWidget):
         index = MODE_CYCLE.index(self._mode)
         self.set_mode(MODE_CYCLE[(index + 1) % len(MODE_CYCLE)])
         self.mode_changed.emit(self._mode)
+
+    def _on_queue_toggled(self, checked: bool) -> None:
+        """队列开关:先按新状态重染图标,再把期望的可见性上报。"""
+        self.queue_button.setIcon(
+            self._themed_icon("list", DARK.accent if checked else DARK.text)
+        )
+        self.queue_toggled.emit(bool(checked))
 
     def _on_quality_changed(self, index: int) -> None:
         """上报下拉框选中的档位(``None`` 表示自动)。"""
@@ -400,5 +515,6 @@ class PlayerBar(QWidget):
         self.seek_requested.emit(self.position_slider.value())
 
     def _on_volume_changed(self, value: int) -> None:
-        """把滑块百分比换算成 0.0 ~ 1.0 再上报。"""
+        """把滑块百分比换算成 0.0 ~ 1.0 再上报,并同步喇叭图标。"""
+        self._render_volume_icon(value / 100.0)
         self.volume_changed.emit(value / 100.0)

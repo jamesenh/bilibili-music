@@ -23,20 +23,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # 注意导入顺序:先 QtWidgets/QtGui 再 QtCore(见 scripts/_helpers.py 的说明)
-from PySide6.QtGui import QGuiApplication, QIcon  # noqa: E402
+from PySide6.QtGui import QColor, QGuiApplication, QIcon  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 from PySide6.QtCore import QSize  # noqa: E402
 
 from bilibili_music.ui import icons as icons_mod  # noqa: E402
 from bilibili_music.ui.icons import (  # noqa: E402
     DARK,
-    LIGHT,
     app_icon_path,
     available_icons,
     clear_cache,
     get_icon,
     icon_path,
-    palette,
     render_pixmap,
 )
 
@@ -77,6 +75,15 @@ class TestIconResources(unittest.TestCase):
             "heart",
             "close",
             "refresh",
+            # 自绘标题栏与新版式新增的
+            "minimize",
+            "maximize",
+            "restore",
+            "home",
+            "plus",
+            "more-vertical",
+            "trash",
+            "expand",
         }
         self.assertEqual(expected - set(available_icons()), set())
 
@@ -173,13 +180,13 @@ class TestIconObject(unittest.TestCase):
 
     def test_get_icon_returns_non_null_with_requested_size(self) -> None:
         """get_icon 必须返回请求尺寸的非空 QIcon,否则按钮上会显示成空白占位。"""
-        icon = get_icon("play", LIGHT.text, 20)
+        icon = get_icon("play", DARK.text, 20)
         self.assertFalse(icon.isNull())
         self.assertIn(QSize(20, 20), icon.availableSizes())
 
     def test_disabled_variant_uses_disabled_color(self) -> None:
         """Qt 不会自动灰化 SVG,禁用态必须显式注册,否则按钮禁用后图标不变色。"""
-        icon = get_icon("play", LIGHT.text, 24, disabled_color=LIGHT.disabled)
+        icon = get_icon("play", DARK.text, 24, disabled_color=DARK.disabled)
 
         normal = icon.pixmap(QSize(24, 24), mode=QIcon.Mode.Normal).toImage()
         disabled = icon.pixmap(QSize(24, 24), mode=QIcon.Mode.Disabled).toImage()
@@ -191,11 +198,19 @@ class TestIconObject(unittest.TestCase):
             for y in range(24)
             if disabled.pixelColor(x, y).alpha() > 0
         )
-        self.assertEqual(disabled.pixelColor(*opaque).name(), LIGHT.disabled.lower())
+        # 预乘 alpha 的往返换算有 ±1 的舍入误差(实测 #5A5A5A 读回来是 #595959),
+        # 所以按通道比、允许差 1,而不是拿十六进制字符串硬比
+        actual = disabled.pixelColor(*opaque)
+        expected = QColor(DARK.disabled)
+        for channel in ("red", "green", "blue"):
+            with self.subTest(channel=channel):
+                self.assertLessEqual(
+                    abs(getattr(actual, channel)() - getattr(expected, channel)()), 1
+                )
 
     def test_no_disabled_variant_when_not_requested(self) -> None:
         """未显式传 disabled_color 时不该注册禁用态位图,让 QIcon 走 Qt 自带的降饱和处理。"""
-        icon = get_icon("play", LIGHT.text, 24)
+        icon = get_icon("play", DARK.text, 24)
         normal = icon.pixmap(QSize(24, 24), mode=QIcon.Mode.Normal).toImage()
         disabled = icon.pixmap(QSize(24, 24), mode=QIcon.Mode.Disabled).toImage()
         # Qt 自行降饱和处理,但与正常态不同;这里只断言两种模式都能出图
@@ -204,30 +219,19 @@ class TestIconObject(unittest.TestCase):
 
 
 class TestPalette(unittest.TestCase):
-    """调色板。"""
+    """调色板(应用是深色单主题,所以只有一套)。"""
 
-    def test_known_palettes(self) -> None:
-        """主题名必须映射到对应调色板单例,保证切换主题只是换引用而不是重建配色。"""
-        self.assertIs(palette("light"), LIGHT)
-        self.assertIs(palette("dark"), DARK)
+    def test_colors_are_valid_hex(self) -> None:
+        """每个颜色都必须是 ``#RRGGBB``,否则 Qt 会解析成无效颜色而画不出图标。"""
+        for color in (DARK.text, DARK.muted, DARK.accent, DARK.disabled, DARK.on_accent):
+            with self.subTest(color=color):
+                self.assertTrue(color.startswith("#"))
+                self.assertEqual(len(color), 7)
 
-    def test_unknown_palette_raises(self) -> None:
-        """未知主题名必须抛 ValueError,避免主题名拼错时静默退回某个默认色板。"""
-        with self.assertRaises(ValueError):
-            palette("neon")
-
-    def test_dark_and_light_differ_on_text(self) -> None:
-        """深色主题预留:只换调色板就该得到不同颜色,不需要改 SVG。"""
-        self.assertNotEqual(LIGHT.text, DARK.text)
-
-    def test_palette_colors_are_valid(self) -> None:
-        """深浅两套调色板的每个颜色都必须是 #RRGGBB,否则 Qt 会解析成无效颜色而画不出图标。"""
-        for name in ("light", "dark"):
-            scheme = palette(name)
-            for color in (scheme.text, scheme.muted, scheme.accent, scheme.disabled):
-                with self.subTest(palette=name, color=color):
-                    self.assertTrue(color.startswith("#"))
-                    self.assertEqual(len(color), 7)
+    def test_roles_are_distinct(self) -> None:
+        """正文色与弱化色必须不同:一样的话"次要信息"就区分不出来了。"""
+        self.assertNotEqual(DARK.text, DARK.muted)
+        self.assertNotEqual(DARK.muted, DARK.accent)
 
 
 if __name__ == "__main__":
