@@ -87,6 +87,26 @@ class TestBuildPalette(unittest.TestCase):
 class TestStylesheet(unittest.TestCase):
     """全局 QSS。"""
 
+    @staticmethod
+    def _rule(text: str, selector: str) -> str:
+        """从样式表里抠出某个选择器的规则块(不确定样式表格式就无法断言字号)。
+
+        只取从 ``<selector> {`` 到其后第一个 ``}`` 的那一段 —— 断言"这条规则写了多大字"
+        比断言整份样式表里出现过某个字号更准。
+
+        Args:
+            text: 完整样式表。
+            selector: 要取的选择器,如 ``"QLabel#PageRowTitle"``。
+
+        Returns:
+            规则块文本(含选择器行、不含结尾的 ``}``);找不到时返回空串。
+        """
+        start = text.find(f"{selector} {{")
+        if start < 0:
+            return ""
+        end = text.find("}", start)
+        return text[start:end] if end > start else ""
+
     def test_contains_accent_and_surface_colors(self) -> None:
         """强调色与表面色都要出现在样式表里 —— 否则设计稿的粉色主按钮就没了。"""
         text = stylesheet()
@@ -106,8 +126,23 @@ class TestStylesheet(unittest.TestCase):
             "#PageSelector",
             "#PagePopup",
             "#PageRow",
+            "#PageRowTitle",
         ):
             self.assertIn(name, text)
+
+    def test_page_row_title_is_not_styled_as_the_page_heading(self) -> None:
+        """分P菜单行的标题必须有自己的字号,不许套上内容区大标题的 20px。
+
+        这两处曾经共用 ``#PageTitle``:QSS 按 objectName 选控件,菜单里的小字行因此被
+        内容区大标题(20px 加粗)一起选中,一行只有 34px 高,字差点把行撑满
+        (用户反馈"分P菜单里的字太大")。这条用例按选择器分别取规则块来钉住这个边界。
+        """
+        text = stylesheet()
+        self.assertIn("font-size: 13px;", self._rule(text, "QLabel#PageRowTitle"))
+        # 大标题那条必须还在:内容区的页面标题本来就该是 20px
+        self.assertIn("font-size: 20px;", self._rule(text, "QLabel#PageTitle"))
+        # 菜单行标题的规则不许再落到内容区大标题的 objectName 上
+        self.assertNotIn("font-size: 13px;", self._rule(text, "QLabel#PageTitle"))
 
     def test_is_non_trivial(self) -> None:
         """空样式表说明生成逻辑坏了(比如 f-string 没插值),这里挡一道。"""

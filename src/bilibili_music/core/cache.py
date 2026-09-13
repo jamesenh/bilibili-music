@@ -7,6 +7,11 @@
 写入采用"先写 ``.part`` 再原子替换":下载中断或进程被杀时,不会留下一个
 半截文件被后续误判为有效缓存。``os.replace`` 在同一文件系统内是原子的,
 所以"缓存文件存在"就等价于"这个文件是完整的",不需要额外的元数据校验。
+
+**除了文件,还维护一份索引**(:class:`~bilibili_music.core.cache_index.CacheIndex`,
+与本模块同目录的 ``index.json``):文件名是摘要,只有"知道键再查文件"这一条路,
+而"本地缓存"页需要反向枚举出曲名 / UP主 / 体积。索引只服务于展示与快路径,
+坏了、丢了都不影响播放 —— 见 :func:`~bilibili_music.audio.resolver.pick_best_cached`。
 """
 
 from __future__ import annotations
@@ -17,7 +22,9 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 
+from .cache_index import CachedTrack, CacheIndex, entry_for
 from .errors import BiliMusicError
+from .models import AudioTrack, Page, Video
 
 __all__ = [
     "AudioCache",
@@ -169,6 +176,9 @@ class AudioCache:
         """
         self.root = Path(root) if root is not None else cache_root()
         self.root.mkdir(parents=True, exist_ok=True)
+        #: 与音频文件同目录的索引(可枚举的元数据)。两者**必须同一个 root**:
+        #: 分开了就会出现"清空了音频却留下索引"这类不一致,注入沙箱目录时也容易漏一个。
+        self.index = CacheIndex(root=self.root)
 
     def key_for(self, bvid: str, cid: int, quality_id: int, codec: str = "") -> str:
         """计算缓存键。
@@ -212,6 +222,100 @@ class AudioCache:
             会自己打开它,同步路径请改用 :meth:`store_chunks`。
         """
         return DownloadSink(self.path_for(bvid, cid, quality_id, codec))
+
+    # ------------------------------------------------------------ 索引
+
+    def indexed_hit(self, bvid: str, cid: int) -> tuple[CachedTrack, Path] | None:
+        """按 ``(bvid, cid)`` 从索引里取音质最高的一条,并确认文件还在。
+
+        与 :meth:`lookup` 的分工:``lookup`` 是"知道键去问文件在不在"(不需要索引),
+        这里是"从索引反查已经缓存了什么" —— 它有**真实的档位与 codec**,所以连
+        ``fLaC`` 这类不在常规三档里的缓存也能命中,离线点播因此不会因为索引里记的
+        codec 与盲查猜的不一样而落空。
+
+        索引条目指向的文件可能已经被用户手删,所以这里必须再 ``stat`` 一次:
+        "索引里有"不等于"文件还在"。
+
+        Args:
+            bvid: 视频 BV 号。
+            cid: 分P的 cid。
+
+        Returns:
+            ``(索引记录, 音频文件路径)``;索引里没有这个分P,或对应文件已不在
+            (或为 0 字节)时返回 ``None``。
+        """
+        entry = self.index.find(bvid, cid)
+        if entry is None:
+            return None
+        path = self.root / entry.file_name
+        try:
+            if path.stat().st_size > 0:
+                return entry, path
+        except OSError:
+            pass
+        return None
+
+    def remember(
+        self, video: Video, page: Page, track: AudioTrack, path: Path
+    ) -> bool:
+        """把一次成功的解析结果写进索引(供"本地缓存"页枚举)。
+
+        由解析流程在**成功出口**调用,命中缓存与刚下载完两条路径都会走:前者顺带把
+        "索引里还没有它"(例如索引丢了、或这首歌是在有索引之前缓存的)补上。
+
+        文件大小在这里量:它是界面要显示的信息,而调用方(解析器)手上没有 stat。
+
+        Args:
+            video: 目标视频。
+            page: 目标分P。
+            track: 实际落盘的音轨。
+            path: 音频文件路径。
+
+        Returns:
+            索引内容真的变了并尝试落盘返回 ``True``;完全没变返回 ``False``。
+            **写盘失败不抛异常**,只当这次记录作废(索引不该影响播放)。
+        """
+        size = 0
+        try:
+            size = path.stat().st_size
+        except OSError:
+            pass
+        return self.index.remember(entry_for(video, page, track, path, size_bytes=size))
+
+    def forget(self, entry: CachedTrack) -> bool:
+        """删掉某条缓存:音频文件 + 索引记录。
+
+        先删文件再删索引:反过来的话,文件删不掉(Windows 不允许删已打开的文件,而它
+        很可能正被播放器占着)就会留下一个谁也看不见、却实实在在占着磁盘的孤儿文件。
+
+        Args:
+            entry: 要删除的索引记录。
+
+        Returns:
+            成功删除返回 ``True``;文件被占用或无权限时返回 ``False`` ——
+            此时**索引保持不动**,界面上的这一首还在,用户可以停掉播放再删一次。
+        """
+        path = self.root / entry.file_name
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass  # 文件本来就不在了(用户手删过),索引照样要清掉
+        except OSError:
+            return False
+        self.index.forget(entry.key)
+        return True
+
+    def prune(self) -> int:
+        """剪掉"音频文件已经不在"的索引条目。
+
+        Returns:
+            被剪掉的条目数;索引与磁盘一致时是 ``0``(也不会落盘)。
+        """
+        return self.index.retain_files(self._audio_file_names())
+
+    def _audio_file_names(self) -> list[str]:
+        """列出缓存目录里现存的音频文件名(``prune`` / ``clear`` 的判据)。"""
+        return [path.name for path in self.root.glob("*.m4a") if path.is_file()]
 
     def store_chunks(
         self,
@@ -260,6 +364,10 @@ class AudioCache:
         单个文件删不掉时**跳过而不是中断**:缓存目录里可能有正被播放器占用的
         文件(Windows 不允许删除已打开的文件),为它放弃清理其余文件并不划算。
 
+        删完要把索引与磁盘对齐(见 :meth:`prune`):否则"删不掉的那几个文件"会连着
+        索引记录一起消失,变成谁也看不见、却实实在在占着磁盘的孤儿 —— 界面于是显示
+        "已清空 0 首"但缓存占用纹丝不动,用户完全无从理解。
+
         Returns:
             成功删除的 ``.m4a`` 文件数(不含顺带清理的 ``.part`` 残留)。
         """
@@ -273,4 +381,5 @@ class AudioCache:
         # 上次异常退出遗留的临时文件也一并清掉,它们永远不会被复用
         for path in self.root.glob("*.part"):
             path.unlink(missing_ok=True)
+        self.prune()
         return removed

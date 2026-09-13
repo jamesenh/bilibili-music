@@ -10,8 +10,9 @@
 * **导航项用互斥的 ``QPushButton`` 而不是 ``QListWidget``**:设计稿里的选中态是圆角
   胶囊 + 强调色文字,样式表能直接表达 ``:checked``,而列表项的选中态要跟
   ``::item:selected`` 与 ``QPalette`` 的选中色一起对付。
-* **"播放队列"不在页面组里**:它不是一页,而是右侧队列面板的开关(设计稿里它既有
-  侧栏入口,也有播放条上的按钮)。放进互斥组会导致"打开队列"顺手取消掉当前页面选中。
+* **侧栏不放入口给"播放队列"**:队列面板的开关只有播放条上那一个(见
+  ``PlayerBar.queue_button``)。侧栏每一个入口都是"切一页"的语义,而队列面板是常驻
+  侧边的开关,混在一起会让"点侧栏"到底是换页还是收起面板变得说不清。
 * **图标要手动按选中态重新染色**:SVG 是栅格化成位图之后再染色的,样式表的 ``:checked``
   只管文字颜色,管不到图标 —— 与 ``PlayerBar`` 的播放模式按钮同源。
 * **两套互斥组(页面 / 歌单)**:歌单也是"选中一个"的语义,但选歌单要清掉页面选中态、
@@ -57,23 +58,19 @@ class NavItem:
         key: 内部标识,信号里传的就是它(界面文案可以改,key 不该跟着变)。
         label: 显示文字。
         icon: 图标名(``resources/icons`` 下的文件名)。
-        is_page: ``True`` 表示它切换中间的内容页;``False`` 表示它是个面板开关
-            (只有"播放队列"是这种)。
     """
 
     key: str
     label: str
     icon: str
-    is_page: bool = True
 
 
-#: 侧栏入口。顺序与设计稿一致;"发现""本地缓存"对应的功能分属路线图 M3 / M2,
-#: 当前点开是占位页(见 ``widgets/placeholder.py``)。
+#: 侧栏入口,每一个都对应中间内容区的一页。顺序与设计稿一致;"发现""本地缓存"
+#: 对应的功能分属路线图 M3 / M2,当前点开是占位页(见 ``widgets/placeholder.py``)。
 NAV_ITEMS: tuple[NavItem, ...] = (
     NavItem("discover", "发现", "home"),
     NavItem("results", "搜索结果", "search"),
     NavItem("cache", "本地缓存", "download"),
-    NavItem("queue", "播放队列", "list", is_page=False),
 )
 
 #: "我的歌单"分组的条目 ``(名称, 图标名)``。
@@ -95,7 +92,6 @@ class Sidebar(QWidget):
 
     信号:
         nav_selected(str): 点了某个入口,携带 :attr:`NavItem.key`
-            (播放队列开关也走它,key 是 ``"queue"``,按钮的 check 状态即期望的可见性)
         playlist_selected(str): 点了某个歌单,携带歌单名
         create_playlist_requested(): 点了"我的歌单"旁边的 "+"
     """
@@ -141,7 +137,7 @@ class Sidebar(QWidget):
     # ------------------------------------------------------------ 构建界面
 
     def _nav_button(self, item: NavItem) -> QPushButton:
-        """造一个导航按钮,并按它是不是页面挂到对应的按钮组上。"""
+        """造一个导航按钮,并挂到页面互斥组上。"""
         button = QPushButton(item.label)
         button.setObjectName("NavButton")
         button.setCheckable(True)
@@ -157,8 +153,7 @@ class Sidebar(QWidget):
             )
         )
         button.clicked.connect(lambda _=False, key=item.key: self._on_nav_clicked(key))
-        if item.is_page:
-            self._page_group.addButton(button)
+        self._page_group.addButton(button)
         return button
 
     def _build_playlist_header(self) -> QHBoxLayout:
@@ -219,37 +214,22 @@ class Sidebar(QWidget):
         _paint_nav_icon(button, self._nav_icons[key], True)
         _uncheck_all(self._playlist_group)
 
-    def set_queue_visible(self, visible: bool) -> None:
-        """同步"播放队列"开关的选中态(不触发 ``nav_selected``)。
-
-        播放条上也有队列开关,两处必须显示同一个状态 —— 这条路径用来对齐它们。
-
-        Args:
-            visible: 队列面板当前是否可见。
-        """
-        button = self.nav_buttons.get("queue")
-        if button is None or button.isChecked() == bool(visible):
-            return
-        was_blocked = button.blockSignals(True)
-        button.setChecked(bool(visible))
-        button.blockSignals(was_blocked)
-        _paint_nav_icon(button, self._nav_icons["queue"], bool(visible))
-
     # ------------------------------------------------------------ 内部槽
 
     def _on_nav_clicked(self, key: str) -> None:
-        """点了导航入口:页面类入口要点亮,并清掉歌单的选中态。"""
-        item = next((entry for entry in NAV_ITEMS if entry.key == key), None)
-        if item is not None and item.is_page:
-            _uncheck_all(self._playlist_group)
+        """点了导航入口:清掉歌单的选中态,再把 key 上报给 ``MainWindow``。
+
+        页面入口之间的互斥由 ``_page_group`` 自己保证,这里只管跨组的互斥。
+
+        Args:
+            key: :data:`NAV_ITEMS` 里的键。
+        """
+        _uncheck_all(self._playlist_group)
         self.nav_selected.emit(key)
 
     def _on_playlist_clicked(self, name: str) -> None:
         """点了歌单:清掉页面入口的选中态,再上报。"""
         _uncheck_all(self._page_group)
-        queue_button = self.nav_buttons.get("queue")
-        if queue_button is not None and queue_button.isChecked():
-            queue_button.setChecked(False)
         self.playlist_selected.emit(name)
 
 

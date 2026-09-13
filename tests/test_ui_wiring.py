@@ -35,12 +35,14 @@ from PySide6.QtCore import QBuffer, QIODevice, QObject, Qt, Signal  # noqa: E402
 from bilibili_music.api.bilibili import SearchResult, track_from_quality  # noqa: E402
 from bilibili_music.audio.playback import PlaybackController  # noqa: E402
 from bilibili_music.audio.resolver import ResolvedAudio  # noqa: E402
+from bilibili_music.core.cache import AudioCache  # noqa: E402
 from bilibili_music.core.config import AppConfig, ConfigStore  # noqa: E402
 from bilibili_music.core.cover_cache import CoverCache  # noqa: E402
+from bilibili_music.core.errors import NetworkError  # noqa: E402
 from bilibili_music.core.models import Page, Video  # noqa: E402
 from bilibili_music.core.queue import PlayMode  # noqa: E402
 from bilibili_music.ui.icons import DARK  # noqa: E402
-from bilibili_music.ui.main_window import MainWindow  # noqa: E402
+from bilibili_music.ui.main_window import _SEARCH_MAX_PAGES, MainWindow  # noqa: E402
 from bilibili_music.ui.theme import SURFACES  # noqa: E402
 from bilibili_music.ui.widgets.page_selector import EMPTY_LABEL  # noqa: E402
 
@@ -173,22 +175,109 @@ class _FakePlayer(QObject):
         self.volumes.append(float(volume))
 
 
+@dataclass(slots=True)
+class _PendingSearch:
+    """一次还没被应答的搜索请求(用来模拟慢响应与"迟到的旧回调")。"""
+
+    seq: int
+    keyword: str
+    page: int
+    on_success: Callable[[SearchResult], None]
+    on_error: Callable[[Exception], None]
+
+    def succeed(self, result: SearchResult) -> None:
+        """触发这一页的成功回调。"""
+        self.on_success(result)
+
+    def fail(self, exc: Exception) -> None:
+        """触发这一页的失败回调。"""
+        self.on_error(exc)
+
+
+class _FakeFetchHandle:
+    """搜索请求句柄替身:记录取消,并按契约丢弃尚未触发的回调。"""
+
+    def __init__(self, client: _FakeClient, seq: int) -> None:
+        """绑定所属客户端与请求序号。
+
+        Args:
+            client: 发起这次请求的替身客户端。
+            seq: 请求序号(第几次请求,1 起)。
+        """
+        self._client = client
+        self._seq = seq
+
+    def cancel(self) -> None:
+        """记录取消;真实后端保证"取消后两个回调都不再触发",这里照做。"""
+        self._client.cancelled.append(self._seq)
+        self._client.pending = [p for p in self._client.pending if p.seq != self._seq]
+
+
 class _FakeClient:
     """接口客户端替身:只实现界面用到的 ``search_video`` / ``fetch_cover`` / ``close``。"""
 
-    def __init__(self, videos: list[Video]) -> None:
+    def __init__(
+        self,
+        videos: list[Video],
+        *,
+        pages: dict[int, list[Video]] | None = None,
+        total_pages: int = 1,
+        total: int | None = None,
+        defer: bool = False,
+        fail_pages: set[int] | None = None,
+    ) -> None:
         """记录要返回的搜索结果。
 
         Args:
-            videos: 每次搜索都返回这一批视频。
+            videos: 不翻页时每次搜索都返回这一批(多数用例只关心"搜出来一批")。
+            pages: 页码 -> 该页视频;给了它就按 ``page`` 取,``videos`` 只当兜底。
+            total_pages: 接口自称的总页数(``numPages``)。
+            total: 接口自称的命中总数;``None`` 表示用本页条数。
+            defer: ``True`` 表示**不立刻应答**,把回调攒进 :attr:`pending` 交给用例
+                (只有竞态用例需要:同步应答的话根本来不及插进第二次搜索)。
+            fail_pages: 这些页码的请求改走 ``on_error``(模拟风控 412 / 网络失败)。
         """
         self.videos = list(videos)
+        self.pages = dict(pages) if pages is not None else None
+        self.total_pages = total_pages
+        self.total = total
+        self.defer = defer
+        self.fail_pages = set(fail_pages or ())
         self.keywords: list[str] = []
+        #: 每次搜索请求的 (关键字, 页码),用来断言"翻了第几页、一共翻了几次"
+        self.calls: list[tuple[str, int]] = []
+        #: 被 ``cancel()`` 取消过的请求序号
+        self.cancelled: list[int] = []
+        #: defer 模式下还没被应答的请求
+        self.pending: list[_PendingSearch] = []
         self.closed = 0
         self.cover_calls: list[str] = []
         #: URL -> 还没被应答的回调组**列表**。列表而不是单个回调:搜索列表、队列面板与
         #: 播放条各有自己的封面加载器,同一张图会被请求多次,每次请求都是独立的一笔。
         self._cover_callbacks: dict[str, list[tuple[Callable, Callable]]] = {}
+
+    def result_for(self, page: int, videos: list[Video] | None = None) -> SearchResult:
+        """按当前配置造一份"第 page 页"的响应(供 defer 模式手动应答)。
+
+        Args:
+            page: 页码。
+            videos: 覆盖这一页的视频;``None`` 表示按 :attr:`pages` / :attr:`videos` 取。
+
+        Returns:
+            可直接交给 ``_PendingSearch.succeed`` 的响应。
+        """
+        if videos is None:
+            videos = (
+                list(self.pages.get(page, []))
+                if self.pages is not None
+                else list(self.videos)
+            )
+        return SearchResult(
+            videos=list(videos),
+            page=page,
+            total_pages=self.total_pages,
+            total=self.total if self.total is not None else len(videos),
+        )
 
     def search_video(
         self,
@@ -197,10 +286,20 @@ class _FakeClient:
         page: int = 1,
         on_success: Callable[[SearchResult], None],
         on_error: Callable[[Exception], None],
-    ) -> None:
-        """同步回调一条搜索结果(界面只关心"填表对不对")。"""
+    ) -> _FakeFetchHandle:
+        """应答一页搜索结果;``defer`` 为真时改为攒起来等用例触发。"""
         self.keywords.append(keyword)
-        on_success(SearchResult(videos=list(self.videos), total=len(self.videos)))
+        self.calls.append((keyword, page))
+        seq = len(self.calls)
+        handle = _FakeFetchHandle(self, seq)
+        if page in self.fail_pages:
+            on_error(NetworkError(f"HTTP 412(第 {page} 页)"))
+            return handle
+        if self.defer:
+            self.pending.append(_PendingSearch(seq, keyword, page, on_success, on_error))
+        else:
+            on_success(self.result_for(page))
+        return handle
 
     def fetch_cover(
         self,
@@ -290,7 +389,7 @@ class _WindowCase(unittest.TestCase):
         QPixmapCache.clear()
 
         self.videos = [_video("A"), _video("B", pages=2), _video("C")]
-        self.client = _FakeClient(self.videos)
+        self.client = self._make_client()
         self.resolver = _FakeResolver()
         self.player = _FakePlayer()
         self.playback = PlaybackController(self.resolver, self.player)  # type: ignore[arg-type]
@@ -306,7 +405,9 @@ class _WindowCase(unittest.TestCase):
 
         self.window = MainWindow(
             client=self.client,  # type: ignore[arg-type]
-            cache=object(),  # type: ignore[arg-type]
+            # 音频缓存要指向沙箱目录:切到"本地缓存"页会读它的索引(默认值会去翻真实
+            # 用户的 %LOCALAPPDATA%,那些记录不属于任何用例)
+            cache=AudioCache(self.tmp / "cache"),
             # 封面必须落进沙箱目录:默认值会写到真实用户的 %LOCALAPPDATA%,
             # 而且第二个用例会因为"上一轮的图还在磁盘上"而不再发假请求,断言随之失灵
             cover_cache=CoverCache(self.tmp / "covers"),
@@ -323,10 +424,34 @@ class _WindowCase(unittest.TestCase):
         self.window.title_bar.search_input.setText(keyword)
         self.window.on_search()
 
+    def _make_client(self) -> _FakeClient:
+        """造本次用例用的客户端替身;翻页类用例会覆盖它。"""
+        return _FakeClient(self.videos)
+
     def _search_and_play(self, row: int) -> None:
         """走一遍"搜索 + 双击第 row 行"。"""
         self._search()
         self.window.result_list.row_activated.emit(row)
+
+    def _rebuild_window(self, client: _FakeClient) -> None:
+        """换一个客户端替身重建主窗口(旧窗口先关掉)。
+
+        客户端是在 ``setUp`` 里注入窗口的,而翻页用例需要自己决定"每页返回什么、哪一页
+        失败",所以只能重建 —— 给基类开一堆可覆盖的钩子比重建更难读。重建用另一个封面
+        缓存目录,免得命中上一个窗口留下的磁盘缓存。
+
+        Args:
+            client: 新的客户端替身。
+        """
+        self.window.close()
+        self.client = client
+        self.window = MainWindow(
+            client=client,  # type: ignore[arg-type]
+            cache=object(),  # type: ignore[arg-type]
+            cover_cache=CoverCache(self.tmp / "covers_next"),
+            config_store=self.store,
+            playback=self.playback,
+        )
 
 
 # ====================================================================== 用例
@@ -407,6 +532,184 @@ class TestSearchWiring(_WindowCase):
         self.window.result_list.add_requested.emit(2)
         self.assertEqual(len(self.playback.queue), 1)
         self.assertEqual(self.playback.queue.items[0].video.bvid, "C")
+
+
+class TestSearchPagingWiring(_WindowCase):
+    """搜索结果的翻页加载:滚到底追加、去重、停止条件与竞态。"""
+
+    def _make_client(self) -> _FakeClient:
+        """三页结果,其中第 2 页**故意重复**第 1 页的一条 —— 实测接口真的会这样。
+
+        第 2 页重复 ``B``,所以三页全部加载完应该是 A B C D E F G H 共 8 行。
+        """
+        self.page1 = [_video("A"), _video("B"), _video("C")]
+        self.page2 = [_video("B"), _video("D"), _video("E")]
+        self.page3 = [_video("F"), _video("G"), _video("H")]
+        return _FakeClient(
+            self.page1,
+            pages={1: self.page1, 2: self.page2, 3: self.page3},
+            total_pages=3,
+            total=8,
+        )
+
+    def _titles(self) -> list[str]:
+        """结果表当前所有行的标题。"""
+        table = self.window.result_list
+        return [table.title_at(row) for row in range(table.rowCount())]
+
+    def _page_of(self, index: int) -> int:
+        """第 index 次搜索请求请求的是第几页(0 起)。"""
+        return self.client.calls[index][1]
+
+    def test_search_only_asks_for_the_first_page(self) -> None:
+        """首次搜索只取第 1 页,不预取(每页都是一次请求,不能开局就打一串)。"""
+        self._search()
+        self.assertEqual(self.client.calls, [("周杰伦", 1)])
+
+    def test_scrolling_to_the_bottom_appends_the_next_page(self) -> None:
+        """滚到底要自动取下一页并**追加**,而不是把已有结果换掉。"""
+        self._search()
+        self.assertEqual(self._titles(), ["视频A", "视频B", "视频C"])
+
+        self.window.result_list.load_more_requested.emit()
+
+        self.assertEqual(self._page_of(1), 2)
+        self.assertEqual(
+            self._titles(), ["视频A", "视频B", "视频C", "视频D", "视频E"]
+        )
+        # 追加的行序号接着排,不是从 1 重来
+        self.assertEqual(self.window.result_list.item(4, 0).text(), "5")
+
+    def test_duplicate_bvids_are_listed_once(self) -> None:
+        """相邻两页会重叠(实测 p1 与 p2 有 3 条重复),重复的不能再显示一行。"""
+        self._search()
+        self.window.result_list.load_more_requested.emit()  # 第 2 页带回了 B
+        self.assertEqual(self._titles().count("视频B"), 1)
+        self.assertEqual(self.window.result_list.rowCount(), 5)
+
+    def test_keeps_loading_until_the_last_page_then_stops(self) -> None:
+        """翻到接口说的末页就停:不能一直请求下去。"""
+        self._search()
+        self.window.result_list.load_more_requested.emit()
+        self.window.result_list.load_more_requested.emit()
+        self.assertEqual(self._titles(), [f"视频{x}" for x in "ABCDEFGH"])
+        self.assertEqual(len(self.client.calls), 3)
+
+        self.window.result_list.load_more_requested.emit()  # 到底了再滚也不发请求
+        self.assertEqual(len(self.client.calls), 3)
+        self.assertIn("全部", self.window.status_label.text())
+
+    def test_a_page_without_any_new_item_stops_the_paging(self) -> None:
+        """本页没带来新条目就停。
+
+        实测**越界页码会被接口静默当成第 1 页返回**,所以"还有下一页"不能只信
+        ``numPages`` —— 这里让第 2 页原样回第 1 页的数据,必须立刻停,否则会无限重复。
+        """
+        client = _FakeClient(
+            self.videos,
+            pages={1: list(self.videos), 2: list(self.videos)},
+            total_pages=99,
+            total=200,
+        )
+        self._rebuild_window(client)
+        self._search()
+        self.window.result_list.load_more_requested.emit()
+        self.assertEqual(len(client.calls), 2)
+
+        self.window.result_list.load_more_requested.emit()
+        self.assertEqual(len(client.calls), 2, "重复的第 1 页不该被一遍遍拉")
+        self.assertEqual(self.window.result_list.rowCount(), 3)
+
+    def test_stops_at_the_configured_page_limit(self) -> None:
+        """自设上限到了就停:接口给几十页,不能真的翻几十次(风控)。"""
+        pages = {
+            page: [_video(f"P{page}-{i}") for i in range(3)]
+            for page in range(1, 10)
+        }
+        self._rebuild_window(
+            _FakeClient(pages[1], pages=pages, total_pages=99, total=999)
+        )
+        self._search()
+        for _ in range(10):
+            self.window.result_list.load_more_requested.emit()
+
+        self.assertEqual(len(self.client.calls), _SEARCH_MAX_PAGES)
+        self.assertEqual(
+            self.window.result_list.rowCount(), _SEARCH_MAX_PAGES * 3
+        )
+        self.assertIn(str(_SEARCH_MAX_PAGES), self.window.status_label.text())
+
+    def test_a_new_search_resets_the_paging_state(self) -> None:
+        """换关键字重新搜索要从第 1 页重来,不能接着上一次的页码往下翻。"""
+        self._search()
+        self.window.result_list.load_more_requested.emit()  # 到第 2 页
+        self.window.title_bar.search_input.setText("晴天")
+        self.window.on_search()
+        self.assertEqual(self._page_of(2), 1)
+        self.assertEqual(self._titles(), ["视频A", "视频B", "视频C"])
+
+    def test_late_response_of_a_replaced_search_is_dropped(self) -> None:
+        """被换掉的搜索即使响应迟到,也不能污染新结果(序号对不上就丢弃)。"""
+        client = _FakeClient(self.videos, defer=True)
+        self._rebuild_window(client)
+
+        self.window.title_bar.search_input.setText("第一个")
+        self.window.on_search()
+        stale = client.pending[0]  # 抓住旧请求的回调,模拟"已经在路上"
+
+        self.window.title_bar.search_input.setText("第二个")
+        self.window.on_search()
+        self.assertEqual(client.cancelled, [1], "旧请求要被取消")
+
+        stale.succeed(SearchResult(videos=[_video("ZZZ")], page=1, total_pages=1))
+        self.assertEqual(self.window.result_list.rowCount(), 0, "旧响应必须被丢弃")
+
+        client.pending[0].succeed(client.result_for(1))
+        self.assertEqual(self._titles(), ["视频A", "视频B", "视频C"])
+
+    def test_failed_next_page_offers_a_retry_button(self) -> None:
+        """翻页失败不能静默:要给一个看得见、点得动的重试出口(滚动触发是隐式的)。"""
+        pages = {1: list(self.videos), 2: [_video("D")]}
+        self._rebuild_window(
+            _FakeClient(
+                self.videos, pages=pages, total_pages=3, total=4, fail_pages={2}
+            )
+        )
+        self._search()
+        self.assertTrue(self.window.load_more_button.isHidden(), "平时不该占地方")
+
+        self.window.result_list.load_more_requested.emit()  # 第 2 页失败
+        self.assertFalse(self.window.load_more_button.isHidden())
+        self.assertIn("失败", self.window.status_label.text())
+        self.assertEqual(self.warnings, [], "翻页失败不该弹模态框打断用户")
+
+    def test_retry_button_loads_the_failed_page(self) -> None:
+        """点重试要真的把那页再取一次,成功后按钮自己收起来。"""
+        pages = {1: list(self.videos), 2: [_video("D")]}
+        client = _FakeClient(
+            self.videos, pages=pages, total_pages=3, total=4, fail_pages={2}
+        )
+        self._rebuild_window(client)
+        self._search()
+        self.window.result_list.load_more_requested.emit()
+        self.assertFalse(self.window.load_more_button.isHidden())
+
+        client.fail_pages.clear()  # 风控过去了
+        self.window.load_more_button.click()
+
+        self.assertEqual(self._titles(), ["视频A", "视频B", "视频C", "视频D"])
+        self.assertTrue(self.window.load_more_button.isHidden())
+        self.assertEqual(self._page_of(2), 2)
+
+    def test_failed_first_page_still_warns_with_a_dialog(self) -> None:
+        """第 1 页失败是用户主动点的搜索,必须弹窗让他看见(与翻页失败区别对待)。"""
+        self._rebuild_window(
+            _FakeClient(self.videos, total_pages=1, fail_pages={1})
+        )
+        self._search()
+        self.assertEqual(len(self.warnings), 1)
+        self.assertIn("搜索失败", self.warnings[0])
+        self.assertTrue(self.window.load_more_button.isHidden())
 
 
 class TestPlayerBarWiring(_WindowCase):
@@ -582,34 +885,25 @@ class TestQueueDrawerWiring(_WindowCase):
 
 
 class TestQueueVisibilityWiring(_WindowCase):
-    """队列面板的显示/隐藏:播放条与侧栏两个开关必须显示同一个状态。"""
+    """队列面板的显示/隐藏:开关只有播放条上那一个。"""
 
     def _visible(self) -> bool:
         """队列面板当前是否可见。"""
         return not self.window.queue_drawer.isHidden()
 
     def test_queue_is_visible_on_start(self) -> None:
-        """设计稿里队列面板默认是展开的,两个开关也要是选中态。"""
+        """设计稿里队列面板默认是展开的,播放条上的开关要是选中态。"""
         self.assertTrue(self._visible())
         self.assertTrue(self.window.player_bar.queue_button.isChecked())
-        self.assertTrue(self.window.sidebar.nav_buttons["queue"].isChecked())
 
     def test_player_bar_button_hides_and_shows(self) -> None:
-        """播放条上的队列开关要真的收起面板,并把侧栏的开关一起同步。"""
+        """播放条上的队列开关要真的收起/展开面板。"""
         self.window.player_bar.queue_button.click()
         self.assertFalse(self._visible())
-        self.assertFalse(self.window.sidebar.nav_buttons["queue"].isChecked())
+        self.assertFalse(self.window.player_bar.queue_button.isChecked())
         self.window.player_bar.queue_button.click()
         self.assertTrue(self._visible())
-        self.assertTrue(self.window.sidebar.nav_buttons["queue"].isChecked())
-
-    def test_sidebar_entry_toggles_the_panel(self) -> None:
-        """侧栏的"播放队列"是面板开关而不是一页,点它不该把内容页换掉。"""
-        self.window.sidebar.nav_buttons["results"].click()
-        current = self.window.pages.currentWidget()
-        self.window.sidebar.nav_buttons["queue"].click()
-        self.assertFalse(self._visible())
-        self.assertIs(self.window.pages.currentWidget(), current)
+        self.assertTrue(self.window.player_bar.queue_button.isChecked())
 
 
 class TestNavigationWiring(_WindowCase):
@@ -622,15 +916,21 @@ class TestNavigationWiring(_WindowCase):
         self.assertIs(self.window.pages.currentWidget(), self.window.results_page)
 
     def test_unimplemented_entries_show_a_placeholder(self) -> None:
-        """"发现""本地缓存"都还没有功能:必须给占位页,而不是点了没反应。"""
-        for key, title in (("discover", "发现"), ("cache", "本地缓存")):
-            with self.subTest(entry=key):
-                self.window.sidebar.nav_buttons[key].click()
-                self.assertIs(
-                    self.window.pages.currentWidget(), self.window.placeholder_page
-                )
-                self.assertEqual(self.window.placeholder_page.title_label.full_text(), title)
-                self.assertIn("还没实现", self.window.placeholder_page.hint_label.full_text())
+        """"发现"还没有功能:必须给占位页,而不是点了没反应。"""
+        self.window.sidebar.nav_buttons["discover"].click()
+        self.assertIs(self.window.pages.currentWidget(), self.window.placeholder_page)
+        self.assertEqual(self.window.placeholder_page.title_label.full_text(), "发现")
+        self.assertIn("还没实现", self.window.placeholder_page.hint_label.full_text())
+
+    def test_cache_entry_shows_the_local_cache_page(self) -> None:
+        """"本地缓存"已经是真的页面了,不再落进占位页(路线图 M2.2)。
+
+        页面内容与离线点播在 ``tests/test_cache_page.py`` 里细验,这里只钉住"侧栏这一格
+        通向哪一页"这条接线。
+        """
+        self.window.sidebar.nav_buttons["cache"].click()
+        self.assertIs(self.window.pages.currentWidget(), self.window.cache_page)
+        self.assertTrue(self.window.sidebar.nav_buttons["cache"].isChecked())
 
     def test_playlist_entry_shows_a_placeholder(self) -> None:
         """歌单同样是占位页(路线图 M5 冻结),标题要写清是哪个歌单。"""

@@ -11,6 +11,7 @@
 * :mod:`.player_bar` —— ``PlayerBar``,底部播放条
 * :mod:`.page_selector` —— ``PageSelector``,播放条上的分P选择器与它的弹出菜单
 * :mod:`.queue_drawer` —— ``QueueDrawer``,右侧播放队列面板
+* :mod:`.cache_page` —— ``CachePage``,本地缓存页(已缓存音频的列表与清理)
 * :mod:`.placeholder` —— ``PlaceholderPage``,尚未实现的功能的占位页
 * :mod:`.elided_label` —— ``ElidedLabel``,按宽度省略过长文字的标签
 
@@ -18,6 +19,7 @@
 "下一首放什么"这类决定一律在 :mod:`bilibili_music.audio.playback` 里做。
 """
 
+from .cache_page import CachePage
 from .elided_label import ElidedLabel
 from .page_selector import PageSelector
 from .placeholder import PlaceholderPage
@@ -29,6 +31,7 @@ from .track_list import TrackList, TrackRow
 from .window_frame import FramelessWindow
 
 __all__ = [
+    "CachePage",
     "ElidedLabel",
     "FramelessWindow",
     "PageSelector",

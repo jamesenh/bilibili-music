@@ -20,6 +20,7 @@ __all__ = [
     "Video",
     "format_count",
     "format_duration",
+    "format_size",
     "track_subtitle",
     "track_title",
 ]
@@ -60,6 +61,31 @@ def format_count(count: int) -> str:
     if count >= 10_000:
         return f"{count / 10_000:.1f}万"
     return str(int(count))
+
+
+def format_size(size_bytes: int) -> str:
+    """把字节数格式化成 ``3.4 MB`` / ``812 KB``。
+
+    按 1024 进制(与文件管理器的口径一致),小数位分档给:
+
+    * ``B`` 不带小数 —— 几百字节的零头没有意义
+    * ``KB`` 取整 —— 一首歌是几 MB,显示 ``812.3 KB`` 只是噪声
+    * ``MB`` 一位、``GB`` 两位 —— 这是缓存占用真正会被读到的量级,多留一位有用
+
+    Args:
+        size_bytes: 字节数;负数按 ``0`` 处理。
+
+    Returns:
+        形如 ``"812 KB"`` / ``"3.4 MB"`` 的字符串。
+    """
+    size = max(0, int(size_bytes))
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024**2:
+        return f"{size / 1024:.0f} KB"
+    if size < 1024**3:
+        return f"{size / 1024**2:.1f} MB"
+    return f"{size / 1024**3:.2f} GB"
 
 
 def track_title(video: Video, page: Page | None) -> str:

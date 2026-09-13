@@ -11,8 +11,8 @@
     │ [图标] [搜索框 ..............] [搜索]      [-][□][×] │  ← TitleBar(自绘)
     ├────────┬──────────────────────────┬──────────────────┤
     │ Sidebar│ 内容页(QStackedWidget)   │ QueueDrawer      │
-    │ 发现   │  搜索结果页 / 占位页      │ 播放队列         │
-    │ ...    │                          │                  │
+    │ 发现   │  搜索结果页 / 本地缓存页  │ 播放队列         │
+    │ ...    │  / 占位页                │                  │
     ├────────┴──────────────────────────┴──────────────────┤
     │ [封面] 曲名/UP主   [传输控件]  [进度]  [分P/音质/音量] │  ← PlayerBar
     └──────────────────────────────────────────────────────┘
@@ -23,10 +23,20 @@
 分P都是一首独立的歌,所以换分P既不改队列,也不在搜索结果列表里 —— 它显示当前正在播
 那个视频的分P,选中的目标交给 ``audio.playback`` 走既有的播放切换流程。
 
-侧栏入口里"发现""本地缓存"以及"我的歌单"对应的功能分别属于路线图 M3 / M2 / M5,
-当前都还没有实现 —— 点开是一张把话说清楚的占位页,而不是点了没反应(见
-:class:`~bilibili_music.ui.widgets.placeholder.PlaceholderPage`)。"播放队列"不是一页,
-它是右侧队列面板的开关。
+侧栏入口里"发现"与"我的歌单"对应的功能分别属于路线图 M3 / M5,当前还没有实现 ——
+点开是一张把话说清楚的占位页,而不是点了没反应(见
+:class:`~bilibili_music.ui.widgets.placeholder.PlaceholderPage`)。"播放队列"不是页面入口,
+它是右侧队列面板的开关,只有播放条上那一个按钮(见 ``PlayerBar.queue_button``)。
+
+**"本地缓存"页(路线图 M2.2)是真的**:它列出 ``AudioCache`` 索引里的已缓存音轨,
+支持过滤、离线点播与删除;这一页的数据来自索引(见 ``core/cache_index.py``),而
+"索引怎么维护"是解析层的事 —— 这里只负责在需要的时候读一遍推给界面
+(见 :meth:`MainWindow._refresh_cache_page`)。
+
+**搜索结果是分页加载的**:接口一次只给一页(见 ``api.bilibili.py`` 的 ``search_video``),
+列表滚到接近底部时自动取下一页并追加,失败时底部会出现一个"重试"按钮。页码、去重与
+停止条件全在这里裁决(见 :meth:`MainWindow._decide_has_more`),``TrackList`` 只报
+"用户快到底了"。
 
 依赖以参数注入的只有"可替换的外部资源"(客户端 / 音频缓存 / 封面缓存 / 配置 / 编排器):
 默认全部走真实实现,测试可以塞替身进来,于是界面接线能被自动化验证,而不是只能靠肉眼点。
@@ -35,8 +45,9 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 
-from PySide6.QtCore import QEvent, QUrl
+from PySide6.QtCore import QEvent, Qt, QUrl
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -45,6 +56,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QProgressBar,
+    QPushButton,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -55,14 +67,17 @@ from ..audio.playback import PlaybackController
 from ..audio.player import PlayerController
 from ..audio.resolver import AudioResolver, ResolvedAudio
 from ..core.cache import AudioCache
+from ..core.cache_index import CachedTrack, video_from_entry
 from ..core.config import ConfigStore
 from ..core.cover_cache import CoverCache
-from ..core.models import Video, format_count
+from ..core.models import Video, format_count, format_size
 from ..core.queue import QueueItem
+from ..net.base import FetchHandle
 from .cover_loader import CoverLoader
 from .icons import app_icon_path
 from .theme import apply_theme
 from .widgets import (
+    CachePage,
     FramelessWindow,
     PlaceholderPage,
     PlayerBar,
@@ -88,12 +103,19 @@ _ACTION_COLUMN = 5
 #: "分P"列在详情补全前显示的占位符。
 _UNKNOWN_PAGES = "?"
 
+#: 搜索最多自动加载几页。
+#:
+#: 接口自己允许几十页(实测 ``numPages`` ≈ 34,``numResults`` 封顶 1000),但**每翻一页
+#: 就是一次搜索请求**,而搜索接口是风控重灾区(README「坑 3」:同一份请求连发第 3 次
+#: 就可能 412)。5 页 ≈ 150 条,挑歌足够了,代价封顶在 5 次请求。
+_SEARCH_MAX_PAGES = 5
+
 #: 侧栏里那些"还没有对应功能"的入口 -> ``(占位页标题, 说明)``。
 #:
 #: 说明里写上路线图编号,是为了让"为什么这页是空的"有据可查,而不是一句"敬请期待"。
+#: "本地缓存"原来也在这张表里,现在它是真的页面了(路线图 M2.2)。
 _PLACEHOLDER_PAGES: dict[str, tuple[str, str]] = {
     "discover": ("发现", "排行榜与内容发现还没实现(路线图 M3)"),
-    "cache": ("本地缓存", "本地曲库还没实现,要先有缓存索引(路线图 M2.1)"),
 }
 
 #: 歌单相关入口的占位说明。
@@ -150,6 +172,24 @@ class MainWindow(FramelessWindow):
         )
 
         self._videos: list[Video] = []
+        #: 当前结果集里出现过的 bvid。**去重是必需的,不是保险**:实测同一次搜索的相邻
+        #: 两页之间会重叠若干条(排序在两次请求之间会变),不查重就会在列表里出现重复行。
+        self._seen_bvids: set[str] = set()
+        #: 当前结果对应的关键字;空串表示还没搜过(翻页时要靠它)
+        self._search_keyword = ""
+        #: 已经拿到手的页码(第 1 页记 1);0 表示一条都还没有
+        self._loaded_page = 0
+        #: 接口在这一页回的总页数(``numPages``);它是按接口**实际**使用的 pagesize 算的
+        self._total_pages = 1
+        #: 还能不能接着翻页。由 :meth:`_decide_has_more` 统一裁决,别处只读不写
+        self._has_more = False
+        #: 是否有搜索请求在飞。挡住"滚动到底"的重复触发(滚一下会来好几个 valueChanged)
+        self._searching = False
+        #: 在飞的搜索句柄(用来取消);没有请求时为 ``None``
+        self._search_handle: FetchHandle | None = None
+        #: 请求序号:每次发起新请求就 +1。响应回来时对不上号就丢弃 —— 否则"搜索 A 的
+        #: 第 2 页"会追加进"搜索 B 的结果里(与 resolver 里 ``_alive`` 是同一类防护)
+        self._search_token = 0
         #: 最近一次位置信号里的毫秒数;落盘只在切歌与退出时做(见 _remember_position)
         self._position_ms = 0
         self._config = self.config_store.load()
@@ -159,12 +199,16 @@ class MainWindow(FramelessWindow):
         )
         #: 搜索列表与队列面板各自一个加载器:两边都会整体换内容,共用一个的话
         #: "列表换了一批"会把另一边还在排队的封面一起清掉。
-        #: 三个加载器**共用同一个磁盘缓存**:同一张图在播放条与列表里是同一个 URL,
+        #: 本地缓存页同理(它的内容会随过滤框每一次输入整体重绘)。
+        #: 四个加载器**共用同一个磁盘缓存**:同一张图在播放条与列表里是同一个 URL,
         #: 谁的队列先走到就落盘,另一个直接命中,不会重复下载。
         self.list_covers = CoverLoader(
             self.client.fetch_cover, cache=self.cover_cache
         )
         self.queue_covers = CoverLoader(
+            self.client.fetch_cover, cache=self.cover_cache
+        )
+        self.cache_covers = CoverLoader(
             self.client.fetch_cover, cache=self.cover_cache
         )
 
@@ -193,8 +237,10 @@ class MainWindow(FramelessWindow):
 
         self.pages = QStackedWidget()
         self.results_page = self._build_results_page()
+        self.cache_page = CachePage(self.cache_covers)
         self.placeholder_page = PlaceholderPage()
         self.pages.addWidget(self.results_page)
+        self.pages.addWidget(self.cache_page)
         self.pages.addWidget(self.placeholder_page)
         body.addWidget(self.pages, 1)
 
@@ -255,13 +301,25 @@ class MainWindow(FramelessWindow):
         return row
 
     def _build_footer(self) -> QHBoxLayout:
-        """建列表下方的"状态文字 + 缓存进度条"这一行。"""
+        """建列表下方的"状态文字 + 重试按钮 + 缓存进度条"这一行。
+
+        "加载更多"按钮平时是**隐藏**的:正常翻页由"滚到底"自动触发,不需要用户点。
+        它只在翻页失败时露出来 —— 滚动触发是隐式的,失败了必须给一个看得见、点得动的
+        出口,否则用户只会看到列表不再增长。
+        """
         row = QHBoxLayout()
         row.setSpacing(10)
 
         self.status_label = QLabel("就绪")
         self.status_label.setObjectName("StatusLabel")
         row.addWidget(self.status_label, 1)
+
+        self.load_more_button = QPushButton("加载更多")
+        self.load_more_button.setObjectName("GhostTextButton")
+        self.load_more_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.load_more_button.setVisible(False)
+        self.load_more_button.clicked.connect(self._load_more)
+        row.addWidget(self.load_more_button)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -298,6 +356,8 @@ class MainWindow(FramelessWindow):
         self.queue_drawer.clear_requested.connect(self.playback.clear)
 
         self.title_bar.search_requested.connect(self.on_search)
+        # 列表只报"快到底了",要不要真去翻页由 _load_more 一处决定
+        self.result_list.load_more_requested.connect(self._load_more)
         self.title_bar.minimize_requested.connect(self.showMinimized)
         self.title_bar.maximize_requested.connect(self._toggle_maximized)
         self.title_bar.close_requested.connect(self.close)
@@ -306,10 +366,17 @@ class MainWindow(FramelessWindow):
         self.sidebar.playlist_selected.connect(self._on_playlist_selected)
         self.sidebar.create_playlist_requested.connect(self._on_create_playlist)
 
+        self.cache_page.row_activated.connect(self._on_cache_activated)
+        self.cache_page.row_menu_requested.connect(self._on_cache_menu)
+        self.cache_page.add_requested.connect(self._on_cache_add)
+        self.cache_page.remove_requested.connect(self._on_cache_remove)
+        self.cache_page.clear_requested.connect(self._on_cache_clear)
+
         self.cover_loader.loaded.connect(self._on_cover_loaded)
         self.cover_loader.failed.connect(self._on_cover_failed)
         self.list_covers.loaded.connect(self.result_list.set_cover)
         self.queue_covers.loaded.connect(self.queue_drawer.set_cover)
+        self.cache_covers.loaded.connect(self.cache_page.set_cover)
 
     def _apply_window_icon(self) -> None:
         """设置窗口/任务栏图标。
@@ -339,39 +406,162 @@ class MainWindow(FramelessWindow):
     # ------------------------------------------------------------ 搜索
 
     def on_search(self) -> None:
-        """发起搜索(回车或点按钮都会走到这里)。
+        """发起**新**搜索(回车或点按钮都会走到这里)。
 
-        请求是异步的:先把按钮禁掉再发,否则用户连点会叠出多个搜索请求,
-        在这个接口上等于自找风控。
+        新搜索一律从第 1 页重来:作废在飞的旧请求、清掉上一次的结果与页码,再取第一页。
+        请求是异步的,所以过程中禁掉搜索按钮 —— 否则用户连点会叠出多个请求,在这个接口上
+        等于自找风控。
         """
         keyword = self.title_bar.search_input.text().strip()
         if not keyword:
             return
-        self.title_bar.search_button.setEnabled(False)
+        self._search_keyword = keyword
+        self._videos = []
+        self._seen_bvids.clear()
+        self._loaded_page = 0
+        self._total_pages = 1
+        self._has_more = False
         self.query_label.setText(f"「{keyword}」")
         self.total_label.setText("")
-        self.status_label.setText(f"正在搜索「{keyword}」…")
-        self.client.search_video(
-            keyword,
-            on_success=self._on_search_done,
-            on_error=self._on_search_failed,
-        )
-
-    def _on_search_done(self, result: SearchResult) -> None:
-        """搜索成功:填表并把分P列标成未知(要等详情接口才知道)。"""
-        self.title_bar.search_button.setEnabled(True)
-        self._videos = list(result.videos)
-        self.result_list.set_tracks(
-            [self._track_row_of(video) for video in self._videos]
-        )
+        # 立刻清空旧结果:留着上一批会让人以为"这次搜索搜出了这些"
+        self.result_list.set_tracks([])
         self.result_list.set_highlight(-1)
-        self.total_label.setText(f"共找到 {result.total} 个视频")
-        self.status_label.setText(f"本页 {len(result.videos)} 条")
+        self._request_search_page(1)
 
-    def _on_search_failed(self, exc: Exception) -> None:
-        """搜索失败:恢复按钮并如实报错。"""
+    def _request_search_page(self, page: int) -> None:
+        """请求某一页搜索结果,并给这次请求编号。
+
+        Args:
+            page: 页码,从 1 开始。
+        """
+        self._cancel_search_request()  # 同一时刻只允许一个搜索请求在飞
+        token = self._search_token
+        self._searching = True
+        self.load_more_button.setVisible(False)
+        self.title_bar.search_button.setEnabled(False)
+        self.status_label.setText(
+            f"正在搜索「{self._search_keyword}」…"
+            if page == 1
+            else f"正在加载第 {page} 页…"
+        )
+        self._search_handle = self.client.search_video(
+            self._search_keyword,
+            page=page,
+            on_success=lambda result: self._on_search_page(result, page, token),
+            on_error=lambda exc: self._on_search_failed(exc, token),
+        )
+
+    def _cancel_search_request(self) -> None:
+        """取消在飞的搜索请求,并让它的回调作废。
+
+        只靠 ``cancel()`` 是不够的:两个后端都保证"取消后不再回调",但换关键字与翻页
+        都是"发新的",先自增序号最稳妥 —— 回来得再快也认不出这是哪一次的了。
+        """
+        handle = self._search_handle
+        self._search_handle = None
+        if handle is not None:
+            handle.cancel()
+        self._search_token += 1
+
+    def _on_search_page(self, result: SearchResult, page: int, token: int) -> None:
+        """某一页搜索结果到了:第 1 页替换列表,后续页追加(并按 bvid 去重)。
+
+        Args:
+            result: 接口返回的这一页。
+            page: 请求时用的页码。
+            token: 请求序号;与当前序号对不上说明这次结果已经过期,直接丢弃。
+        """
+        if token != self._search_token:
+            return  # 用户已经换了关键字(或这次请求已被取消),这份结果不能再用了
+        self._searching = False
+        self._search_handle = None
         self.title_bar.search_button.setEnabled(True)
-        self._fail(f"搜索失败:{exc}")
+
+        fresh = [video for video in result.videos if video.bvid not in self._seen_bvids]
+        self._seen_bvids.update(video.bvid for video in fresh)
+        self._videos.extend(fresh)
+
+        rows = [self._track_row_of(video) for video in fresh]
+        if page == 1:
+            self.result_list.set_tracks(rows)
+            self.result_list.set_highlight(-1)
+        else:
+            self.result_list.append_tracks(rows)
+
+        self._loaded_page = max(self._loaded_page, page)
+        self._total_pages = max(1, result.total_pages)
+        self._has_more = self._decide_has_more(page, result.page, fresh)
+        self.total_label.setText(f"共找到 {result.total} 个视频")
+        self._show_search_status()
+
+    def _on_search_failed(self, exc: Exception, token: int) -> None:
+        """某一页失败:如实报错,并留一个能重试的出口。
+
+        第 1 页失败走弹窗(用户刚点了搜索,必须让他看见);后续页是滚动自动触发的,
+        为它弹一个模态框太打扰(用户可能只想接着看已经加载出来的),所以改用状态栏 +
+        重试按钮。
+        """
+        if token != self._search_token:
+            return
+        self._searching = False
+        self._search_handle = None
+        self.title_bar.search_button.setEnabled(True)
+        if self._loaded_page == 0:
+            self._fail(f"搜索失败:{exc}")
+            return
+        self.status_label.setText(f"第 {self._loaded_page + 1} 页加载失败:{exc}")
+        self.load_more_button.setText(f"重试第 {self._loaded_page + 1} 页")
+        self.load_more_button.setVisible(True)
+
+    def _load_more(self) -> None:
+        """加载下一页(滚到底自动触发,失败后也可以点按钮重来)。
+
+        这里是**唯一的**翻页入口,所以重复触发全在这一处挡掉。
+        """
+        if self._searching or not self._search_keyword or not self._has_more:
+            return
+        self._request_search_page(self._loaded_page + 1)
+
+    def _decide_has_more(self, page: int, served_page: int, fresh: Sequence[Video]) -> bool:
+        """裁决"还能不能接着翻页"。
+
+        四个停止条件,每一个都有实测依据:
+
+        * **本页没带来任何新条目**:搜索排序在两次请求之间会变,翻页本来就可能"全是旧的";
+          而且实测**越界页码会被静默当成第 1 页返回**(``page=1000`` 回的是第 1 页的数据),
+          只信 ``numPages`` 的话一旦对不上就会永远重复拉第 1 页 —— 这条是兜底。
+        * **接口回填的页码与请求的不一致**:同上,是"这一页其实不存在"的更直接证据。
+        * **到了接口说的末页**:``numPages`` 按接口**实际**用的 pagesize 算(实测传 30 却
+          回了 20 条时它是 50,正常回 30 条时是 34),所以它只能用当页的值,不能缓存。
+        * **到了自设上限**:见 :data:`_SEARCH_MAX_PAGES`。
+
+        Args:
+            page: 本次请求的页码。
+            served_page: 接口在响应里回的页码(``data.page``)。
+            fresh: 本页**去掉重复之后**真正新增的条目。
+
+        Returns:
+            还能继续翻页返回 ``True``。
+        """
+        if not fresh:
+            return False
+        if page > 1 and served_page != page:
+            return False
+        if page >= _SEARCH_MAX_PAGES:
+            return False
+        return page < self._total_pages
+
+    def _show_search_status(self) -> None:
+        """把"已加载多少 / 还能不能继续"写到底部状态栏。"""
+        loaded = len(self._videos)
+        if self._has_more:
+            self.status_label.setText(f"已加载 {loaded} 条,继续下滑加载更多")
+        elif self._loaded_page >= _SEARCH_MAX_PAGES:
+            self.status_label.setText(
+                f"已加载 {loaded} 条(最多加载 {_SEARCH_MAX_PAGES} 页)"
+            )
+        else:
+            self.status_label.setText(f"已加载全部 {loaded} 条")
 
     @staticmethod
     def _track_row_of(video: Video) -> TrackRow:
@@ -444,14 +634,18 @@ class MainWindow(FramelessWindow):
     # ------------------------------------------------------------ 导航
 
     def _on_nav_selected(self, key: str) -> None:
-        """侧栏入口被点:队列是面板开关,其余是页面切换。
+        """侧栏入口被点:切换中间的内容页。
+
+        "本地缓存"页在切过来时**重读一次索引**:缓存目录可能被应用之外的东西动过
+        (用户手删、或上一轮进程异常退出),而且这一页在别的页面显示期间不会刷新。
+        其它页面只是切页,没有这种"内容会过期"的问题。
 
         Args:
             key: :data:`~bilibili_music.ui.widgets.sidebar.NAV_ITEMS` 里的键。
         """
-        if key == "queue":
-            # 按钮的 check 状态就是期望的可见性(侧栏只负责把它翻过来)
-            self._set_queue_visible(self.sidebar.nav_buttons["queue"].isChecked())
+        if key == "cache":
+            self._show_page(self.cache_page, "cache")
+            self._refresh_cache_page()
             return
         placeholder = _PLACEHOLDER_PAGES.get(key)
         if placeholder is None:
@@ -484,17 +678,15 @@ class MainWindow(FramelessWindow):
             self.sidebar.set_active_page(nav_key)
 
     def _set_queue_visible(self, visible: bool) -> None:
-        """统一设置队列面板的可见性,并同步两处开关的外观。
+        """设置队列面板的可见性,并同步播放条上那个开关的外观。
 
-        播放条与侧栏各有一个队列开关,它们必须显示同一个状态 —— 所以真正的入口只有
-        这一个方法,而不是让两个控件各自维护"我以为队列是开着的"。
+        真正的入口只有这一个方法,而不是让控件自己维护"我以为队列是开着的"。
 
         Args:
             visible: 是否显示队列面板。
         """
         self.queue_drawer.setVisible(bool(visible))
         self.player_bar.set_queue_visible(bool(visible))
-        self.sidebar.set_queue_visible(bool(visible))
 
     def _toggle_maximized(self) -> None:
         """在最大化与还原之间切换(标题栏按钮与双击标题栏都走这里)。"""
@@ -502,6 +694,168 @@ class MainWindow(FramelessWindow):
             self.showNormal()
         else:
             self.showMaximized()
+
+    # ------------------------------------------------------------ 本地缓存
+
+    def _refresh_cache_page(self) -> None:
+        """把缓存索引读一遍推给"本地缓存"页。
+
+        每次都**重读磁盘**并剪掉"文件已经不在"的条目:用户可能在应用之外删过文件,或者
+        上一轮进程异常退出留下了孤儿记录 —— 只有重读才对得上。两件事都很便宜(读一个
+        小 JSON,剪枝只在真变了时才落盘),不值得为此维护一份内存副本。
+
+        为什么要先 ``reload`` 再 ``prune``:剪枝要依据**磁盘上现存的**文件名,
+        而内存里那份可能是几分钟前读的。
+        """
+        self.cache.index.reload()
+        self.cache.prune()
+        self.cache_page.set_tracks(self.cache.index.entries(), self.cache.size_bytes())
+
+    def _cache_queue_items(self) -> list[QueueItem]:
+        """把"本地缓存"页**当前显示**的歌摊成队列项(过滤后的那一批)。
+
+        双击某一首 = 把眼前这张列表整列变成队列 —— 与搜索结果页同一套行为,
+        于是"本地缓存"顺带就是一个离线歌单。
+
+        Returns:
+            队列项列表,顺序与页面上的行号一致。
+        """
+        return [self._queue_item_of(entry) for entry in self.cache_page.visible_entries()]
+
+    @staticmethod
+    def _queue_item_of(entry: CachedTrack) -> QueueItem:
+        """把一条缓存记录变成队列项。
+
+        分P序号**必须**一起带上:记录里存的是被缓存的那一P(可能是第 3P),不带的话
+        解析器会退回视频级 cid —— 那是第 1P,多P合集于是串歌(领域铁律)。
+
+        Args:
+            entry: 索引记录。
+
+        Returns:
+            可直接入队的项。
+        """
+        return QueueItem(video=video_from_entry(entry), page_index=entry.page_index)
+
+    def _on_cache_activated(self, row: int) -> None:
+        """双击缓存里的一首:整个可见列表成为队列,从这一行开始播。
+
+        这条路径**零网络请求**:``Video`` 是用索引记录拼出来的,解析器查到它有分P列表
+        就不会再请求详情,紧接着又被缓存命中(见 ``audio/resolver.py``)。所以断网也能放。
+
+        Args:
+            row: 行号(以过滤后的列表为准)。
+        """
+        items = self._cache_queue_items()
+        if not items:
+            return
+        self.playback.play_queue(items, start=row)
+
+    def _on_cache_add(self, row: int) -> None:
+        """点行内"+":把这一首加到播放队列末尾。
+
+        Args:
+            row: 行号(以过滤后的列表为准)。
+        """
+        entry = self.cache_page.entry_at(row)
+        if entry is None:
+            return
+        self.playback.enqueue(self._queue_item_of(entry))
+
+    def _on_cache_menu(self, row: int, position) -> None:  # noqa: ANN001 - QPoint
+        """本地缓存右键菜单:播放 / 下一首播放 / 加入队列 / 从缓存删除 / 在B站打开。
+
+        Args:
+            row: 行号(以过滤后的列表为准)。
+            position: 弹出位置(全局坐标)。
+        """
+        entry = self.cache_page.entry_at(row)
+        if entry is None:
+            return
+        menu = QMenu(self)
+        play_action = menu.addAction("播放")
+        next_action = menu.addAction("下一首播放")
+        queue_action = menu.addAction("加入队列")
+        menu.addSeparator()
+        remove_action = menu.addAction("从缓存删除")
+        open_action = menu.addAction("在B站打开")
+
+        chosen = menu.exec(position)
+        if chosen is play_action:
+            self._on_cache_activated(row)
+        elif chosen is next_action:
+            self.playback.enqueue_next(self._queue_item_of(entry))
+        elif chosen is queue_action:
+            self.playback.enqueue(self._queue_item_of(entry))
+        elif chosen is remove_action:
+            self._delete_cached(entry)
+        elif chosen is open_action:
+            QDesktopServices.openUrl(QUrl(video_from_entry(entry).web_url))
+
+    def _on_cache_remove(self, row: int) -> None:
+        """请求删除某一行(操作列"⋮"菜单里的那一项也会走到这里)。
+
+        Args:
+            row: 行号(以过滤后的列表为准)。
+        """
+        entry = self.cache_page.entry_at(row)
+        if entry is not None:
+            self._delete_cached(entry)
+
+    def _delete_cached(self, entry: CachedTrack) -> None:
+        """确认后删掉一条缓存(音频文件 + 索引记录)并刷新页面。
+
+        删除**不可撤销**(再听要重新下载),所以先问一句;默认按钮是"否",避免一路回车
+        就把歌删了。
+
+        删不掉时说明原因而不是静默失败:最可能的情况是文件正被播放器占着(Windows 不允许
+        删除已打开的文件),用户需要知道"要去停掉播放",而不是以为按钮坏了。
+
+        Args:
+            entry: 要删除的索引记录。
+        """
+        answer = QMessageBox.question(
+            self,
+            "删除缓存",
+            f"要删除「{entry.title or entry.bvid}」的缓存吗?再听需要重新下载。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not self.cache.forget(entry):
+            QMessageBox.warning(
+                self, "删除缓存", "这个文件正在被播放器使用,停掉播放后再试一次。"
+            )
+            return
+        self._refresh_cache_page()
+
+    def _on_cache_clear(self) -> None:
+        """确认后清空全部缓存。
+
+        清完**当场再量一次占用**:删不掉的文件(正被播放器占用)会被跳过,若一声不吭地
+        只报"已清空",界面上那个占用数字就会纹丝不动地留在那里,用户完全无从理解。
+        """
+        if not self.cache.index.entries():
+            return
+        answer = QMessageBox.question(
+            self,
+            "清空缓存",
+            "要删除所有已缓存的音频文件吗?再听需要重新下载。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        removed = self.cache.clear()
+        self._refresh_cache_page()
+        left = self.cache.size_bytes()
+        if left:
+            QMessageBox.warning(
+                self,
+                "清空缓存",
+                f"已删除 {removed} 首,但还有 {format_size(left)} 正在被使用,未能删除。",
+            )
 
     # ------------------------------------------------------------ 编排层回调
 
@@ -534,6 +888,10 @@ class MainWindow(FramelessWindow):
         self._mark_page_count(resolved)
         # 详情此刻才补全,分P列表到这会儿才可用 —— 再刷一次选择器,它才显示得出分P标题
         self._sync_page_selector()
+        # "本地缓存"页也要跟着走:这一首刚被记进索引,而且它可能正是正在播的那一行
+        self.cache_page.set_playing(resolved.video.bvid, resolved.page.cid)
+        if self.pages.currentWidget() is self.cache_page:
+            self._refresh_cache_page()
         # 封面是异步的,而且允许失败:拿不到就用占位图,不打断播放
         self.cover_loader.load(resolved.video.cover_https)
         # 位置的落盘交给切歌与退出,这里只更新内存里的"上次播的是哪一首"

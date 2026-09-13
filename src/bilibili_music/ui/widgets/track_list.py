@@ -33,7 +33,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QPixmap
+from PySide6.QtGui import QBrush, QColor, QFontMetrics, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -73,8 +73,19 @@ ROW_HEIGHT = 56
 #: 封面缩略图边长(像素)。
 COVER_SIZE = 40
 
-#: 序号列宽度(像素):两位数以内不会换行即可。
-_INDEX_WIDTH = 36
+#: 距底部多少像素算"快到底了",提前触发下一页。取 3 行高:用户几乎感觉不到停顿,
+#: 又不至于刚往下滚一屏就白花一次请求。
+_LOAD_MORE_MARGIN = ROW_HEIGHT * 3
+
+#: 序号列的**最小**宽度(像素)。实际宽度按字体算(见 :meth:`TrackList._index_width`),
+#: 这个值只是下限,免得字体特别小时列窄得像条缝。
+_INDEX_WIDTH = 44
+
+#: 序号要能显示到几位:翻页上限是 5 页 × 每页 30 条 ≈ 150 行,所以三位数封顶。
+_INDEX_SAMPLE = "100"
+
+#: QSS 给 ``TrackTable::item`` 的 ``padding: 0 8px`` 在左右各吃掉的像素。
+_INDEX_PADDING = 16
 
 #: 操作列宽度(像素):"+"与"⋮"两个 26px 按钮加间距。
 _ACTION_WIDTH = 76
@@ -153,6 +164,9 @@ class TrackList(QTableWidget):
         row_menu_requested(int, QPoint): 请求某行的右键菜单(操作列的"⋮"也会发它),
             参数是行号与全局坐标
         add_requested(int): 点了某行的"+"(加入播放队列)
+        load_more_requested(): 用户快滑到底了,想再要一批。
+            **控件只报"快到底了"这一件事**:有没有下一页、是不是正在加载、要不要去重,
+            全是调用方(``MainWindow``)的状态 —— 列表不该认识分页协议。
 
     信号名带 ``row_`` / ``*_requested`` 前缀是为了**避开基类已有的信号**:
     ``QAbstractItemView`` 本身就有 ``activated(QModelIndex)``、``doubleClicked`` 等,
@@ -170,6 +184,7 @@ class TrackList(QTableWidget):
     row_activated = Signal(int)
     row_menu_requested = Signal(int, QPoint)
     add_requested = Signal(int)
+    load_more_requested = Signal()
 
     def __init__(
         self,
@@ -222,7 +237,7 @@ class TrackList(QTableWidget):
         for column in range(len(columns)):
             if column == INDEX_COLUMN:
                 header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
-                self.setColumnWidth(column, _INDEX_WIDTH)
+                self.setColumnWidth(column, self._index_width())
             elif column == RICH_COLUMN:
                 header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
             elif column == action_column:
@@ -234,6 +249,8 @@ class TrackList(QTableWidget):
         self.doubleClicked.connect(self._on_double_clicked)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_menu_requested)
+        # "快到底了"只能从滚动条读:QTableWidget 没有"滚到边界"的信号
+        self.verticalScrollBar().valueChanged.connect(self._on_scrolled)
 
     # ------------------------------------------------------------ 填数据
 
@@ -242,6 +259,8 @@ class TrackList(QTableWidget):
 
         列表整体换内容时旧的封面请求已经没人要了,所以先清掉加载队列 —— 否则用户连着
         搜两次,第一次那几十张封面还要占着限速窗口慢慢取完。
+
+        翻页追加请用 :meth:`append_tracks` —— 那条路径**不清**封面队列,也不动已有行。
 
         Args:
             rows: 每行的展示数据;行数可以变化。
@@ -252,7 +271,31 @@ class TrackList(QTableWidget):
         self.setRowCount(0)
         self._rows.clear()
 
-        for index, track in enumerate(rows):
+        self._append_rows(rows)
+
+    def append_tracks(self, rows: Sequence[TrackRow]) -> None:
+        """在末尾追加若干行(翻页加载用)。
+
+        与 :meth:`set_tracks` 的关键差别是**不动已有行**:不重建、不丢掉已经贴上的封面、
+        也不清封面加载队列 —— 翻页时把前 30 行的封面请求全部作废再重下一遍,既慢又是
+        白挨一次限速。序号由 :meth:`_set_index` 按全局行号生成,所以接着往下排。
+
+        Args:
+            rows: 要追加的展示数据;空序列时什么都不做。
+        """
+        if not rows:
+            return
+        self._append_rows(rows)
+
+    def _append_rows(self, rows: Sequence[TrackRow]) -> None:
+        """把一批行接到表格末尾,并请求它们缺的封面。
+
+        Args:
+            rows: 要追加的展示数据;空序列是安全的空操作。
+        """
+        start = self.rowCount()
+        for offset, track in enumerate(rows):
+            index = start + offset
             self.insertRow(index)
             self.setRowHeight(index, ROW_HEIGHT)
             self._set_index(index)
@@ -363,6 +406,27 @@ class TrackList(QTableWidget):
         return self._rows[row].has_cover
 
     # ------------------------------------------------------------ 行内构造
+
+    def _index_width(self) -> int:
+        """按当前字体算出序号列要留多宽。
+
+        **不能写死像素**:翻页加载后行号会到三位数(:data:`_INDEX_SAMPLE`),而三位数要
+        多宽完全取决于字体 —— 同一个 44,在 Microsoft YaHei UI 9pt 下够(``"100"`` 21px),
+        在找不到系统字体时的 fallback 字体下就不够(实测 36px)。字体是运行期才知道的。
+
+        按**加粗**字体算:当前播放行的序号是加粗的(见 :meth:`_style_index`)。再补上 QSS
+        给 ``::item`` 预留的左右 padding —— 列宽里有一段是被样式表吃掉的,那部分放不下字。
+
+        Returns:
+            列宽(像素),不小于 :data:`_INDEX_WIDTH`。
+        """
+        bold = self.font()
+        bold.setBold(True)
+        needed = max(
+            QFontMetrics(self.font()).horizontalAdvance(_INDEX_SAMPLE),
+            QFontMetrics(bold).horizontalAdvance(_INDEX_SAMPLE),
+        )
+        return max(_INDEX_WIDTH, needed + _INDEX_PADDING)
 
     def _set_index(self, row: int) -> None:
         """填行首序号列(设计稿里是从 1 开始的裸数字)。"""
@@ -497,3 +561,19 @@ class TrackList(QTableWidget):
         if item is None:
             return
         self.row_menu_requested.emit(item.row(), self.viewport().mapToGlobal(position))
+
+    def _on_scrolled(self, value: int) -> None:
+        """滚到接近底部时发一次 :attr:`load_more_requested`。
+
+        这里**不做去重、也不判断有没有下一页**:到底了还在滚、上一次请求还没回来、
+        已经加载完最后一页 —— 这些重复触发由调用方的状态机挡掉,列表只负责如实汇报
+        "用户快到底了"。
+
+        Args:
+            value: 滚动条当前值(像素,``ScrollPerPixel`` 模式下就是滚过的距离)。
+        """
+        bar = self.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return  # 整批内容一屏就放得下,无所谓"到底"
+        if value >= bar.maximum() - _LOAD_MORE_MARGIN:
+            self.load_more_requested.emit()

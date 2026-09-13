@@ -45,6 +45,7 @@ __all__ = [
     "parse_search_result",
     "parse_video",
     "pick_best",
+    "track_from_cache",
     "track_from_quality",
 ]
 
@@ -335,11 +336,35 @@ def pick_best(tracks: list[AudioTrack]) -> AudioTrack:
     return max(tracks, key=lambda t: t.bandwidth)
 
 
-def track_from_quality(quality_id: int, codec: str = "") -> AudioTrack:
-    """按音质档位直接造一条 ``AudioTrack``。
+def track_from_cache(
+    quality_id: int, codec: str = "", bandwidth: int = 0
+) -> AudioTrack:
+    """按缓存里记下来的档位、codec 与码率重建一条 ``AudioTrack``。
 
-    用于**缓存命中**的场景:音频文件已经在本地,不需要再请求 playurl,于是也就
-    拿不到接口给的 ``bandwidth`` 与 ``baseUrl``。此时只能按档位取标称码率。
+    用于**缓存命中**的场景:音频文件已经在本地,不需要再请求 playurl,于是也就拿不到
+    接口的 ``baseUrl``。``bandwidth`` 优先用缓存索引里存下的真实值(它是上次解析时接口
+    给的),拿不到(索引缺失、老记录、盲查命中)才退回该档位的标称值。
+
+    Args:
+        quality_id: 音质档位 id,如 ``30280``。
+        codec: 编码串;由缓存键或索引里存下来的那一份原样传入。
+        bandwidth: 已知的真实码率(bit/s);``<= 0`` 表示不知道,按档位取标称值。
+
+    Returns:
+        一条 ``url`` 为空的音轨(它只服务于"展示 + 播本地文件",不参与下载)。
+    """
+    return AudioTrack(
+        quality_id=quality_id,
+        codec=codec,
+        bandwidth=bandwidth if bandwidth > 0 else int(QUALITY_FALLBACK_BPS.get(quality_id, 0)),
+        url="",
+    )
+
+
+def track_from_quality(quality_id: int, codec: str = "") -> AudioTrack:
+    """按音质档位直接造一条 ``AudioTrack``(码率取标称值)。
+
+    用于**盲查命中**的场景:那时连索引都没有,只知道档位与 codec。
 
     Args:
         quality_id: 音质档位 id,如 ``30280``。
@@ -350,15 +375,10 @@ def track_from_quality(quality_id: int, codec: str = "") -> AudioTrack:
 
     Note:
         标称码率可能与文件真实码率有零头差异(界面会显示成 192 kbps 而不是
-        191.9 kbps)。真实值要等缓存索引把元数据写进 sidecar 之后才能提供。
+        191.9 kbps)。真实值在缓存索引里(见 :func:`track_from_cache`)。
         ``url`` 为空是刻意的:这条音轨只服务于"展示 + 播本地文件",不参与下载。
     """
-    return AudioTrack(
-        quality_id=quality_id,
-        codec=codec,
-        bandwidth=int(QUALITY_FALLBACK_BPS.get(quality_id, 0)),
-        url="",
-    )
+    return track_from_cache(quality_id, codec)
 
 
 # ====================================================================== 客户端

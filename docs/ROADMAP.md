@@ -21,22 +21,20 @@
 
 ## 1. 基线(实测,不是估计)
 
-> 2026-09-13 更新(新增分P选择器后重测);07 节变更记录里有这次改版的完整清单。
+> 2026-09-14 更新(本地缓存页与缓存索引落地后重跑);07 节变更记录里有完整清单。
 
-- **单元测试**:共 `415` 个用例(2026-09-13 新增封面磁盘缓存后)。
-  - 放宽沙箱(`danger-full-access`)实测过一次全绿 `Ran 377 tests ... OK`(当时是 377 个);
-    本轮新增的 38 个用例**未**在放宽模式下重跑。
-  - `workspace-write` 沙箱内本轮:`Ran 415 tests`,`errors=19`,**全部**是
-    `PermissionError: [WinError 5]` 落在 `tempfile.TemporaryDirectory()` 上
-    (`test_core.py`),与 AGENTS.md 7.1 记录的沙箱挡 `%TEMP%` 一致,**不是代码缺陷**。
-  - 沙箱内可绿的命令(排除 `test_core`):
-    `.venv\Scripts\python.exe -m unittest tests.test_cover_cache tests.test_cover_loader tests.test_api_parsing tests.test_backend_contract tests.test_config tests.test_icons tests.test_queue tests.test_resolver tests.test_ui_widgets tests.test_ui_wiring`
-    → `Ran 306 tests ... OK`。
-  - `uv run ...` 在沙箱内直接起不来(`uv` 缓存目录写不进去),验证要改用上面的 venv 直调。
-- **仓库尚无任何 commit**,全部文件 untracked(`git log` 报 `does not have any commits yet`)。
-- `scripts/smoke_test.py`(触网 + 需 GUI):新增分P选择器后跑过一次(默认 Qt 后端),
-  搜索 → 多P → DASH → 下载 → 真实播放全部 `[OK]`,末行 `[PASS] qt 后端单后端链路全部打通`;
-  上一次界面改版**未重跑**。要动 `net/` 或 `api/` 时按 AGENTS.md 第 7 节补跑 `--both` 并如实汇报。
+- **单元测试**:共 `510` 个用例(2026-09-14 新增缓存索引与本地缓存页后)。
+  - 本轮在 `danger-full-access` 下实测 `Ran 510 tests ... OK`(全绿,含 `test_core`
+    那批依赖 `tempfile` 的用例)。
+  - `workspace-write` 沙箱内的历史结论仍然成立:`uv run ...` 起不来,且 `test_core`
+    里依赖 `%TEMP%` 的用例会成批报 `PermissionError`,验证要改用 venv 直调
+    `.venv\Scripts\python.exe -m unittest discover -s tests`(见 `AGENTS.md` 7.1)。
+- **2026-09-13 的旧数据**(分P选择器那一轮):共 `415` 个用例;放宽沙箱下
+  `Ran 377 tests ... OK`(当时是 377 个),`workspace-write` 内 `errors=19` 全部落在
+  `tempfile.TemporaryDirectory()` 上,**不是代码缺陷**。
+- `scripts/smoke_test.py`(触网 + 需 GUI):最近一次跑通是在分P选择器那一轮
+  (`[PASS] qt 后端单后端链路全部打通`)。本轮**未重跑**(只动界面与缓存索引的读写,
+  没碰 `net/` 与 `api/` 的请求路径;沙箱内下载步还会因 `%LOCALAPPDATA%` 写不进去而失败)。
 
 ---
 
@@ -44,7 +42,7 @@
 
 | 现状 | 对规划的影响 |
 |---|---|
-| `core/cache.py` 只能按 `(bvid, cid, quality_id, codec)` **盲查**,没有索引文件 | 「本地曲库 / 离线歌单」必须先有 sidecar 索引才能枚举已缓存内容 → **M2.1 必须排在 M2 其余任务之前** |
+| `core/cache.py` 只能按 `(bvid, cid, quality_id, codec)` **盲查**,没有索引文件 | 「本地曲库 / 离线歌单」必须先有 sidecar 索引才能枚举已缓存内容 → **M2.1 必须排在 M2 其余任务之前**(已于 2026-09-14 落地,见 07 节) |
 | 全项目没有配置持久化:音量、播放模式、上次分P、缓存目录都只活在内存 | 队列"记住播放模式"、续播位置、主题选择都依赖它 → 作为 M1 的基础设施先做 |
 | `ui/main_window.py` 是 513 行的 MVP 单文件(其中相当篇幅是 AGENTS.md 强制要求的中文 docstring) | 队列面板/封面/歌词塞不进去 → 已确认先拆 widget,作为 M1 第一步 |
 
@@ -62,8 +60,8 @@
 | 编号 | 里程碑 | 依赖 | 状态 |
 |---|---|---|---|
 | M0 | 工程化前置:首次 `git commit` | 无 | 待办(建议开工 M1 前先做,否则重构无回退点) |
-| M1 | 播放体验骨架 | M0(建议) | **本阶段** |
-| M2 | 本地曲库与下载管理 | M2.1 索引格式定稿 | 登记 |
+| M1 | 播放体验骨架 | M0(建议) | **已完成** |
+| M2 | 本地曲库与下载管理 | M2.1 索引格式定稿 | **M2.1 / M2.2 已完成**,M2.3–M2.5 登记 |
 | M3 | 内容发现 | 接口 probe 结论 | 登记 |
 | M4 | 歌词 | 歌词源选型(需单独拍板) | 登记 |
 | M5 | 账号能力(WBI / 登录 / 收藏夹) | **用户显式授权** | 冻结 |
@@ -193,12 +191,22 @@ M1 落地时的取舍与遗留,后续动作前先看这里:
 
 ### M2 本地曲库与下载管理
 
+> **进度(2026-09-14)**:**M2.1 与 M2.2 已完成** —— 缓存索引 + "本地缓存"页(枚举 / 过滤 /
+> 离线点播 / 删除单曲 / 清空)。M2.3–M2.5 仍未开工,细节见下。
+
 - **封面磁盘缓存已在 2026-09-13 提前落地**(见 07 节变更记录):`core/cover_cache.py`
   提供 `size_bytes()` / `clear()`,但**没有接界面**——"本地缓存"页要显示封面占用时直接复用。
-- **M2.1 缓存索引**:sidecar JSON(`<key>.json`)记录
-  `bvid / cid / 标题 / UP主 / 音质 / 时长 / 封面URL / 落盘时间`,让缓存**可枚举**。
-  索引缺失或损坏时退回盲查(`pick_best_cached`),**不能因此播不出来**。
-- **M2.2 本地曲库页**:离线播放、按标题/UP主过滤、删除单曲。
+- **M2.1 缓存索引**:**已落地**(`core/cache_index.py`,与音频文件同目录的 `index.json`),
+  记录 `bvid / cid / 标题 / UP主 / 分P序号 / 音质 / codec / 真实码率 / 时长 / 封面URL /
+  体积 / 落盘时间`。两处偏离原计划,都在 07 节记了理由:①用**单个 `index.json`** 而不是
+  每个音频配一个 `<key>.json`;②索引写入由 `AudioResolver` 的成功出口负责,而不是下载层。
+  索引缺失或损坏时退回盲查(`pick_best_cached`),**不会因此播不出来**;反过来,
+  `pick_best_cached` 会**先问索引**,于是连 `fLaC` 这类非常规档位的缓存也能命中。
+- **M2.2 本地曲库页**:**已落地**(`ui/widgets/cache_page.py` + 主窗口接线)。
+  离线播放的做法是"用索引记录重建一个只含该分P的 `Video`",于是解析器既不会请求详情
+  (有 `pages`),也会被缓存命中 —— 全链路**零网络请求**。
+  过滤为按曲名 / UP主(本控件内做,不涉及业务判断);删除单曲与清空都**先确认**,
+  删不掉(文件正被播放器占用)时会说明原因并保留索引,让用户可以停掉播放再试。
 - **M2.3 下载队列**:串行或并发上限 1–2(风控敏感 —— `core/http.py` 的限速参数
   **禁止**为提速调小),失败重试、暂停/取消。
 - **M2.4 整合集一键缓存**:"缓存整个合集(200P)"要给出总量预估且可中断。
@@ -251,6 +259,42 @@ M1 落地时的取舍与遗留,后续动作前先看这里:
 
 ## 7. 变更记录
 
+- 2026-09-14:**本地缓存页落地(M2.1 缓存索引 + M2.2 本地曲库页,用户当轮明确要求)**。
+  落地内容与取舍:
+  - 新增 `core/cache_index.py`:`CachedTrack`(记录)+ `CacheIndex`(读写)+ 两个纯函数
+    (`entry_for` 从解析结果造记录、`video_from_entry` 把记录还原成可播放的 `Video`)。
+    **不 import Qt**(`core` 红线),路径由 `AudioCache` 注入,所以测试可以指到沙箱目录。
+  - **偏离原计划一处**:索引是**单个 `index.json`**(与音频文件同目录),不是每个音频配一个
+    `<key>.json`。理由:枚举只读一次盘、增删只写一次盘(原子替换),缓存目录里不会散出
+    成百上千个小文件;代价是每新增一首整体重写一次,几百首也只有几十 KB。
+  - **偏离原计划第二处**:索引写入放在 `AudioResolver` 的**成功出口**(`_remember`),
+    命中缓存那条路径也会调用 —— 那是"索引丢失/老缓存"自愈的唯一机会(否则在索引出现
+    之前缓存的歌永远不出现在本地缓存页里)。内容没变时 `remember` 跳过落盘。
+  - `pick_best_cached` 改为**索引优先、盲查兜底**:索引能给出真实档位与 codec,
+    含 `fLaC` 这类不在 `KNOWN_QUALITIES` 里的缓存;索引读不出来或文件被手删时照旧盲查。
+    `CachedHit` 增加 `bandwidth` 字段,`api.bilibili.track_from_cache()` 用它把界面上显示的
+    码率从"标称值"换成**真实值**(M1.3 留下的那个取舍,到此收口)。
+  - 新增 `ui/widgets/cache_page.py`(`CachePage`):复用 `TrackList` 与 `PlaceholderPage`
+    (空态),头部是"标题 + 过滤框 + 占用 + 首数 + 清空缓存";过滤按曲名/UP主在**控件内**做
+    (纯字符串匹配,不涉及业务判断),过滤中显示"N / M 首";空态文案区分"还没缓存"与
+    "过滤没匹配到"。播放中的那一行会被高亮(与队列面板同一套"上层告知"的接法)。
+  - `ui/main_window.py`:侧栏"本地缓存"从占位页改为真页面;新增"双击 = 当前列表变队列并
+    离线播"(重建 `Video` 时**带上记录里的分P序号**,否则多P会串到第 1P)、行内 "+" 入队、
+    右键菜单(播放 / 下一首播放 / 加入队列 / 从缓存删除 / 在B站打开)、清空(都先确认;
+    删不掉时说清原因并保留索引)。切到这一页时才 `reload()` + 剪枝,不适合为看不见的页面
+    反复读盘。
+  - `ui/theme.py` 增加 `QLineEdit#FilterInput`(与播放条音质下拉同尺寸口径)。
+  - `core/models.py` 增加 `format_size()`(纯函数,KB 取整 / MB 一位 / GB 两位);
+    `core/cache.py` 的 `clear()` 现在会 `prune()`,**删不掉的文件连同索引记录一起留下** ——
+    否则界面上会出现"已清空 0 首"但占用纹丝不动这种没人看得懂的状态。
+  - 新增 73 个用例:`tests/test_cache_index.py`(索引读写/容错/路径穿越/与磁盘一致性、
+    体积格式化、记录与 `Video` 的双向还原)、`tests/test_cache_page.py`(控件行为 + 主窗口
+    接线,其中"离线点播零请求"用的是**真解析器** + 一被调用就失败的客户端替身)、
+    `tests/test_resolver.py` 扩到索引优先那条路径。
+  - 验证:`.venv\Scripts\python.exe -m unittest discover -s tests` → `Ran 510 tests ... OK`
+    (danger-full-access)。另外用一次性离屏截图脚本肉眼核对了"有内容 / 空态"两种版式
+    (脚本跑完即删,未入库)。`scripts/smoke_test.py` **未重跑**(未改 `net/` 的请求路径,
+    且沙箱内下载步会因 `%LOCALAPPDATA%` 写不进去而失败),按 AGENTS.md 第 7 节如实标注。
 - 2026-09-13:**封面新增磁盘缓存(用户当轮明确要求)**。落地内容与取舍:
   - 新增 `core/cover_cache.py`(`CoverCache`,纯逻辑、**不 import Qt**):文件名 =
     URL 的 SHA-1 前 20 位,扩展名按图片魔数推断(`.jpg` / `.webp` / `.png` / `.gif` /

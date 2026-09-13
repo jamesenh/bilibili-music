@@ -266,6 +266,20 @@ QLabel#PanelTitle {{
     font-size: 15px;
     font-weight: 600;
 }}
+/* 本地缓存页的过滤框。与播放条上的音质下拉同尺寸口径(30px 高 / 8px 圆角),
+   两者是同一层级的"页内小控件",长得差太多会显得不是一套界面 */
+QLineEdit#FilterInput {{
+    background: {s.field};
+    border: 1px solid {s.border};
+    border-radius: 8px;
+    padding: 0 10px;
+    min-height: 30px;
+    color: {DARK.text};
+    selection-background-color: {DARK.accent};
+}}
+QLineEdit#FilterInput:focus {{
+    border: 1px solid {DARK.accent};
+}}
 QPushButton#GhostTextButton {{
     background: transparent;
     border: none;
@@ -305,9 +319,6 @@ QTableWidget#TrackTable QHeaderView::section {{
     padding: 6px 8px;
     color: {DARK.muted};
     font-size: 12px;
-}}
-QLabel#TrackIndex {{
-    color: {DARK.muted};
 }}
 QLabel#TrackTitle {{
     color: {DARK.text};
@@ -420,8 +431,11 @@ QLabel#PageDot[current="true"] {{
 QLabel#PageIndex {{
     color: {DARK.muted};
 }}
-QLabel#PageTitle {{
+/* 菜单行标题**不许**用 #PageTitle:那是内容区大标题(20px 加粗),
+   菜单一行只有 34px 高,套上去字会撑满整行。见 page_selector.PageRow */
+QLabel#PageRowTitle {{
     color: {DARK.text};
+    font-size: 13px;
 }}
 QLabel#PageDuration {{
     color: {DARK.muted};

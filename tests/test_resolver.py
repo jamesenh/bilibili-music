@@ -1,11 +1,14 @@
-"""音源快路径的单元测试:缓存盲查与"命中就不发请求"。
+"""音源快路径的单元测试:缓存索引 / 盲查与"命中就不发请求"。
 
-不触网:缓存与接口客户端都用替身。钉住两件事:
+不触网:缓存与接口客户端都用替身。钉住四件事:
 
-1. 盲查命中时**一个网络请求都不发** —— 用"一被调用就断言失败"的客户端替身证明,
+1. 命中缓存时**一个网络请求都不发** —— 用"一被调用就断言失败"的客户端替身证明,
    这比断言"请求次数为 0"更硬:真发了请求会直接把用例炸红。
-2. **指定了音质档位时不走快路径** —— 那种情况下连 codec 都要等接口返回才知道,
+2. **索引优先、盲查兜底** —— 索引能给出真实档位与 codec(含非常规档位),
+   它帮不上忙时才按常见档位从高到低试。
+3. **指定了音质档位时不走快路径** —— 那种情况下连 codec 都要等接口返回才知道,
    拼不出缓存键,只能老老实实请求。
+4. 成功出口会把这一首**写进缓存索引**(本地缓存页靠它枚举)。
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ _CODEC = "mp4a.40.2"
 
 
 def _video(bvid: str = "BVTEST", *, pages: int = 2) -> Video:
-    """造一个**已带分P**的视频:这样 resolve 直接走到盲查那一步,不请求详情。"""
+    """造一个**已带分P**的视频:这样 resolve 直接走到查缓存那一步,不请求详情。"""
     return Video(
         bvid=bvid,
         title=f"视频{bvid}",
@@ -44,9 +47,15 @@ def _video(bvid: str = "BVTEST", *, pages: int = 2) -> Video:
 
 
 class _FakeCache:
-    """缓存替身:只实现 ``lookup``,可指定哪些 (档位, codec) 算命中。"""
+    """缓存替身:实现 ``indexed_hit`` / ``lookup`` / ``remember`` 三件事。
 
-    def __init__(self, available: dict[tuple[int, str], Path] | None = None) -> None:
+    ``indexed_hit`` 默认什么都不返回,于是大多数用例走的仍是盲查那条路 ——
+    与"索引缺失"时真缓存的行为一致。
+    """
+
+    def __init__(
+        self, available: dict[tuple[int, str], Path] | None = None
+    ) -> None:
         """记录"哪些键命中",并准备收集查询记录。
 
         Args:
@@ -54,6 +63,23 @@ class _FakeCache:
         """
         self.available = dict(available or {})
         self.queries: list[tuple[str, int, int, str]] = []
+        #: 索引查询记录 ``(bvid, cid)``
+        self.index_queries: list[tuple[str, int]] = []
+        #: 写索引记录 ``(bvid, cid, 档位, 路径)``
+        self.remembered: list[tuple[str, int, int, Path]] = []
+        #: 预设的索引命中 ``((档位, codec, 码率), 路径)``;``None`` 表示索引里没有
+        self.indexed: tuple[tuple[int, str, int], Path] | None = None
+
+    def indexed_hit(self, bvid: str, cid: int):
+        """记录一次索引查询,并按预设返回结果。"""
+        self.index_queries.append((bvid, cid))
+        if self.indexed is None:
+            return None
+        (quality_id, codec, bandwidth), path = self.indexed
+        return (
+            _FakeEntry(bvid, cid, quality_id, codec, bandwidth),
+            path,
+        )
 
     def lookup(
         self, bvid: str, cid: int, quality_id: int, codec: str = ""
@@ -65,6 +91,25 @@ class _FakeCache:
         """
         self.queries.append((bvid, cid, quality_id, codec))
         return self.available.get((quality_id, codec))
+
+    def remember(self, video: Video, page: Page, track: AudioTrack, path: Path) -> bool:
+        """记录一次"写索引"。"""
+        self.remembered.append((video.bvid, page.cid, track.quality_id, path))
+        return True
+
+
+class _FakeEntry:
+    """索引命中结果的替身:解析器只读它的这几个字段。"""
+
+    def __init__(
+        self, bvid: str, cid: int, quality_id: int, codec: str, bandwidth: int
+    ) -> None:
+        """按字段建一条假记录。"""
+        self.bvid = bvid
+        self.cid = cid
+        self.quality_id = quality_id
+        self.codec = codec
+        self.bandwidth = bandwidth
 
 
 class _NoRequestClient:
@@ -155,6 +200,39 @@ class TestPickBestCached(unittest.TestCase):
             CachedHit(quality_id=30216, codec=_CODEC, path=Path("C:/fake/low.m4a")),
         )
 
+    def test_index_wins_over_the_blind_lookup(self) -> None:
+        """索引里有的就按索引来:它记的是**真实**档位与 codec,比猜的准。
+
+        这一条同时钉住"命中索引后不再盲查" —— 每一次 lookup 都是一次磁盘 stat。
+        """
+        cache = _FakeCache({(30280, _CODEC): Path("C:/fake/high.m4a")})
+        cache.indexed = ((30232, "fLaC", 1411200), Path("C:/fake/indexed.m4a"))
+        hit = pick_best_cached(cache, self.video, self.page)
+        assert hit is not None
+        self.assertEqual(hit.quality_id, 30232)
+        self.assertEqual(hit.codec, "fLaC")
+        self.assertEqual(hit.path, Path("C:/fake/indexed.m4a"))
+        self.assertEqual(hit.bandwidth, 1411200)
+        self.assertEqual(cache.queries, [])  # 一次盲查都没做
+
+    def test_index_lookup_uses_the_pages_own_cid(self) -> None:
+        """索引查询同样要带对应分P的 cid(多P合集每个分P是一首独立的歌)。"""
+        video = _video(pages=3)
+        cache = _FakeCache()
+        page3 = video.page(3)
+        assert page3 is not None
+        pick_best_cached(cache, video, page3)
+        self.assertEqual(cache.index_queries[0], (video.bvid, page3.cid))
+
+    def test_missing_index_falls_back_to_the_blind_lookup(self) -> None:
+        """索引里没有(或读不出来)时必须退回盲查,不能因此当成未命中。"""
+        cache = _FakeCache({(30216, _CODEC): Path("C:/fake/low.m4a")})
+        hit = pick_best_cached(cache, self.video, self.page)
+        assert hit is not None
+        self.assertEqual(hit.quality_id, 30216)
+        self.assertEqual(hit.bandwidth, 0)  # 盲查拿不到真实码率
+        self.assertEqual(len(cache.queries), 3)  # 三个档位都试过
+
 
 class TestResolverCachePreflight(unittest.TestCase):
     """解析器在请求 playurl 之前的盲查。"""
@@ -178,13 +256,40 @@ class TestResolverCachePreflight(unittest.TestCase):
         self.assertEqual(ok[0].path, Path("C:/fake/hit.m4a"))
 
     def test_cache_hit_rebuilds_track_with_nominal_quality(self) -> None:
-        """快路径拿不到接口响应,音轨只能按档位取标称码率。"""
+        """盲查命中时拿不到接口响应,音轨只能按档位取标称码率。"""
         cache = _FakeCache({(30280, _CODEC): Path("C:/fake/hit.m4a")})
         resolver = AudioResolver(_NoRequestClient(), cache)  # type: ignore[arg-type]
         ok, _ = self._resolve(resolver, _video())
         self.assertEqual(ok[0].track.quality_id, 30280)
         self.assertEqual(ok[0].track.codec, _CODEC)
         self.assertEqual(ok[0].track.kbps, 192)
+
+    def test_index_hit_uses_the_real_bandwidth(self) -> None:
+        """索引里记着上次接口给的真实码率:界面据此显示的是真值,不是标称值。"""
+        cache = _FakeCache()
+        cache.indexed = ((30280, _CODEC, 191_900), Path("C:/fake/hit.m4a"))
+        resolver = AudioResolver(_NoRequestClient(), cache)  # type: ignore[arg-type]
+        ok, _ = self._resolve(resolver, _video())
+        self.assertEqual(ok[0].track.bandwidth, 191_900)
+        self.assertEqual(ok[0].track.kbps, 192)
+
+    def test_success_records_the_track_into_the_index(self) -> None:
+        """成功出口要把这一首写进缓存索引:否则"本地缓存"页永远枚举不到它。"""
+        cache = _FakeCache({(30280, _CODEC): Path("C:/fake/hit.m4a")})
+        resolver = AudioResolver(_NoRequestClient(), cache)  # type: ignore[arg-type]
+        video = _video()
+        self._resolve(resolver, video, page_index=2)
+        self.assertEqual(
+            cache.remembered,
+            [(video.bvid, 1001, 30280, Path("C:/fake/hit.m4a"))],
+        )
+
+    def test_failure_does_not_touch_the_index(self) -> None:
+        """失败不该留下记录:索引指向一个不存在的文件,本地缓存页就会多一首点不开的歌。"""
+        cache = _FakeCache()
+        resolver = AudioResolver(_StubClient(), cache)  # type: ignore[arg-type]
+        self._resolve(resolver, _video())
+        self.assertEqual(cache.remembered, [])
 
     def test_cache_hit_leaves_resolver_idle(self) -> None:
         """快路径走完必须把状态清干净,否则后续 resolve 会被当成"还在忙"。"""

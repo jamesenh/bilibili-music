@@ -30,8 +30,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # 注意导入顺序:先 QtWidgets/QtGui 再 QtCore(见 AGENTS.md 第 5 节)
-from PySide6.QtGui import QPixmap  # noqa: E402
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QPushButton, QWidget  # noqa: E402
+from PySide6.QtGui import QFontMetrics, QPixmap  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication,
+    QHBoxLayout,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 from PySide6.QtCore import QPoint, QRect, Qt  # noqa: E402
 
 from bilibili_music.core.models import Page  # noqa: E402
@@ -55,9 +61,11 @@ from bilibili_music.ui.widgets.page_selector import (  # noqa: E402
     POPUP_ROW_HEIGHT,
     POPUP_SPACING,
 )
+from bilibili_music.ui.widgets.sidebar import NAV_ITEMS  # noqa: E402
 from bilibili_music.ui.widgets.track_list import (  # noqa: E402
     INDEX_COLUMN,
     RICH_COLUMN,
+    _INDEX_PADDING,
     split_title_prefix,
 )
 from bilibili_music.ui.widgets.window_frame import RESIZE_GRIP, _ResizeGrip  # noqa: E402
@@ -213,6 +221,77 @@ class TestTrackList(unittest.TestCase):
         widget = self._list(covers=covers)  # type: ignore[arg-type]
         widget.set_tracks([])
         self.assertGreaterEqual(covers.clear_count, 2)
+
+    def test_append_tracks_keeps_existing_rows_and_covers(self) -> None:
+        """翻页追加重建已有行是错的:行不能动、已贴的封面不能丢、封面队列不能被清。
+
+        清掉封面队列意味着"把前 30 行的封面请求全部作废再重下一遍",既慢又白挨限速。
+        """
+        covers = _FakeCovers()
+        widget = self._list(covers=covers)  # type: ignore[arg-type]
+        widget.set_cover("https://i0.hdslb.com/a.jpg", QPixmap(8, 8))
+        covers.requested.clear()
+        clears_before = covers.clear_count
+
+        widget.append_tracks(
+            [TrackRow(title="新歌", cover_url="https://i0.hdslb.com/c.jpg")]
+        )
+
+        self.assertEqual(widget.rowCount(), 4)
+        self.assertEqual(widget.item(3, INDEX_COLUMN).text(), "4")  # 序号接着往下排
+        self.assertEqual(widget.title_at(0), "晴天【官方 MV】")  # 旧行原样保留
+        self.assertTrue(widget.has_cover_at(0))  # 已经贴上的封面没被丢掉
+        self.assertEqual(covers.clear_count, clears_before)  # 没有清封面队列
+        self.assertEqual(covers.requested, ["https://i0.hdslb.com/c.jpg"])
+
+    def test_append_tracks_with_nothing_changes_nothing(self) -> None:
+        """空批次(接口回了 0 条)不该动列表。"""
+        widget = self._list()
+        widget.append_tracks([])
+        self.assertEqual(widget.rowCount(), 3)
+
+    def test_index_column_fits_three_digits(self) -> None:
+        """翻页后行号会过百,序号列必须放得下三位数。
+
+        列宽是**按字体算**的(不写死像素):同一份代码在真实字体与离屏环境的 fallback
+        字体下宽度并不相同,所以断言也必须跟着字体走 —— 列宽里有一段被 QSS 的
+        ``padding: 0 8px`` 吃掉,那部分放不下字。
+        """
+        widget = self._list()
+        available = widget.columnWidth(INDEX_COLUMN) - _INDEX_PADDING
+        bold = widget.font()
+        bold.setBold(True)  # 当前播放行的序号是加粗的
+        for text in ("100", "150"):
+            with self.subTest(text=text):
+                self.assertGreaterEqual(
+                    available, QFontMetrics(widget.font()).horizontalAdvance(text)
+                )
+                self.assertGreaterEqual(
+                    available, QFontMetrics(bold).horizontalAdvance(text)
+                )
+
+    def test_scrolling_near_the_bottom_asks_for_more(self) -> None:
+        """滚到快到底要报"再要一批";在顶部时不该报。"""
+        host = QWidget()
+        self.addCleanup(host.close)
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 0, 0, 0)
+        widget = TrackList(_COLUMNS, action_column=_ACTION_COLUMN)
+        widget.set_tracks([TrackRow(title=f"第{i}首") for i in range(30)])
+        layout.addWidget(widget)
+        host.resize(400, 200)
+        host.show()
+        QApplication.processEvents()
+
+        bar = widget.verticalScrollBar()
+        self.assertGreater(bar.maximum(), 0, "前提:内容确实比视口高")
+
+        got: list[bool] = []
+        widget.load_more_requested.connect(lambda: got.append(True))
+        bar.setValue(bar.maximum())  # 滚到底
+        self.assertEqual(len(got), 1)
+        bar.setValue(0)  # 又滚回顶部
+        self.assertEqual(len(got), 1, "回到顶部不该再要下一批")
 
     def test_set_cover_marks_only_the_matching_rows(self) -> None:
         """封面按 URL 找到行:贴错行比不贴更糟。"""
@@ -385,6 +464,18 @@ class TestPageSelector(unittest.TestCase):
         self.assertIn("…", title_label.text())
         self.assertEqual(title_label.full_text(), long_title)
         self.assertEqual(title_label.toolTip(), long_title)
+
+    def test_row_title_keeps_its_own_object_name(self) -> None:
+        """菜单行标题要用独立的 objectName,不许和内容区大标题 ``#PageTitle`` 撞名。
+
+        撞名的后果不是"名字不好看":``theme.py`` 里 ``QLabel#PageTitle`` 是 20px 加粗的
+        内容区大标题,菜单一行只有 34px 高,套上它字会撑满整行(用户反馈的"字太大")。
+        """
+        selector = self._selector(count=2, current=1)
+        selector.click()
+        title_label = selector.popup_rows()[0].title_label
+        self.assertEqual(title_label.objectName(), "PageRowTitle")
+        self.assertNotEqual(title_label.objectName(), "PageTitle")
 
     def test_only_the_current_page_is_marked(self) -> None:
         """菜单里只有一行是选中态,而且圆点是实心的。"""
@@ -576,13 +667,17 @@ class TestSidebar(unittest.TestCase):
         sidebar.nav_buttons["cache"].click()
         self.assertEqual(got, ["discover", "cache"])
 
-    def test_queue_entry_is_not_mutually_exclusive_with_pages(self) -> None:
-        """"播放队列"是面板开关:点它不该把页面入口的选中态弄丢。"""
+    def test_queue_entry_is_gone(self) -> None:
+        """"播放队列"的开关只在播放条上,侧栏不该再留一个入口。
+
+        侧栏入口一律是"切一页"的语义,队列面板是常驻开关 —— 混在一起会让"点侧栏
+        到底是换页还是收起面板"说不清。
+        """
         sidebar = self._sidebar()
-        sidebar.nav_buttons["results"].click()
-        sidebar.nav_buttons["queue"].click()
-        self.assertTrue(sidebar.nav_buttons["results"].isChecked())
-        self.assertTrue(sidebar.nav_buttons["queue"].isChecked())
+        self.assertNotIn("queue", sidebar.nav_buttons)
+        self.assertEqual(
+            [item.key for item in NAV_ITEMS], ["discover", "results", "cache"]
+        )
 
     def test_playlist_click_clears_page_selection(self) -> None:
         """选歌单要清掉页面入口的选中态,侧栏不能同时亮两个。"""
@@ -622,15 +717,6 @@ class TestSidebar(unittest.TestCase):
         sidebar.nav_selected.connect(got.append)
         sidebar.set_active_page("results")
         self.assertTrue(sidebar.nav_buttons["results"].isChecked())
-        self.assertEqual(got, [])
-
-    def test_set_queue_visible_does_not_emit(self) -> None:
-        """同步队列开关同理:否则同步一次就会把面板再翻一遍(状态直接抖回去)。"""
-        sidebar = self._sidebar()
-        got: list[str] = []
-        sidebar.nav_selected.connect(got.append)
-        sidebar.set_queue_visible(True)
-        self.assertTrue(sidebar.nav_buttons["queue"].isChecked())
         self.assertEqual(got, [])
 
 

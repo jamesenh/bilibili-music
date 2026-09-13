@@ -177,8 +177,12 @@ class PageRow(QPushButton):
         self.index_label.setFixedWidth(30)
 
         # 标题用 ElidedLabel:音乐区的分P标题可以很长,放不下要省略而不是撑破菜单
+        #
+        # objectName 必须是 PageRowTitle 而不是 PageTitle:后者是内容区大标题
+        # (``theme.py`` 里 ``QLabel#PageTitle`` 是 20px 加粗),菜单里的小字行套上它
+        # 会一行占掉半个菜单 —— QSS 按 objectName 选控件,名字撞了样式就一起撞。
         self.title_label = ElidedLabel(page.title or f"P{page.index}")
-        self.title_label.setObjectName("PageTitle")
+        self.title_label.setObjectName("PageRowTitle")
 
         # 时长取**分P自己的** duration:视频级 duration 是所有分P之和,不能当单曲时长
         self.duration_label = QLabel(page.duration_text)

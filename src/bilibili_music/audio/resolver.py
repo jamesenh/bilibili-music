@@ -1,13 +1,22 @@
 """把 ``Video`` 的某个分P解析成本地可播放的音频文件(异步)。
 
-流程:补全详情(拿分P与 ``cid``) -> **先盲查缓存** -> 请求 playurl 拿音轨 -> 选音质
--> 下载到缓存。
+流程:补全详情(拿分P与 ``cid``) -> **先查缓存** -> 请求 playurl 拿音轨 -> 选音质
+-> 下载到缓存 -> 写缓存索引。
 
-盲查缓存(见 :func:`pick_best_cached`)发生在请求 playurl **之前**,已经落盘的歌
-因此能省掉整次网络请求直接开播。代价是这条快路径拿不到接口给的 ``bandwidth``,
-音轨只能按档位取标称码率(见 :func:`~bilibili_music.api.bilibili.track_from_quality`)。
-指定了 ``quality_id`` 时**不走**快路径 —— 那时连 codec 都要等接口返回才知道,
+查缓存发生在请求 playurl **之前**,已经落盘的歌因此能省掉整次网络请求直接开播。
+两条路依次试(见 :func:`pick_best_cached`):
+
+1. **缓存索引**(``core/cache_index.py``,``index.json``):它能给出真实的档位、codec
+   与码率,所以连不在常规三档里的缓存也能命中;
+2. **盲查**:索引缺失、损坏或记录的文件已被手删时,按常见档位从高到低试
+   (:data:`KNOWN_QUALITIES`)。这条快路径拿不到接口给的 ``bandwidth``,
+   音轨只能按档位取标称码率(见 :func:`~bilibili_music.api.bilibili.track_from_quality`)。
+
+指定了 ``quality_id`` 时**两条都不走** —— 那时连 codec 都要等接口返回才知道,
 没法提前拼出缓存键。
+
+**写索引是"顺手"的**:解析成功(命中缓存或刚下载完)时把这一条记进索引,让"本地缓存"页
+能枚举出曲名与体积。写失败由 ``CacheIndex`` 自己吞掉,不影响播放。
 
 **这个模块里没有 QThread**。改造成 QNetworkAccessManager 之后,整个下载过程
 就是"发请求 -> 收进度信号 -> 收完成信号",本来就不需要工作线程。之前用
@@ -28,7 +37,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..api.bilibili import BilibiliClient, pick_best, track_from_quality
+from ..api.bilibili import BilibiliClient, pick_best, track_from_cache
 from ..core.cache import AudioCache, DownloadSink
 from ..core.errors import NoAudioSourceError
 from ..core.models import AudioTrack, Page, Video, track_subtitle, track_title
@@ -75,22 +84,32 @@ class ResolvedAudio:
 
 @dataclass(slots=True)
 class CachedHit:
-    """一次缓存盲查的命中结果。
+    """一次缓存查询的命中结果。
 
     带上 ``quality_id`` 与 ``codec`` 而不是只回一个路径:上层要据此重建
     :class:`~bilibili_music.core.models.AudioTrack` 才能在界面上显示音质 ——
     只知道文件在哪是拼不出 :class:`ResolvedAudio` 的。
+
+    Attributes:
+        quality_id: 命中的音质档位。
+        codec: 命中的编码串。
+        path: 本地音频文件路径。
+        bandwidth: 接口给过、并被缓存索引记下来的真实码率(bit/s);``0`` 表示不知道
+            (盲查命中),此时只能按档位取标称值。
     """
 
     quality_id: int
     codec: str
     path: Path
+    bandwidth: int = 0
 
 
 def pick_best_cached(cache: AudioCache, video: Video, page: Page) -> CachedHit | None:
-    """盲查缓存:不知道实际音质时,按常见档位从高到低试。
+    """查缓存:先问索引,索引帮不上忙时按常见档位从高到低盲查。
 
-    用于在请求 playurl **之前**预判:命中就能直接开播,省掉整次网络请求。
+    顺序是有讲究的。索引能给出**真实的**档位与 codec(含 ``fLaC`` 这类不在常规三档里
+    的缓存),所以先问它;索引读不出来、或它记的那个文件已经被用户手删时,再退回盲查
+    —— 这条兜底是"缓存能不能播"的最后保障,索引坏了绝不允许影响播放(见 ``core/cache_index.py``)。
 
     Args:
         cache: 音频缓存实例。
@@ -98,8 +117,17 @@ def pick_best_cached(cache: AudioCache, video: Video, page: Page) -> CachedHit |
         page: 目标分P,提供 ``cid``。
 
     Returns:
-        命中的档位、codec 与文件路径;全部档位都未命中时返回 ``None``。
+        命中的档位、codec、文件路径与已知码率;两处都没有时返回 ``None``。
     """
+    indexed = cache.indexed_hit(video.bvid, page.cid)
+    if indexed is not None:
+        entry, path = indexed
+        return CachedHit(
+            quality_id=entry.quality_id,
+            codec=entry.codec,
+            path=path,
+            bandwidth=entry.bandwidth,
+        )
     for quality_id, codec in KNOWN_QUALITIES:
         path = cache.lookup(video.bvid, page.cid, quality_id, codec)
         if path is not None:
@@ -274,13 +302,13 @@ class AudioResolver:
             )
         state.page = page
 
-        # 盲查缓存在请求 playurl 之前:已落盘的歌直接开播,省掉整次网络请求。
+        # 查缓存在请求 playurl 之前:已落盘的歌直接开播,省掉整次网络请求。
         # 只在"自动选音质"时走这条路 —— 用户指定了档位时,连 codec 都要等接口
         # 返回才知道,没法提前拼出缓存键。
         if state.quality_id is None:
             hit = pick_best_cached(self.cache, state.video, page)
             if hit is not None:
-                state.track = track_from_quality(hit.quality_id, hit.codec)
+                state.track = track_from_cache(hit.quality_id, hit.codec, hit.bandwidth)
                 self._done(state, hit.path)
                 return
 
@@ -335,11 +363,12 @@ class AudioResolver:
             state.on_progress(done, total)
 
     def _done(self, state: _ResolveState, path: Path) -> None:
-        """成功出口:组装 :class:`ResolvedAudio` 并回调。"""
+        """成功出口:写缓存索引,组装 :class:`ResolvedAudio` 并回调。"""
         if not self._alive(state):
             return
         self._state = None
         assert state.page is not None and state.track is not None
+        self._remember(state, path)
         state.on_success(
             ResolvedAudio(
                 video=state.video,
@@ -348,6 +377,19 @@ class AudioResolver:
                 path=path,
             )
         )
+
+    def _remember(self, state: _ResolveState, path: Path) -> None:
+        """把这一首记进缓存索引,让"本地缓存"页能枚举到它。
+
+        两条成功路径都要走这里:刚下载完的那一首固然是新记录,而**命中缓存**的那一首也
+        需要补一笔 —— 它可能是"索引还没有时"缓存下来的,不补就永远不出现在本地缓存页里。
+        重复记录不会重复落盘(``CacheIndex.remember`` 会比对内容),所以不必自己去判断。
+
+        写索引失败**不上报**:索引只是缓存的一份快照,不能因为它写不进去就让一次已经
+        成功的播放变成失败(真正的失败口径见 :meth:`_fail`)。
+        """
+        assert state.page is not None and state.track is not None
+        self.cache.remember(state.video, state.page, state.track, path)
 
 
 __all__ = [

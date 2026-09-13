@@ -14,6 +14,7 @@
 * :mod:`.headers` —— 请求头构造与 gzip/deflate 解压(纯函数)
 * :mod:`.http` —— 超时、退避、限速等调优常量(只有常量,没有实现)
 * :mod:`.cache` —— 音频磁盘缓存与原子写入的 ``DownloadSink``
+* :mod:`.cache_index` —— 已缓存音频的 sidecar JSON 索引(让缓存可枚举)
 * :mod:`.cover_cache` —— 封面图片的磁盘缓存(按 URL 落盘,带容量上限)
 * :mod:`.queue` —— 播放队列与四种播放模式(纯逻辑,不碰 Qt)
 * :mod:`.config` —— 应用配置的 JSON 落盘(音量、播放模式、主题、续播位置)
