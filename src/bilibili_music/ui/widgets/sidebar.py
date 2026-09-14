@@ -65,11 +65,13 @@ class NavItem:
     icon: str
 
 
-#: 侧栏入口,每一个都对应中间内容区的一页。顺序与设计稿一致;"发现""本地缓存"
-#: 对应的功能分属路线图 M3 / M2,当前点开是占位页(见 ``widgets/placeholder.py``)。
+#: 侧栏入口,每一个都对应中间内容区的一页。顺序与设计稿一致;"发现"对应的功能
+#: 属路线图 M3,当前点开是占位页(见 ``widgets/placeholder.py``);
+#: "搜索结果""最近播放""本地缓存"三页都是真的。
 NAV_ITEMS: tuple[NavItem, ...] = (
     NavItem("discover", "发现", "home"),
     NavItem("results", "搜索结果", "search"),
+    NavItem("history", "最近播放", "history"),
     NavItem("cache", "本地缓存", "download"),
 )
 

@@ -39,6 +39,7 @@ from bilibili_music.core.cache import AudioCache  # noqa: E402
 from bilibili_music.core.config import AppConfig, ConfigStore  # noqa: E402
 from bilibili_music.core.cover_cache import CoverCache  # noqa: E402
 from bilibili_music.core.errors import NetworkError  # noqa: E402
+from bilibili_music.core.library_db import LibraryDb  # noqa: E402
 from bilibili_music.core.models import Page, Video  # noqa: E402
 from bilibili_music.core.queue import PlayMode  # noqa: E402
 from bilibili_music.ui.icons import DARK  # noqa: E402
@@ -407,7 +408,7 @@ class _WindowCase(unittest.TestCase):
             client=self.client,  # type: ignore[arg-type]
             # 音频缓存要指向沙箱目录:切到"本地缓存"页会读它的索引(默认值会去翻真实
             # 用户的 %LOCALAPPDATA%,那些记录不属于任何用例)
-            cache=AudioCache(self.tmp / "cache"),
+            cache=AudioCache(self.tmp / "cache", db=LibraryDb(self.tmp / "library.db")),
             # 封面必须落进沙箱目录:默认值会写到真实用户的 %LOCALAPPDATA%,
             # 而且第二个用例会因为"上一轮的图还在磁盘上"而不再发假请求,断言随之失灵
             cover_cache=CoverCache(self.tmp / "covers"),
@@ -450,6 +451,7 @@ class _WindowCase(unittest.TestCase):
             cache=object(),  # type: ignore[arg-type]
             cover_cache=CoverCache(self.tmp / "covers_next"),
             config_store=self.store,
+            library=LibraryDb(self.tmp / "library.db"),
             playback=self.playback,
         )
 
@@ -1037,6 +1039,7 @@ class TestConfigWiring(_WindowCase):
             cache=object(),  # type: ignore[arg-type]
             cover_cache=CoverCache(self.tmp / "covers"),
             config_store=self.store,
+            library=LibraryDb(self.tmp / "library.db"),
             playback=PlaybackController(_FakeResolver(), _FakePlayer()),  # type: ignore[arg-type]
         )
         self.addCleanup(window.close)
@@ -1147,6 +1150,7 @@ class TestCoverWiring(_WindowCase):
             cache=object(),  # type: ignore[arg-type]
             cover_cache=CoverCache(self.tmp / "covers"),
             config_store=self.store,
+            library=LibraryDb(self.tmp / "library.db"),
             playback=PlaybackController(_FakeResolver(), _FakePlayer()),  # type: ignore[arg-type]
         )
         self.addCleanup(window.close)

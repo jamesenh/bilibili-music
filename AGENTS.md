@@ -41,7 +41,7 @@
 | 依赖管理 | `uv` | 新增依赖前先问；能用 Qt 自带的就不加包（但 `core` 不许 import Qt，见 4.1；`json` 这类标准库方案同样不新增依赖） |
 | 网络 | `QNetworkAccessManager`（默认）+ `urllib`（对照） | 两者接口必须一致，可 `--backend` 切换 |
 | 播放 | `QMediaPlayer` + `QAudioOutput` | 只播**本地音频文件** |
-| 本地存储 | 文件缓存（`core/cache.py`，原子写入） | 不引入数据库/ORM |
+| 本地存储 | 音频文件缓存（`core/cache.py`，原子写入）+ 本地 sqlite 库（`core/library_db.py`） | 缓存索引与播放历史入 `library.db`（`sqlite3` 是标准库，无新依赖）；配置仍是纯 JSON。不引入 ORM，**也不新增任何第三方数据库包** |
 
 ### 1.2 核心流程（固定，不要绕开）
 
@@ -219,6 +219,11 @@ ui/     界面(依赖以上全部)
 - **`QStandardPaths` 也进不了 `core`**。实测在没有 `QCoreApplication`（或未设置
   `applicationName`）时，它只返回泛化目录（如 `AppData/Local`），拿不到带应用名的正确
   路径；它天然依赖一个已初始化的 app 实例。真要它，就让 `ui` 解析好再注入。
+
+**`sqlite3` 不在这条禁令之内**：它是标准库（不算新增第三方包），也不依赖事件循环，
+`core/library_db.py` 用它存放缓存索引与播放历史。但"能用标准库就不加包"不等于
+"可以随便引库"：真要换/加数据库驱动（`aiosqlite`、SQLAlchemy 之类）仍按第 3 节
+"新增依赖前先问"走。
 
 允许与禁止的分界（现状经实测核对）：
 

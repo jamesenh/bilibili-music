@@ -84,6 +84,8 @@ class TestIconResources(unittest.TestCase):
             "more-vertical",
             "trash",
             "expand",
+            # 「最近播放」侧栏入口新增的
+            "history",
         }
         self.assertEqual(expected - set(available_icons()), set())
 

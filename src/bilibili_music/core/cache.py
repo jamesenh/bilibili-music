@@ -9,9 +9,13 @@
 所以"缓存文件存在"就等价于"这个文件是完整的",不需要额外的元数据校验。
 
 **除了文件,还维护一份索引**(:class:`~bilibili_music.core.cache_index.CacheIndex`,
-与本模块同目录的 ``index.json``):文件名是摘要,只有"知道键再查文件"这一条路,
+存在与配置文件同目录的 ``library.db`` 里):文件名是摘要,只有"知道键再查文件"这一条路,
 而"本地缓存"页需要反向枚举出曲名 / UP主 / 体积。索引只服务于展示与快路径,
 坏了、丢了都不影响播放 —— 见 :func:`~bilibili_music.audio.resolver.pick_best_cached`。
+
+**索引刻意不与音频文件同目录**:音频放 ``%LOCALAPPDATA%``(随时可以整个删掉),
+索引与播放历史放配置目录(用户数据)。代价是用户把缓存目录整个删掉时,库里会留下
+一批指向不存在文件的记录 —— 那由 :meth:`AudioCache.prune` 在下次读到时剪掉。
 """
 
 from __future__ import annotations
@@ -22,8 +26,14 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 
-from .cache_index import CachedTrack, CacheIndex, entry_for
+from .cache_index import (
+    CachedTrack,
+    CacheIndex,
+    discard_legacy_index,
+    entry_for,
+)
 from .errors import BiliMusicError
+from .library_db import LibraryDb
 from .models import AudioTrack, Page, Video
 
 __all__ = [
@@ -167,18 +177,27 @@ class AudioCache:
     键里漏掉 ``cid`` 会让同一视频的不同分P互相覆盖,表现为"切了分P还是上一首"。
     """
 
-    def __init__(self, root: Path | None = None) -> None:
-        """绑定缓存目录并确保它存在。
+    def __init__(self, root: Path | None = None, *, db: LibraryDb | None = None) -> None:
+        """绑定缓存目录与本地库,并确保缓存目录存在。
 
         Args:
             root: 覆盖缓存根目录,主要给测试用沙箱目录。
                 ``None`` 表示使用 :func:`cache_root` 的平台默认值。
+            db: 本地库(缓存索引的落点);``None`` 表示平台默认配置目录下的
+                ``library.db``。测试必须**显式注入沙箱路径**,否则会写到用户真实的库。
         """
         self.root = Path(root) if root is not None else cache_root()
         self.root.mkdir(parents=True, exist_ok=True)
-        #: 与音频文件同目录的索引(可枚举的元数据)。两者**必须同一个 root**:
-        #: 分开了就会出现"清空了音频却留下索引"这类不一致,注入沙箱目录时也容易漏一个。
-        self.index = CacheIndex(root=self.root)
+        #: 索引与播放历史共用的本地库(见 ``core/library_db.py``)。
+        self.db = db if db is not None else LibraryDb()
+        #: 索引的读写句柄。音频文件在 :attr:`root` 下,索引记录在库里 ——
+        #: 两边的"键"是同构的(都含 ``cid``),但存储位置是分开的。
+        self.index = CacheIndex(self.db)
+        # 旧版 JSON 索引直接丢弃(索引是可再生的快照,不迁移)。
+        # **必须等到库建成功之后才删**:否则删了旧索引而新表没建起来,用户就凭空
+        # 少了一份还能用的元数据。
+        if self.db.available:
+            discard_legacy_index(self.root)
 
     def key_for(self, bvid: str, cid: int, quality_id: int, codec: str = "") -> str:
         """计算缓存键。

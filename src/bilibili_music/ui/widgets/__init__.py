@@ -12,6 +12,8 @@
 * :mod:`.page_selector` —— ``PageSelector``,播放条上的分P选择器与它的弹出菜单
 * :mod:`.queue_drawer` —— ``QueueDrawer``,右侧播放队列面板
 * :mod:`.cache_page` —— ``CachePage``,本地缓存页(已缓存音频的列表与清理)
+* :mod:`.history_page` —— ``HistoryPage``,最近播放页(放过哪些歌的列表)
+* :mod:`.task_dialog` —— ``TaskDialog``,下载任务对话框(批量缓存的进度与暂停/继续)
 * :mod:`.placeholder` —— ``PlaceholderPage``,尚未实现的功能的占位页
 * :mod:`.elided_label` —— ``ElidedLabel``,按宽度省略过长文字的标签
 
@@ -21,11 +23,13 @@
 
 from .cache_page import CachePage
 from .elided_label import ElidedLabel
+from .history_page import HistoryPage
 from .page_selector import PageSelector
 from .placeholder import PlaceholderPage
 from .player_bar import PlayerBar
 from .queue_drawer import QueueDrawer
 from .sidebar import Sidebar
+from .task_dialog import TaskDialog, TaskRow
 from .title_bar import TitleBar
 from .track_list import TrackList, TrackRow
 from .window_frame import FramelessWindow
@@ -34,11 +38,14 @@ __all__ = [
     "CachePage",
     "ElidedLabel",
     "FramelessWindow",
+    "HistoryPage",
     "PageSelector",
     "PlaceholderPage",
     "PlayerBar",
     "QueueDrawer",
     "Sidebar",
+    "TaskDialog",
+    "TaskRow",
     "TitleBar",
     "TrackList",
     "TrackRow",

@@ -676,7 +676,8 @@ class TestSidebar(unittest.TestCase):
         sidebar = self._sidebar()
         self.assertNotIn("queue", sidebar.nav_buttons)
         self.assertEqual(
-            [item.key for item in NAV_ITEMS], ["discover", "results", "cache"]
+            [item.key for item in NAV_ITEMS],
+            ["discover", "results", "history", "cache"],
         )
 
     def test_playlist_click_clears_page_selection(self) -> None:

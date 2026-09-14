@@ -331,6 +331,26 @@ QLabel#TrackSubtitle {{
     color: {DARK.muted};
     font-size: 12px;
 }}
+/* 下载任务对话框:一行一个任务,行与行之间只用一条细线分隔 */
+QFrame#TaskRow {{
+    border-bottom: 1px solid {s.border};
+}}
+QLabel#TaskTitle {{
+    color: {DARK.text};
+    font-weight: 600;
+}}
+QLabel#TaskState {{
+    color: {DARK.muted};
+    font-size: 12px;
+}}
+QLabel#TaskDetail {{
+    color: {DARK.muted};
+    font-size: 12px;
+}}
+/* 全局的进度条被压成 4px(播放条上那条很细的缓存进度),任务行要高一点才看得出进度 */
+QProgressBar#TaskProgress {{
+    max-height: 6px;
+}}
 QLabel#CoverThumb {{
     background: {s.field};
     border-radius: 6px;

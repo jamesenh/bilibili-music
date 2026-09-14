@@ -20,7 +20,9 @@ from bilibili_music.core.config import (  # noqa: E402
     AppConfig,
     CONFIG_FILE_NAME,
     ConfigStore,
+    DEFAULT_HISTORY_LIMIT,
     DEFAULT_VOLUME,
+    MAX_HISTORY_LIMIT,
     config_root,
 )
 from bilibili_music.core.queue import PlayMode  # noqa: E402
@@ -61,6 +63,7 @@ class TestAppConfig(unittest.TestCase):
         self.assertEqual(config.last_bvid, "")
         self.assertEqual(config.last_cid, 0)
         self.assertEqual(config.last_position_ms, 0)
+        self.assertEqual(config.history_limit, DEFAULT_HISTORY_LIMIT)
 
     def test_normalized_clamps_volume(self) -> None:
         """音量越界要被夹到 0 ~ 100,否则会把越界值直接喂给音量控件。"""
@@ -90,6 +93,31 @@ class TestAppConfig(unittest.TestCase):
         config = AppConfig(last_cid=-3, last_position_ms=-1000).normalized()
         self.assertEqual(config.last_cid, 0)
         self.assertEqual(config.last_position_ms, 0)
+
+    def test_normalized_keeps_a_sane_history_limit(self) -> None:
+        """手改过的条数上限:正数原样保留(上限内)。"""
+        self.assertEqual(AppConfig(history_limit=50).normalized().history_limit, 50)
+        self.assertEqual(AppConfig(history_limit="50").normalized().history_limit, 50)
+
+    def test_normalized_recovers_from_bad_history_limit(self) -> None:
+        """非正数与非数字都退回默认值。
+
+        不回退成"0 条历史":上限本来是用户为了"别把库撑大"而设的,填 0 更可能是改错了,
+        而"一条记录都不留"在界面上看起来就是个 bug。
+        """
+        for value in (0, -1, "abc", None):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    AppConfig(history_limit=value).normalized().history_limit,
+                    DEFAULT_HISTORY_LIMIT,
+                )
+
+    def test_normalized_caps_the_history_limit(self) -> None:
+        """超大值要封顶:否则每播一首都让 sqlite 去数十百万行。"""
+        self.assertEqual(
+            AppConfig(history_limit=10_000_000).normalized().history_limit,
+            MAX_HISTORY_LIMIT,
+        )
 
     def test_normalized_does_not_mutate_original(self) -> None:
         """收敛必须返回新对象:就地改会让"原始输入"和"合法化结果"无法对照。"""
@@ -127,11 +155,20 @@ class TestConfigStore(_ScratchCase):
             last_bvid="BV1xx411c7mD",
             last_cid=998877,
             last_position_ms=42000,
+            history_limit=88,
         )
         store.save(saved)
         loaded = store.load()
         self.assertEqual(loaded, saved)
         self.assertIsInstance(loaded.play_mode, PlayMode)
+
+    def test_history_limit_is_handeditable_in_the_config_file(self) -> None:
+        """「最近播放」的上限要真的落进 ``config.json`` 并可手改(没有界面入口)。"""
+        store = self._store()
+        store.save(AppConfig(history_limit=88))
+        raw = json.loads(store.path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["history_limit"], 88)
+        self.assertEqual(store.load().history_limit, 88)
 
     def test_save_returns_written_path(self) -> None:
         """保存要返回真正落盘的路径,方便调用方记日志或断言。"""

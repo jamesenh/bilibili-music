@@ -40,6 +40,7 @@ from bilibili_music.core.cache import AudioCache  # noqa: E402
 from bilibili_music.core.cache_index import CachedTrack  # noqa: E402
 from bilibili_music.core.config import ConfigStore  # noqa: E402
 from bilibili_music.core.cover_cache import CoverCache  # noqa: E402
+from bilibili_music.core.library_db import LibraryDb  # noqa: E402
 from bilibili_music.core.models import AudioTrack, Page, Video  # noqa: E402
 from bilibili_music.ui.main_window import MainWindow  # noqa: E402
 from bilibili_music.ui.widgets import CachePage  # noqa: E402
@@ -338,6 +339,33 @@ class TestCachePageWidget(unittest.TestCase):
         page.clear_button.click()
         self.assertEqual(got, [True])
 
+    def test_download_task_button_emits(self) -> None:
+        """"下载任务"按钮要把请求转给主窗口(对话框是主窗口的,控件不自己开窗)。"""
+        page = self._page()
+        got: list[bool] = []
+        page.tasks_requested.connect(lambda: got.append(True))
+        page.tasks_button.click()
+        self.assertEqual(got, [True])
+
+    def test_open_dir_button_emits(self) -> None:
+        """"打开缓存目录"按钮同上:控件只发信号,不开目录也不读盘。"""
+        page = self._page()
+        got: list[bool] = []
+        page.open_dir_requested.connect(lambda: got.append(True))
+        page.open_dir_button.click()
+        self.assertEqual(got, [True])
+
+    def test_download_task_button_shows_the_unfinished_count(self) -> None:
+        """未完成任务数写在按钮上;都干完了就把数字去掉,回到一个安静的入口。"""
+        page = self._page()
+        self.assertEqual(page.tasks_button.text(), "下载任务")
+        page.set_task_summary(3)
+        self.assertEqual(page.tasks_button.text(), "下载任务 (3)")
+        self.assertIn("3 个任务未完成", page.tasks_button.toolTip())
+        page.set_task_summary(0)
+        self.assertEqual(page.tasks_button.text(), "下载任务")
+        self.assertNotIn("0 个", page.tasks_button.toolTip())
+
     def test_style_hooks_are_in_place(self) -> None:
         """样式按 ``#objectName`` 选,控件必须挂上约定好的名字(过滤框是新的一个)。"""
         page = self._page()
@@ -345,6 +373,8 @@ class TestCachePageWidget(unittest.TestCase):
         self.assertEqual(page.filter_input.objectName(), "FilterInput")
         self.assertEqual(page.list.objectName(), "TrackTable")
         self.assertEqual(page.clear_button.objectName(), "GhostTextButton")
+        self.assertEqual(page.tasks_button.objectName(), "GhostTextButton")
+        self.assertEqual(page.open_dir_button.objectName(), "GhostTextButton")
 
 
 # ====================================================================== 接线用例
@@ -360,7 +390,7 @@ class _WiringCase(unittest.TestCase):
         self.tmp.mkdir(parents=True, exist_ok=True)
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-        self.cache = AudioCache(self.tmp / "cache")
+        self.cache = AudioCache(self.tmp / "cache", db=LibraryDb(self.tmp / "library.db"))
         self.player = _FakePlayer()
         # 真的解析器 + "一被调用就失败"的客户端:离线点播但凡发一个请求,用例就红
         self.playback = PlaybackController(

@@ -1,4 +1,4 @@
-"""已缓存音频的索引(sidecar JSON,让缓存**可枚举**)。
+"""已缓存音频的索引(让缓存**可枚举**)。
 
 为什么需要它
 ------------
@@ -11,60 +11,99 @@
 一次快照",坏了、丢了都不影响播放 —— :func:`~bilibili_music.audio.resolver.pick_best_cached`
 在索引缺失时会退回按档位盲查(见 ``AGENTS.md`` 第 1.2 节的主线不变)。
 
+为什么从 ``index.json`` 换成 sqlite
+-----------------------------------
+
+索引原先是一份与音频文件同目录的 ``index.json``:每次增删都要**整份重写**。播放历史
+(``core/history.py``)是"每开始播一首都写一条"的高频写入,再用同一套做法就得维护第二个
+整天重写的文件。现在两者共用配置目录下的 ``library.db``(见 :mod:`.library_db`):
+
+* 增删是一行 SQL,不再重写整份数据;
+* 一个库两张表,想做"这首还在不在本地"这类跨表查询时不必再对两份文件;
+* 崩溃安全交给 sqlite 自己的日志(WAL),原先那套"先 ``.part`` 再 ``os.replace``"的
+  纪律不再需要。
+
+**旧数据不迁移**(2026-09-14 的决定):索引文件保留的只是"磁盘快照",没有不可再生的
+信息,所以 :func:`discard_legacy_index` 在库建好之后直接把它删掉。代价是**索引出现之前
+缓存下来的非常规档位(如 ``fLaC``)会变成磁盘上的僵尸文件** —— 盲查只覆盖
+:data:`~bilibili_music.audio.resolver.KNOWN_QUALITIES` 里的三档,那些歌要重新缓存一次
+才会重新出现在"本地缓存"页里。
+
 设计取舍
 --------
 
-* **单个 ``index.json``,而不是每个音频文件配一个 ``<key>.json``**:枚举只读一次盘、
-  增删也只写一次盘(原子替换),缓存目录里也不会散出成百上千个小文件。代价是每新增一首
-  就整体重写一次索引 —— 按每条记录约 200 字节估,几百首也只有几十 KB。
-* **写入"先 ``.part`` 再 ``os.replace``"**,与缓存 / 配置同一条纪律:进程被杀不会留下
-  半截 JSON。
-* **写盘失败不抛异常**:索引只服务于界面展示与缓存快路径,磁盘满或没权限时放弃这次更新
-  即可。它的调用方是播放解析流程,**绝不能让写索引失败导致播不出来**。
-* **``file_name`` 只接受纯文件名**:索引文件在用户目录里、可以被手改,只认裸文件名就能
+* **字段容错读取**:sqlite 的列是动态类型的,用户可以拿任意 sqlite 工具手改这个库。
+  缺关键字段、类型不对的单条记录一律跳过,**不做整份作废**。
+* **``file_name`` 只接受纯文件名**:它会被用来拼路径(删除、查文件),只认裸文件名就能
   挡住 ``..\\..\\x.m4a`` 这类路径穿越 —— 否则一次"删除缓存"会删到缓存目录之外。
-* **读取尽量救**:坏 JSON、字段类型不对、缺关键字段的单条记录一律跳过,不做"整份作废"。
+* **写入失败不抛异常**:索引只服务于界面展示与缓存快路径,库不可用时放弃这次更新即可。
+  它的调用方是播放解析流程,**绝不能让写索引失败导致播不出来**。
 """
 
 from __future__ import annotations
 
-import json
-import os
+import sqlite3
 import time
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 
-from .models import AudioTrack, Page, Video, track_title
+from .library_db import LibraryDb
+from .models import AudioTrack, Page, PlayableEntry, Video, track_title
 
 __all__ = [
+    "CacheKey",
     "CachedTrack",
     "CacheIndex",
-    "INDEX_FILE_NAME",
-    "INDEX_VERSION",
+    "LEGACY_INDEX_FILE_NAME",
+    "discard_legacy_index",
     "entry_for",
     "video_from_entry",
 ]
 
-#: 索引文件名(与音频文件同放在缓存根目录下,``*.m4a`` / ``*.part`` 的通配不会碰到它)。
-INDEX_FILE_NAME = "index.json"
+#: 旧版 JSON 索引的文件名。它只在"建库成功后删掉"这一处出现
+#: (见 :func:`discard_legacy_index`)。
+LEGACY_INDEX_FILE_NAME = "index.json"
 
-#: 索引格式版本。当前只在写盘时记录、读盘时不校验:留着它是为了以后真要改结构时,
-#: 能一眼看出这份文件是哪一代写的(而不是为将来的迁移提前写一堆没人走的代码)。
-INDEX_VERSION = 1
+#: 旧版索引写入用的临时后缀(与 ``update``/``lookup`` 同一套纪律的残留),一并清掉。
+_LEGACY_TMP_SUFFIX = ".part"
 
 #: 一条记录的身份:``(bvid, cid, 音质档位, codec)``,与音频文件的缓存键同构。
 CacheKey = tuple[str, int, int, str]
 
-#: 原子写入用的临时后缀;与音频缓存同一条纪律,临时文件与正式文件同目录才保证原子。
-_TMP_SUFFIX = ".part"
+#: 写入一条索引记录的 UPSERT 语句。
+#:
+#: 冲突目标必须是主键 ``file_name``:音频文件名由缓存键推导而来,同一个键永远对应同一个
+#: 文件名,所以"同一个键重复记录"在这里天然收敛成一行。
+#: ``DO UPDATE``(而不是删了再插)保住了 ``rowid``,而"最近缓存的排在前面"正是靠它。
+_UPSERT = """
+INSERT INTO cached_tracks
+    (file_name, bvid, cid, quality_id, codec, bandwidth, title, author, page_index,
+     page_title, multipart, duration, cover_url, size_bytes, cached_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(file_name) DO UPDATE SET
+    bvid       = excluded.bvid,
+    cid        = excluded.cid,
+    quality_id = excluded.quality_id,
+    codec      = excluded.codec,
+    bandwidth  = excluded.bandwidth,
+    title      = excluded.title,
+    author     = excluded.author,
+    page_index = excluded.page_index,
+    page_title = excluded.page_title,
+    multipart  = excluded.multipart,
+    duration   = excluded.duration,
+    cover_url  = excluded.cover_url,
+    size_bytes = excluded.size_bytes,
+    cached_at  = excluded.cached_at
+"""
 
 
 def _as_int(value: object, default: int = 0) -> int:
     """把不可信的值转成整数;转不了就用 ``default``。
 
-    索引文件可能被手改坏,直接 ``int()`` 会抛 ``TypeError`` / ``ValueError`` 把整次读取
-    炸掉,而这里的目标是"尽量救回来"。
+    库文件可能被手改坏(sqlite 的列是动态类型的),直接 ``int()`` 会抛
+    ``TypeError`` / ``ValueError`` 把整次读取炸掉,而这里的目标是"尽量救回来"。
 
     Args:
         value: 待转换的原始值。
@@ -95,7 +134,7 @@ def _as_str(value: object) -> str:
 def _is_plain_file_name(name: str) -> bool:
     """判断一个字符串是不是"纯文件名"(不含目录、盘符、上跳)。
 
-    见模块 docstring:索引里的 ``file_name`` 会被用来拼路径(删除、查文件),而索引文件
+    见模块 docstring:索引里的 ``file_name`` 会被用来拼路径(删除、查文件),而库文件
     本身是可被手改的,所以进内存前就得把 ``..`` / 目录分隔符挡在外面。
 
     Args:
@@ -106,7 +145,41 @@ def _is_plain_file_name(name: str) -> bool:
     """
     if not name or name in (".", ".."):
         return False
+    # 反斜杠也得自己挡:它是 Windows 的目录分隔符,但 POSIX 上 ``Path`` 只认 ``/``,
+    # 于是 ``Path(r"..\\..\\x.m4a").name`` 会原样返回整个串。库文件是可移植的
+    # (会被同步、备份到别的机器),这条判据不能因平台而变松。
+    if "\\" in name:
+        return False
     return Path(name).name == name
+
+
+def discard_legacy_index(root: Path) -> bool:
+    """删掉缓存目录里的旧版 JSON 索引(不迁移,见模块 docstring)。
+
+    调用点只有一个(``AudioCache.__init__``),而且必须**在建库成功之后**才调用:
+    删了旧索引而新表没建成的话,用户就凭空少了一份还能用的元数据。
+
+    删不掉(文件被占用、无权限)不算错误:留着它只是多个几百字节的陌生文件,不影响任何
+    功能 —— 下一次启动还会再试一遍。
+
+    Args:
+        root: 缓存根目录(旧索引与音频文件同目录)。
+
+    Returns:
+        真的删掉了 ``index.json`` 返回 ``True``;本来就没有或删不掉返回 ``False``。
+    """
+    directory = Path(root)
+    legacy = directory / LEGACY_INDEX_FILE_NAME
+    removed = False
+    for path in (legacy, legacy.with_suffix(legacy.suffix + _LEGACY_TMP_SUFFIX)):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+        removed = True
+    return removed
 
 
 @dataclass(slots=True)
@@ -114,11 +187,11 @@ class CachedTrack:
     """索引里的一条已缓存音轨。
 
     字段覆盖三件事:**键**(怎么找到那个文件)、**展示**(本地缓存页上显示什么)、
-    **回放**(怎么把它拼回可播放的模型)。刻意不存 ``Path``:索引文件是可移植的,
-    存相对文件名才能在缓存目录整体搬家后继续成立。
+    **回放**(怎么把它拼回可播放的模型)。刻意不存 ``Path``:音频文件名是相对名,
+    缓存目录整体搬家之后记录仍然成立。
 
     Attributes:
-        file_name: 音频文件名(形如 ``<20位摘要>.m4a``),与索引同目录。
+        file_name: 音频文件名(形如 ``<20位摘要>.m4a``),在缓存根目录下。
         bvid: 视频 BV 号。
         cid: **分P**的 cid(领域铁律:视频级 cid 只是第 1P,多P会串歌)。
         quality_id: 音质档位 id,如 ``30280``。
@@ -159,59 +232,88 @@ class CachedTrack:
         return (self.bvid, self.cid, self.quality_id, self.codec)
 
 
-#: 记录里认识的全部字段名(读盘时用它忽略陌生键,兼容旧版本/新版本写的文件)。
-#: 必须放在 :class:`CachedTrack` **之后**:``fields()`` 只对已定义的 dataclass 有效。
-_TRACK_FIELDS = frozenset(f.name for f in fields(CachedTrack))
+def _track_from_row(row: sqlite3.Row) -> CachedTrack | None:
+    """把一行查询结果转成 :class:`CachedTrack`。
+
+    缺 ``file_name`` / ``bvid`` / ``cid`` 的记录**直接丢弃**:这三样缺一个,这条记录既找
+    不到文件也拼不出播放目标,留着只会在界面上显示一条点了没反应的歌。
+
+    Args:
+        row: ``cached_tracks`` 的一行。
+
+    Returns:
+        解析好的记录;结构不对、关键字段缺失或 ``file_name`` 不合法时返回 ``None``。
+    """
+    file_name = _as_str(row["file_name"])
+    bvid = _as_str(row["bvid"])
+    cid = _as_int(row["cid"])
+    if not _is_plain_file_name(file_name) or not bvid or cid <= 0:
+        return None
+    return CachedTrack(
+        file_name=file_name,
+        bvid=bvid,
+        cid=cid,
+        quality_id=_as_int(row["quality_id"]),
+        codec=_as_str(row["codec"]),
+        bandwidth=max(0, _as_int(row["bandwidth"])),
+        title=_as_str(row["title"]),
+        author=_as_str(row["author"]),
+        page_index=max(1, _as_int(row["page_index"], 1)),
+        page_title=_as_str(row["page_title"]),
+        multipart=bool(_as_int(row["multipart"])),
+        duration=max(0, _as_int(row["duration"])),
+        cover_url=_as_str(row["cover_url"]),
+        size_bytes=max(0, _as_int(row["size_bytes"])),
+        cached_at=max(0.0, _as_float(row["cached_at"])),
+    )
 
 
 class CacheIndex:
-    """缓存索引的读写(纯 JSON,原子替换,容错读取)。
+    """缓存索引的读写(库不可用时全部退化成"没有数据")。
 
     典型用法是"解析成功后记一笔、界面展示时读出来"::
 
-        index = CacheIndex(cache_root())
+        index = CacheIndex(db)
         index.remember(entry)
         for entry in index.entries():
             ...
 
-    实例内部保留一份读盘结果,只在首次访问与显式 :meth:`reload` 时读文件 ——
-    切歌时会连续调用 :meth:`remember`,每次都读一遍盘没有意义。
+    **没有内存副本**:每次调用都直接查库。原先那套"惰性读一次盘、之后只改内存"的写法
+    在多了一份播放历史之后不再划算 —— 查询就是一次极便宜的索引扫描,而省掉副本就没有
+    "内存与磁盘谁是对的"这种问题。
 
     Args:
-        root: 索引所在目录(与音频缓存同一个目录);``None`` 表示平台默认缓存根目录。
+        db: 本地库(与播放历史共用同一个实例;``LibraryDb`` 惰性连接)。
     """
 
-    def __init__(self, root: Path | None = None) -> None:
-        """绑定索引目录;此时不读盘、不建目录。
+    def __init__(self, db: LibraryDb) -> None:
+        """绑定本地库;此时不建表、不查询。
 
         Args:
-            root: 索引所在目录;``None`` 表示 :func:`~bilibili_music.core.cache.cache_root`。
+            db: 本地库。
         """
-        if root is None:
-            # 延迟导入:cache 模块要构造本类,顶层互相 import 会成环
-            from .cache import cache_root
-
-            root = cache_root()
-        self.root = Path(root)
-        self.path = self.root / INDEX_FILE_NAME
-        #: 惰性读盘的内存副本(``key -> CachedTrack``);``None`` 表示还没读过
-        self._tracks: dict[CacheKey, CachedTrack] | None = None
+        self.db = db
 
     # ------------------------------------------------------------ 读
 
     def entries(self) -> tuple[CachedTrack, ...]:
         """全部已缓存音轨,**最近缓存的排在前面**。
 
-        顺序取**写入顺序的倒序**,而不是按 ``cached_at`` 排序:索引里的字典本身保留
-        插入顺序(更新已有条目不会改变它的位置),倒过来就是"最新缓存的在最上面"。
-        用时间戳排会不确定 —— Windows 上 ``time.time()`` 的分辨率约 15.6 ms,连着一批
-        下载的记录时间戳会完全相同,那时顺序就交给时间戳之外的偶然因素了。
+        顺序取 ``rowid`` 倒序,即**写入顺序的倒序**,而不是按 ``cached_at`` 排序:
+        更新一条已有记录(比如换了音质重下)不会改变它的位置,与"最新缓存的在最上面"
+        这条直觉一致。用时间戳排会不确定 —— Windows 上 ``time.time()`` 的分辨率约
+        15.6 ms,连着一批下载的记录时间戳会完全相同,那时顺序就交给偶然因素了。
 
         Returns:
-            索引记录的元组;索引不存在、为空或整份读不出来时是空元组。
+            索引记录的元组;库不可用或一条都没有时是空元组。
         """
-        tracks = self._tracks if self._tracks is not None else self._read()
-        return tuple(reversed(list(tracks.values())))
+        rows = self.db.query("SELECT * FROM cached_tracks ORDER BY rowid DESC")
+        found: list[CachedTrack] = []
+        for row in rows:
+            track = _track_from_row(row)
+            if track is not None:
+                found.append(track)
+        return tuple(found)
 
     def find(self, bvid: str, cid: int) -> CachedTrack | None:
         """按 ``(bvid, cid)`` 找**音质最高**的那一条。
@@ -227,22 +329,31 @@ class CacheIndex:
         Returns:
             命中的记录;没有这个分P时返回 ``None``。
         """
-        tracks = self._tracks if self._tracks is not None else self._read()
-        matches = [t for t in tracks.values() if t.bvid == bvid and t.cid == cid]
-        if not matches:
-            return None
-        return max(matches, key=lambda t: (t.bandwidth, t.quality_id))
+        rows = self.db.query(
+            "SELECT * FROM cached_tracks WHERE bvid = ? AND cid = ?", (bvid, int(cid))
+        )
+        best: CachedTrack | None = None
+        for row in rows:
+            track = _track_from_row(row)
+            if track is None:
+                continue
+            if best is None or (track.bandwidth, track.quality_id) > (
+                best.bandwidth,
+                best.quality_id,
+            ):
+                best = track
+        return best
 
     def reload(self) -> tuple[CachedTrack, ...]:
-        """丢掉内存副本、重新读盘,并返回新的内容。
+        """重新读一遍并返回内容。
 
-        界面每次切回"本地缓存"页时调用它:用户在应用之外删过文件、或用别的方式动过
-        缓存目录时,只有重读才看得见。
+        保留这个方法是给调用方的语义用的:界面每次切回"本地缓存"页时都会调用它,
+        表达的是"重新对一次账"(用户可能在应用之外删过文件、或用 sqlite 工具动过库)。
+        实现上每次都直接查库,所以这里只是 :meth:`entries` 的别名。
 
         Returns:
-            重读后的索引记录(与 :meth:`entries` 同一顺序)。
+            当前库里的索引记录(与 :meth:`entries` 同一顺序)。
         """
-        self._tracks = None
         return self.entries()
 
     # ------------------------------------------------------------ 写
@@ -251,19 +362,18 @@ class CacheIndex:
         """新增或更新一条记录。
 
         **重复播放不会刷新 ``cached_at``**:调用方每次解析成功都会调用本方法,若每次都把
-        时间戳写成"现在",那么"缓存时间"这个字段就永远显示成今天,而且每次都真的落一次盘。
+        时间戳写成"现在",那么"缓存时间"这个字段就永远显示成今天,而且每次都真的写一次库。
 
         Args:
             track: 要记录的音轨;``file_name`` 不是纯文件名时直接忽略。
 
         Returns:
-            内容真的变了**且写盘成功**返回 ``True``;内容与已有记录完全相同、入参非法
-            或写盘失败时返回 ``False``。写盘失败时内存副本仍按最新内容保留(见 ``_write``)。
+            内容真的变了**且写成功**返回 ``True``;内容与已有记录完全相同、入参非法
+            或库不可用时返回 ``False``。
         """
         if not _is_plain_file_name(track.file_name):
             return False
-        tracks = self._ensure()
-        previous = tracks.get(track.key)
+        previous = self._by_key(track.key)
         if previous is not None:
             # 保留首次缓存时间:它表达的是"这首歌什么时候存下来的",不是"最后一次播放"
             track.cached_at = previous.cached_at
@@ -273,8 +383,27 @@ class CacheIndex:
             track.cached_at = time.time()
         if previous == track:
             return False
-        tracks[track.key] = track
-        return self._write(tracks)
+        written = self.db.execute(
+            _UPSERT,
+            (
+                track.file_name,
+                track.bvid,
+                int(track.cid),
+                int(track.quality_id),
+                track.codec,
+                max(0, int(track.bandwidth)),
+                track.title,
+                track.author,
+                max(1, int(track.page_index)),
+                track.page_title,
+                1 if track.multipart else 0,
+                max(0, int(track.duration)),
+                track.cover_url,
+                max(0, int(track.size_bytes)),
+                float(track.cached_at),
+            ),
+        )
+        return written is not None
 
     def forget(self, key: CacheKey) -> bool:
         """删掉一条记录。
@@ -283,13 +412,15 @@ class CacheIndex:
             key: :attr:`CachedTrack.key` 给出的身份标识。
 
         Returns:
-            确实删掉了返回 ``True``;本来就没有这一条返回 ``False``。
+            确实删掉了返回 ``True``;本来就没有这一条(或库不可用)返回 ``False``。
         """
-        tracks = self._ensure()
-        if tracks.pop(key, None) is None:
-            return False
-        self._write(tracks)
-        return True
+        bvid, cid, quality_id, codec = key
+        deleted = self.db.execute(
+            "DELETE FROM cached_tracks "
+            "WHERE bvid = ? AND cid = ? AND quality_id = ? AND codec = ?",
+            (bvid, int(cid), int(quality_id), codec),
+        )
+        return bool(deleted)
 
     def retain_files(self, file_names: Iterable[str]) -> int:
         """只保留这些音频文件对应的记录(其余视为文件已不在)。
@@ -301,139 +432,49 @@ class CacheIndex:
             file_names: 仍然存在的音频文件名集合。
 
         Returns:
-            被删掉的记录条数。
+            被删掉的记录条数;库不可用时是 ``0``。
         """
-        alive = set(file_names)
-        tracks = self._ensure()
-        dropped = [key for key, track in tracks.items() if track.file_name not in alive]
-        if not dropped:
-            return 0
-        for key in dropped:
-            tracks.pop(key, None)
-        self._write(tracks)
-        return len(dropped)
+        alive = tuple(dict.fromkeys(_as_str(name) for name in file_names))
+        if not alive:
+            # 空集合用不上 IN,直接清表(缓存目录里一个音频都没有,索引自然也该是空的)
+            deleted = self.db.execute("DELETE FROM cached_tracks")
+        else:
+            placeholders = ", ".join("?" * len(alive))
+            deleted = self.db.execute(
+                f"DELETE FROM cached_tracks WHERE file_name NOT IN ({placeholders})",
+                alive,
+            )
+        return deleted if deleted is not None else 0
 
     def clear(self) -> int:
-        """清空索引。
+        """清空索引(不动播放历史,历史在另一张表里)。
 
         Returns:
-            被清掉的记录条数。
+            被清掉的记录条数;库不可用时是 ``0``。
         """
-        tracks = self._ensure()
-        count = len(tracks)
-        if not count:
-            return 0
-        tracks.clear()
-        self._write(tracks)
-        return count
+        deleted = self.db.execute("DELETE FROM cached_tracks")
+        return deleted if deleted is not None else 0
 
-    # ------------------------------------------------------------ 内部:读写
+    # ------------------------------------------------------------ 内部
 
-    def _ensure(self) -> dict[CacheKey, CachedTrack]:
-        """取内存副本,必要时先读一次盘。"""
-        if self._tracks is None:
-            self._tracks = self._read()
-        return self._tracks
-
-    def _read(self) -> dict[CacheKey, CachedTrack]:
-        """读盘并把能救的记录都救回来。
-
-        任何一步失败都当"索引不可用"处理(空索引),**不抛异常**:索引只是缓存的一份
-        快照,读不出来时上层会退回盲查,照样能播。
-
-        Returns:
-            ``key -> CachedTrack`` 的字典;文件不存在、坏 JSON、结构不对时是空字典。
-        """
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-        if not isinstance(raw, dict):
-            return {}
-        records = raw.get("tracks")
-        if not isinstance(records, list):
-            return {}
-        tracks: dict[CacheKey, CachedTrack] = {}
-        for record in records:
-            track = _parse_record(record)
-            if track is not None:
-                tracks[track.key] = track
-        return tracks
-
-    def _write(self, tracks: dict[CacheKey, CachedTrack]) -> bool:
-        """原子地把索引写盘。
-
-        先写同目录的 ``.part`` 再 ``os.replace`` —— 同一文件系统内的 ``replace`` 是原子的,
-        "索引文件存在"因此等价于"它是一份完整的索引"。
+    def _by_key(self, key: CacheKey) -> CachedTrack | None:
+        """按缓存键取已有记录(只为 :meth:`remember` 的比较与时间戳保留服务)。
 
         Args:
-            tracks: 要落盘的完整内容。
+            key: 缓存键。
 
         Returns:
-            写成功返回 ``True``;写不进去(磁盘满 / 无权限)返回 ``False``。
-
-        Note:
-            写失败**不回滚内存副本**:本次运行里界面看到的就是最新状态,磁盘上的旧索引
-            下次启动会被读回来,那时大不了退回盲查。
+            命中的记录;没有时返回 ``None``。
         """
-        payload = {
-            "version": INDEX_VERSION,
-            "tracks": [asdict(track) for track in tracks.values()],
-        }
-        text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-        tmp = self.path.with_suffix(self.path.suffix + _TMP_SUFFIX)
-        try:
-            self.root.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(text, encoding="utf-8")
-            os.replace(tmp, self.path)
-        except OSError:
-            # 失败必须清掉 .part,否则会在用户目录里留下一个永远不会被复用的残文件
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return False
-        return True
-
-
-def _parse_record(raw: object) -> CachedTrack | None:
-    """把 JSON 里的一条记录解析成 :class:`CachedTrack`。
-
-    缺 ``file_name`` / ``bvid`` / ``cid`` 的记录**直接丢弃**:这三样缺一个,这条记录既找
-    不到文件也拼不出播放目标,留着只会在界面上显示一条点了没反应的歌。
-
-    Args:
-        raw: JSON 数组里的一项(类型不可信)。
-
-    Returns:
-        解析好的记录;结构不对、关键字段缺失或 ``file_name`` 不合法时返回 ``None``。
-    """
-    if not isinstance(raw, dict):
-        return None
-    file_name = _as_str(raw.get("file_name"))
-    bvid = _as_str(raw.get("bvid"))
-    cid = _as_int(raw.get("cid"))
-    if not _is_plain_file_name(file_name) or not bvid or cid <= 0:
-        return None
-    # 只取认识的键:旧版本写的记录可能带已经没有的字段,新版本写的也可能带将来才有的
-    known = {key: value for key, value in raw.items() if key in _TRACK_FIELDS}
-    return CachedTrack(
-        file_name=file_name,
-        bvid=bvid,
-        cid=cid,
-        quality_id=_as_int(known.get("quality_id")),
-        codec=_as_str(known.get("codec")),
-        bandwidth=max(0, _as_int(known.get("bandwidth"))),
-        title=_as_str(known.get("title")),
-        author=_as_str(known.get("author")),
-        page_index=max(1, _as_int(known.get("page_index"), 1)),
-        page_title=_as_str(known.get("page_title")),
-        multipart=bool(known.get("multipart")),
-        duration=max(0, _as_int(known.get("duration"))),
-        cover_url=_as_str(known.get("cover_url")),
-        size_bytes=max(0, _as_int(known.get("size_bytes"))),
-        cached_at=max(0.0, _as_float(known.get("cached_at"))),
-    )
+        bvid, cid, quality_id, codec = key
+        rows = self.db.query(
+            "SELECT * FROM cached_tracks "
+            "WHERE bvid = ? AND cid = ? AND quality_id = ? AND codec = ?",
+            (bvid, int(cid), int(quality_id), codec),
+        )
+        if not rows:
+            return None
+        return _track_from_row(rows[0])
 
 
 def entry_for(
@@ -481,8 +522,8 @@ def entry_for(
     )
 
 
-def video_from_entry(entry: CachedTrack) -> Video:
-    """把一条索引记录还原成可播放的 ``Video``(离线点播用)。
+def video_from_entry(entry: PlayableEntry) -> Video:
+    """把一条记录(索引的或历史的)还原成可播放的 ``Video``(离线点播用)。
 
     **只放被缓存的那一个分P**,而且它的 ``index`` 就是记录里的分P序号:于是
 
@@ -493,11 +534,14 @@ def video_from_entry(entry: CachedTrack) -> Video:
       :func:`~bilibili_music.core.models.track_title` 会直接返回 ``title`` ——
       记录里存的就是当时算好的展示名,不必在这里重算一遍。
 
-    代价是"离线播的这一首在界面上只显示它自己",拿不到同合集其它分P的列表 ——
+    参数类型是 :class:`~bilibili_music.core.models.PlayableEntry` 而不是某一个具体的
+    记录类:缓存索引与播放历史的记录都满足它,于是"点一行就播"这条路径只有一份实现。
+
+    代价是"这样播的这一首在界面上只显示它自己",拿不到同合集其它分P的列表 ——
     那些分P本来也可能没缓存,列出来只会让人觉得点了没反应。
 
     Args:
-        entry: 索引记录。
+        entry: 索引记录或历史记录。
 
     Returns:
         可直接入队播放的 :class:`~bilibili_music.core.models.Video`。

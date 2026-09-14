@@ -6,7 +6,8 @@
 查缓存发生在请求 playurl **之前**,已经落盘的歌因此能省掉整次网络请求直接开播。
 两条路依次试(见 :func:`pick_best_cached`):
 
-1. **缓存索引**(``core/cache_index.py``,``index.json``):它能给出真实的档位、codec
+1. **缓存索引**(``core/cache_index.py``,记录存在配置目录的 ``library.db`` 里):
+   它能给出真实的档位、codec
    与码率,所以连不在常规三档里的缓存也能命中;
 2. **盲查**:索引缺失、损坏或记录的文件已被手删时,按常见档位从高到低试
    (:data:`KNOWN_QUALITIES`)。这条快路径拿不到接口给的 ``bandwidth``,

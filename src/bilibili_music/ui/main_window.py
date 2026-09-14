@@ -33,13 +33,20 @@
 "索引怎么维护"是解析层的事 —— 这里只负责在需要的时候读一遍推给界面
 (见 :meth:`MainWindow._refresh_cache_page`)。
 
+**"最近播放"页也是真的**:每次音频真正就绪时(``audio_ready``)往
+:class:`~bilibili_music.core.history.PlayHistory` 记一条,切到这一页时读出来。
+记录与缓存索引共用一个本地库(``core/library_db.py`` 下的 ``library.db``),但**分表**:
+"清空缓存"不会影响历史。
+
 **搜索结果是分页加载的**:接口一次只给一页(见 ``api.bilibili.py`` 的 ``search_video``),
 列表滚到接近底部时自动取下一页并追加,失败时底部会出现一个"重试"按钮。页码、去重与
 停止条件全在这里裁决(见 :meth:`MainWindow._decide_has_more`),``TrackList`` 只报
 "用户快到底了"。
 
-依赖以参数注入的只有"可替换的外部资源"(客户端 / 音频缓存 / 封面缓存 / 配置 / 编排器):
-默认全部走真实实现,测试可以塞替身进来,于是界面接线能被自动化验证,而不是只能靠肉眼点。
+依赖以参数注入的只有"可替换的外部资源"(客户端 / 音频缓存 / 封面缓存 / 配置 / 编排器 /
+本地库):默认全部走真实实现,测试可以塞替身进来,于是界面接线能被自动化验证,
+而不是只能靠肉眼点。**本地库必须与缓存一起注入同一个实例** —— 两者写的是同一个库文件,
+各建一个连接虽然也能跑,但测试里一个漏注入就会写到用户真实的配置目录。
 """
 
 from __future__ import annotations
@@ -63,6 +70,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..api.bilibili import BilibiliClient, SearchResult
+from ..audio.downloader import Downloader
 from ..audio.playback import PlaybackController
 from ..audio.player import PlayerController
 from ..audio.resolver import AudioResolver, ResolvedAudio
@@ -70,7 +78,10 @@ from ..core.cache import AudioCache
 from ..core.cache_index import CachedTrack, video_from_entry
 from ..core.config import ConfigStore
 from ..core.cover_cache import CoverCache
-from ..core.models import Video, format_count, format_size
+from ..core.download_task import DownloadTaskStore
+from ..core.history import HistoryEntry, PlayHistory, history_entry_for
+from ..core.library_db import LibraryDb
+from ..core.models import Page, PlayableEntry, Video, format_count, format_size
 from ..core.queue import QueueItem
 from ..net.base import FetchHandle
 from .cover_loader import CoverLoader
@@ -79,10 +90,12 @@ from .theme import apply_theme
 from .widgets import (
     CachePage,
     FramelessWindow,
+    HistoryPage,
     PlaceholderPage,
     PlayerBar,
     QueueDrawer,
     Sidebar,
+    TaskDialog,
     TitleBar,
     TrackList,
     TrackRow,
@@ -132,6 +145,12 @@ class MainWindow(FramelessWindow):
         config_store: 配置读写;``None`` 时使用平台默认配置路径。
         playback: 播放编排器;``None`` 时用 ``client`` 与 ``cache`` 现搭一个。
             传入替身(duck typing)即可在测试里跑通整条界面接线。
+        downloader: 批量缓存的调度器;``None`` 时用 ``client`` 与 ``cache`` 现搭一个。
+            与 ``playback`` 相互独立(见 ``audio/downloader.py``:播放用的解析器是
+            单任务状态机,复用会被对方顶掉)。
+        library: 本地库(缓存索引与播放历史的落点);``None`` 时优先用注入的
+            ``cache.db``,否则用平台默认库文件。测试必须让它落到沙箱目录,
+            否则会写到用户真实的库里。
     """
 
     def __init__(
@@ -142,6 +161,8 @@ class MainWindow(FramelessWindow):
         cover_cache: CoverCache | None = None,
         config_store: ConfigStore | None = None,
         playback: PlaybackController | None = None,
+        downloader: Downloader | None = None,
+        library: LibraryDb | None = None,
     ) -> None:
         """建依赖、建界面、接线,并套用配置。
 
@@ -151,6 +172,8 @@ class MainWindow(FramelessWindow):
             cover_cache: 封面磁盘缓存。
             config_store: 配置读写。
             playback: 播放编排器。
+            downloader: 批量缓存的调度器。
+            library: 本地库。
         """
         super().__init__()
         self.setWindowTitle("BiliMusic")
@@ -158,7 +181,14 @@ class MainWindow(FramelessWindow):
         self._apply_window_icon()
 
         self.client = client if client is not None else BilibiliClient()
-        self.cache = cache if cache is not None else AudioCache()
+        # 库只解析一次、只建一个连接:缓存索引与播放历史写的是同一个库文件,
+        # 各建一个连接虽然能跑,但两边看到的数据就不再是同一份了
+        self.library = (
+            library
+            if library is not None
+            else (cache.db if cache is not None else LibraryDb())
+        )
+        self.cache = cache if cache is not None else AudioCache(db=self.library)
         self.cover_cache = (
             cover_cache if cover_cache is not None else CoverCache()
         )
@@ -168,6 +198,18 @@ class MainWindow(FramelessWindow):
             if playback is not None
             else PlaybackController(
                 AudioResolver(self.client, self.cache), PlayerController(self)
+            )
+        )
+        # 批量缓存走**自己的**一条管线:AudioResolver 是单任务状态机,再调一次
+        # resolve() 就会取消上一个 —— 共用的话,用户一点播放就把缓存任务掐死了
+        self.downloader = (
+            downloader
+            if downloader is not None
+            else Downloader(
+                self.client,
+                self.cache,
+                store=DownloadTaskStore(self.library),
+                now_playing=self._now_playing_page,
             )
         )
 
@@ -193,6 +235,9 @@ class MainWindow(FramelessWindow):
         #: 最近一次位置信号里的毫秒数;落盘只在切歌与退出时做(见 _remember_position)
         self._position_ms = 0
         self._config = self.config_store.load()
+        #: 最近播放的读写。条数上限来自配置(可手改 ``config.json``,没有界面入口)。
+        #: 必须在读到配置**之后**建:它要把 ``history_limit`` 带进每一次裁剪。
+        self.history = PlayHistory(self.library, limit=self._config.history_limit)
         #: 播放条封面用的加载器。它只关心"当前这一首",所以还要配合 is_current 过滤
         self.cover_loader = CoverLoader(
             self.client.fetch_cover, cache=self.cover_cache
@@ -211,10 +256,18 @@ class MainWindow(FramelessWindow):
         self.cache_covers = CoverLoader(
             self.client.fetch_cover, cache=self.cover_cache
         )
+        self.history_covers = CoverLoader(
+            self.client.fetch_cover, cache=self.cover_cache
+        )
 
         self._build_ui()
+        #: 下载任务对话框。**懒建、只建一个**:非模态窗口关掉只是隐藏,
+        #: 再点"下载任务"应该看到同一条列表,而不是又开一个窗
+        self.task_dialog: TaskDialog | None = None
         self._connect()
         self._apply_config()
+        # 启动时先把任务角标刷对(上次没下完的任务还在库里等着)
+        self.cache_page.set_task_summary(self.downloader.active_count())
 
     # ------------------------------------------------------------ 构建界面
 
@@ -238,9 +291,11 @@ class MainWindow(FramelessWindow):
         self.pages = QStackedWidget()
         self.results_page = self._build_results_page()
         self.cache_page = CachePage(self.cache_covers)
+        self.history_page = HistoryPage(self.history_covers)
         self.placeholder_page = PlaceholderPage()
         self.pages.addWidget(self.results_page)
         self.pages.addWidget(self.cache_page)
+        self.pages.addWidget(self.history_page)
         self.pages.addWidget(self.placeholder_page)
         body.addWidget(self.pages, 1)
 
@@ -371,12 +426,25 @@ class MainWindow(FramelessWindow):
         self.cache_page.add_requested.connect(self._on_cache_add)
         self.cache_page.remove_requested.connect(self._on_cache_remove)
         self.cache_page.clear_requested.connect(self._on_cache_clear)
+        self.cache_page.tasks_requested.connect(self._show_task_dialog)
+        self.cache_page.open_dir_requested.connect(self._open_cache_dir)
+
+        self.downloader.tasks_changed.connect(self._on_tasks_changed)
+        self.downloader.task_updated.connect(self._on_task_updated)
+        self.downloader.task_failed.connect(self._on_task_failed)
+
+        self.history_page.row_activated.connect(self._on_history_activated)
+        self.history_page.row_menu_requested.connect(self._on_history_menu)
+        self.history_page.add_requested.connect(self._on_history_add)
+        self.history_page.remove_requested.connect(self._on_history_remove)
+        self.history_page.clear_requested.connect(self._on_history_clear)
 
         self.cover_loader.loaded.connect(self._on_cover_loaded)
         self.cover_loader.failed.connect(self._on_cover_failed)
         self.list_covers.loaded.connect(self.result_list.set_cover)
         self.queue_covers.loaded.connect(self.queue_drawer.set_cover)
         self.cache_covers.loaded.connect(self.cache_page.set_cover)
+        self.history_covers.loaded.connect(self.history_page.set_cover)
 
     def _apply_window_icon(self) -> None:
         """设置窗口/任务栏图标。
@@ -610,7 +678,7 @@ class MainWindow(FramelessWindow):
         self.status_label.setText(f"已加入播放队列:{video.title}")
 
     def _on_result_menu(self, row: int, position) -> None:  # noqa: ANN001 - QPoint
-        """搜索结果右键菜单:播放 / 下一首播放 / 加入队列 / 在B站打开。"""
+        """搜索结果右键菜单:播放 / 下一首播放 / 加入队列 / 缓存整个合集 / 在B站打开。"""
         video = self._video_at(row)
         if video is None:
             return
@@ -618,6 +686,8 @@ class MainWindow(FramelessWindow):
         play_action = menu.addAction("播放")
         next_action = menu.addAction("下一首播放")
         queue_action = menu.addAction("加入队列")
+        menu.addSeparator()
+        cache_action = menu.addAction(self._cache_all_label(video))
         menu.addSeparator()
         open_action = menu.addAction("在B站打开")
 
@@ -628,16 +698,113 @@ class MainWindow(FramelessWindow):
             self.playback.enqueue_next(QueueItem(video=video))
         elif chosen is queue_action:
             self.playback.enqueue(QueueItem(video=video))
+        elif chosen is cache_action:
+            self._cache_all_pages(video)
         elif chosen is open_action:
             QDesktopServices.openUrl(QUrl(video.web_url))
+
+    # ------------------------------------------------------------ 批量缓存
+
+    @staticmethod
+    def _cache_all_label(video: Video) -> str:
+        """右键菜单里"缓存整个合集"那一项的文字。
+
+        分P数已知(用户刚播过、详情已在手)且多于一个时直接写出来 —— 点之前就该知道
+        这一下要下 200 首歌。分P数未知时**不瞎猜**(搜索结果只给表面信息):写成
+        "缓存到本地",具体数量留给确认框说 —— 那时详情已经取回来了。
+
+        Args:
+            video: 右键那一行对应的视频。
+
+        Returns:
+            菜单项文字。
+        """
+        if video.part_count > 1:
+            return f"缓存全部 {video.part_count} 个分P"
+        return "缓存到本地"
+
+    def _cache_all_pages(self, video: Video) -> None:
+        """右键"缓存整个合集":先确认,再把整个合集交给下载队列。
+
+        分P列表还没到手时先补一次详情:确认框要写清"共 N 个分P,已缓存 M 个",
+        这两个数字都离不开分P列表。详情命中 client 缓存时回调是同步的。
+
+        Args:
+            video: 目标视频。
+        """
+        if self.downloader.blocks_new_task(video.bvid):
+            QMessageBox.information(
+                self,
+                "缓存到本地",
+                f"「{video.title}」已经在下载任务列表里了,"
+                "可以在「本地缓存 → 下载任务」里看进度。",
+            )
+            return
+        if video.pages:
+            self._confirm_cache_all(video)
+            return
+        self.status_label.setText(f"正在获取「{video.title}」的分P列表…")
+        self.client.fetch_video(
+            video.bvid,
+            on_success=self._confirm_cache_all,
+            on_error=lambda exc: self._fail(str(exc)),
+        )
+
+    def _confirm_cache_all(self, video: Video) -> None:
+        """确认并开始缓存:说清要下多少个分P,同意后入队。
+
+        默认按钮是"是"(与删除缓存的确认框相反):点这个菜单项本身就是用户的明确意图,
+        确认框只是把数量告诉他。
+
+        Args:
+            video: 目标视频(分P列表已就绪)。
+        """
+        pages = video.pages
+        if not pages:
+            QMessageBox.information(
+                self, "缓存到本地", "没能取到这个视频的分P列表,稍后再试试。"
+            )
+            return
+        if self.downloader.blocks_new_task(video.bvid):
+            # 详情是异步取的,等它回来的这段时间里任务可能已经被建好了(连点两次右键)
+            QMessageBox.information(self, "缓存到本地", "这个视频已经在下载任务列表里了。")
+            return
+        cached = self.downloader.cached_page_count(video)
+        remaining = len(pages) - cached
+        if remaining <= 0:
+            QMessageBox.information(
+                self,
+                "缓存到本地",
+                f"「{video.title}」的 {len(pages)} 个分P都已经在本地了。",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "缓存到本地",
+            f"「{video.title}」共 {len(pages)} 个分P,其中 {cached} 个已在本地。\n"
+            f"将串行缓存剩余 {remaining} 个(已缓存的自动跳过),下载期间可以正常播放。\n"
+            "进度在「本地缓存 → 下载任务」里,任务可以随时暂停。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not self.downloader.enqueue(video):
+            QMessageBox.information(
+                self, "缓存到本地", "这个视频没有可缓存的分P,或者已经在任务列表里了。"
+            )
+            return
+        self.status_label.setText(
+            f"已开始缓存「{video.title}」(共 {len(pages)} 个分P)"
+        )
 
     # ------------------------------------------------------------ 导航
 
     def _on_nav_selected(self, key: str) -> None:
         """侧栏入口被点:切换中间的内容页。
 
-        "本地缓存"页在切过来时**重读一次索引**:缓存目录可能被应用之外的东西动过
-        (用户手删、或上一轮进程异常退出),而且这一页在别的页面显示期间不会刷新。
+        "本地缓存"与"最近播放"两页在切过来时都会**重读一次库**:用户可能在应用之外
+        删过文件、或用 sqlite 工具动过库,而且这两页在别的页面显示期间不会刷新。
         其它页面只是切页,没有这种"内容会过期"的问题。
 
         Args:
@@ -646,6 +813,10 @@ class MainWindow(FramelessWindow):
         if key == "cache":
             self._show_page(self.cache_page, "cache")
             self._refresh_cache_page()
+            return
+        if key == "history":
+            self._show_page(self.history_page, "history")
+            self._refresh_history_page()
             return
         placeholder = _PLACEHOLDER_PAGES.get(key)
         if placeholder is None:
@@ -723,14 +894,14 @@ class MainWindow(FramelessWindow):
         return [self._queue_item_of(entry) for entry in self.cache_page.visible_entries()]
 
     @staticmethod
-    def _queue_item_of(entry: CachedTrack) -> QueueItem:
-        """把一条缓存记录变成队列项。
+    def _queue_item_of(entry: PlayableEntry) -> QueueItem:
+        """把一条记录(缓存索引的或播放历史的)变成队列项。
 
-        分P序号**必须**一起带上:记录里存的是被缓存的那一P(可能是第 3P),不带的话
+        分P序号**必须**一起带上:记录里存的是那一P(可能是第 3P),不带的话
         解析器会退回视频级 cid —— 那是第 1P,多P合集于是串歌(领域铁律)。
 
         Args:
-            entry: 索引记录。
+            entry: 索引记录或播放记录。
 
         Returns:
             可直接入队的项。
@@ -831,7 +1002,7 @@ class MainWindow(FramelessWindow):
         self._refresh_cache_page()
 
     def _on_cache_clear(self) -> None:
-        """确认后清空全部缓存。
+        """确认后清空全部缓存(**不动播放历史**)。
 
         清完**当场再量一次占用**:删不掉的文件(正被播放器占用)会被跳过,若一声不吭地
         只报"已清空",界面上那个占用数字就会纹丝不动地留在那里,用户完全无从理解。
@@ -857,6 +1028,235 @@ class MainWindow(FramelessWindow):
                 f"已删除 {removed} 首,但还有 {format_size(left)} 正在被使用,未能删除。",
             )
 
+    # ------------------------------------------------------------ 下载任务
+
+    def _show_task_dialog(self) -> None:
+        """打开(或重新显示)下载任务对话框。
+
+        实例**懒建、只建一个**:非模态窗口关掉只是隐藏,任务照样在后台跑,
+        再点"下载任务"应该看到同一条列表而不是又开一个窗。
+        信号接到下载器上直接调它的方法:控件只发"用户想干什么",
+        改哪个任务、怎么改由调度器决定(``AGENTS.md`` 第 4 节)。
+        """
+        if self.task_dialog is None:
+            self.task_dialog = TaskDialog(self.downloader.page_progress, self)
+            self.task_dialog.pause_requested.connect(self.downloader.pause)
+            self.task_dialog.resume_requested.connect(self.downloader.resume)
+            self.task_dialog.remove_requested.connect(self.downloader.remove)
+            self.task_dialog.pause_all_requested.connect(self.downloader.pause_all)
+            self.task_dialog.resume_all_requested.connect(self.downloader.resume_all)
+            self.task_dialog.clear_finished_requested.connect(
+                self.downloader.clear_finished
+            )
+        self.task_dialog.set_tasks(self.downloader.tasks())
+        self.task_dialog.show()
+        self.task_dialog.raise_()
+        self.task_dialog.activateWindow()
+
+    def _open_cache_dir(self) -> None:
+        """在系统文件管理器里打开缓存目录。
+
+        用 Qt 自带的 :class:`QDesktopServices` 而不是自己调 ``explorer`` / ``open`` /
+        ``xdg-open``:它跳平台、不引依赖,也不用自己拼命令行(拼命令行最容易在带空格的
+        路径上翻车)。
+
+        目录不在时先建出来再打开:``AudioCache`` 建过它,但用户可能手动删掉了,
+        而"点打开目录却发现目录不存在"这种失败完全没必要让用户看到。
+        """
+        directory = self.cache.root
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "打开缓存目录", f"缓存目录不可用:{exc}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory))):
+            QMessageBox.warning(
+                self, "打开缓存目录", f"没能打开文件管理器,缓存目录在:\n{directory}"
+            )
+
+    def _on_tasks_changed(self) -> None:
+        """任务集合、状态或"刚有分P落盘"变了:刷新角标、缓存页与对话框。
+
+        "刚有分P落盘"也算结构变化(而不是普通进度):它会往缓存索引里添记录,
+        正开着的"本地缓存"页要跟着出新行。
+        """
+        self.cache_page.set_task_summary(self.downloader.active_count())
+        if self.pages.currentWidget() is self.cache_page:
+            self._refresh_cache_page()
+        if self.task_dialog is not None and self.task_dialog.isVisible():
+            self.task_dialog.set_tasks(self.downloader.tasks())
+
+    def _on_task_updated(self, bvid: str) -> None:
+        """某个任务的进度数字变了:只刷新对话框里那一行。
+
+        进度回调每秒会来好几次,这里**不能**重建整张列表,更不能刷新缓存页。
+        """
+        if self.task_dialog is None or not self.task_dialog.isVisible():
+            return
+        task = self.downloader.task(bvid)
+        if task is not None:
+            self.task_dialog.update_task(task)
+
+    def _on_task_failed(self, bvid: str, message: str) -> None:
+        """某个任务失败挂起:弹窗告知(失败必须让用户看见)。
+
+        失败弹窗是**模态**的:任务已经停下且整条队列也停了,用户必须知道这件事,
+        否则他会以为还在慢慢下。弹窗里同时告诉他去哪儿重试。
+        """
+        task = self.downloader.task(bvid)
+        title = task.display_title if task is not None else bvid
+        where = (
+            f"第 {task.page_index} 个分P"
+            if task is not None and task.page_index
+            else "某个分P"
+        )
+        QMessageBox.warning(
+            self,
+            "缓存失败",
+            f"「{title}」的{where}没能缓存下来,任务已暂停(排队中的任务也一并暂停了)。\n\n"
+            f"{message}\n\n"
+            "可以在「本地缓存 → 下载任务」里点「继续」重试,或者移除这条任务。",
+        )
+
+    def _now_playing_page(self) -> tuple[str, int] | None:
+        """取"播放器当前正在处理的那一分P"的 ``(bvid, cid)``;没有则 ``None``。
+
+        下载器用它避开"两条管线同时写同一个缓存文件"。注意判据是**编排层当前指向的
+        那一P**,而不是"媒体正在出声":切歌后解析器还在下载的那一两秒,文件已经在写了。
+        分P序号只有编排层知道(合集播到第 3P 时队列项记的仍是入队那一P),
+        所以要经 ``playback.page_index`` 换算回 ``cid``。
+        """
+        item = self.playback.current
+        if item is None:
+            return None
+        page = item.video.page(self.playback.page_index)
+        if page is None:
+            return None
+        return (item.video.bvid, page.cid)
+
+    # ------------------------------------------------------------ 最近播放
+
+    def _refresh_history_page(self) -> None:
+        """把播放历史读一遍推给"最近播放"页。
+
+        与缓存页不同,这里**不需要剪枝**:历史记录不指向任何文件,不存在"文件已被手删"
+        这回事 —— 它记的是"听过什么",而听过这件事不会因为文件没了就没发生。
+        """
+        self.history_page.set_entries(self.history.entries())
+
+    def _history_queue_items(self) -> list[QueueItem]:
+        """把"最近播放"页**当前显示**的歌摊成队列项(过滤后的那一批)。
+
+        双击某一首 = 把眼前这张列表整列变成队列 —— 与搜索结果页、缓存页同一套行为。
+
+        Returns:
+            队列项列表,顺序与页面上的行号一致。
+        """
+        return [self._queue_item_of(entry) for entry in self.history_page.visible_entries()]
+
+    def _on_history_activated(self, row: int) -> None:
+        """双击最近播放里的一首:整个可见列表成为队列,从这一行开始播。
+
+        已缓存的歌走缓存快路径(零网络请求),没缓存的照常解析下载 —— 与在搜索结果里
+        双击没有区别,区别只在"这一行的数据从哪来"。
+
+        Args:
+            row: 行号(以过滤后的列表为准)。
+        """
+        items = self._history_queue_items()
+        if not items:
+            return
+        self.playback.play_queue(items, start=row)
+
+    def _on_history_add(self, row: int) -> None:
+        """点行内"+":把这一首加到播放队列末尾。
+
+        Args:
+            row: 行号(以过滤后的列表为准)。
+        """
+        entry = self.history_page.entry_at(row)
+        if entry is None:
+            return
+        self.playback.enqueue(self._queue_item_of(entry))
+
+    def _on_history_menu(self, row: int, position) -> None:  # noqa: ANN001 - QPoint
+        """最近播放右键菜单:播放 / 下一首播放 / 加入队列 / 从历史中删除 / 在B站打开。
+
+        Args:
+            row: 行号(以过滤后的列表为准)。
+            position: 弹出位置(全局坐标)。
+        """
+        entry = self.history_page.entry_at(row)
+        if entry is None:
+            return
+        menu = QMenu(self)
+        play_action = menu.addAction("播放")
+        next_action = menu.addAction("下一首播放")
+        queue_action = menu.addAction("加入队列")
+        menu.addSeparator()
+        remove_action = menu.addAction("从历史中删除")
+        open_action = menu.addAction("在B站打开")
+
+        chosen = menu.exec(position)
+        if chosen is play_action:
+            self._on_history_activated(row)
+        elif chosen is next_action:
+            self.playback.enqueue_next(self._queue_item_of(entry))
+        elif chosen is queue_action:
+            self.playback.enqueue(self._queue_item_of(entry))
+        elif chosen is remove_action:
+            self._delete_history_entry(entry)
+        elif chosen is open_action:
+            QDesktopServices.openUrl(QUrl(video_from_entry(entry).web_url))
+
+    def _on_history_remove(self, row: int) -> None:
+        """请求删掉某一行(操作列"⋮"菜单里的那一项也会走到这里)。
+
+        Args:
+            row: 行号(以过滤后的列表为准)。
+        """
+        entry = self.history_page.entry_at(row)
+        if entry is not None:
+            self._delete_history_entry(entry)
+
+    def _delete_history_entry(self, entry: HistoryEntry) -> None:
+        """确认后删掉一条播放记录(**不碰缓存文件**)并刷新页面。
+
+        确认框里的"已缓存的音频不会被删除"是刻意写的:用户对"删一条记录"的预期与
+        "删一首歌"很容易混淆,而后者是不可逆的 —— 一句话就能避开这个误会。
+
+        Args:
+            entry: 要删除的记录。
+        """
+        answer = QMessageBox.question(
+            self,
+            "从历史中删除",
+            f"要把「{entry.title or entry.bvid}」从最近播放里删掉吗?"
+            "已缓存的音频不会被删除。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.history.remove(entry.bvid, entry.cid)
+        self._refresh_history_page()
+
+    def _on_history_clear(self) -> None:
+        """确认后清空全部播放记录(**不碰缓存文件**)。"""
+        if not self.history.entries():
+            return
+        answer = QMessageBox.question(
+            self,
+            "清空历史",
+            "要删除全部播放记录吗?已缓存的音频不会被删除。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.history.clear()
+        self._refresh_history_page()
+
     # ------------------------------------------------------------ 编排层回调
 
     def _on_track_changed(self, item: QueueItem) -> None:
@@ -876,7 +1276,12 @@ class MainWindow(FramelessWindow):
         self._sync_page_selector()
 
     def _on_audio_ready(self, resolved: ResolvedAudio) -> None:
-        """音源就绪:更新标题、音质、时长,并记下"上次播的是哪一首"。"""
+        """音源就绪:更新标题、音质、时长,并记下"上次播的是哪一首"。
+
+        **"最近播放"就在这里写一条**(而不是在换队列项时):到这一步才说明音频真的下好、
+        真的要出声了 —— 解析失败或用户快速切歌的那些项不会在历史里留下痕迹。
+        一次播放只写这一条,``position_changed`` 那种高频信号不参与。
+        """
         self.progress.setVisible(False)
         track = resolved.track
         self.player_bar.set_now_playing(
@@ -892,11 +1297,27 @@ class MainWindow(FramelessWindow):
         self.cache_page.set_playing(resolved.video.bvid, resolved.page.cid)
         if self.pages.currentWidget() is self.cache_page:
             self._refresh_cache_page()
+        self._remember_history(resolved.video, resolved.page)
         # 封面是异步的,而且允许失败:拿不到就用占位图,不打断播放
         self.cover_loader.load(resolved.video.cover_https)
         # 位置的落盘交给切歌与退出,这里只更新内存里的"上次播的是哪一首"
         self._config.last_bvid = resolved.video.bvid
         self._config.last_cid = resolved.page.cid
+
+    def _remember_history(self, video: Video, page: Page) -> None:
+        """把刚开播的这一首记进"最近播放";这一页正开着的话顺手刷新。
+
+        只在**看得见这一页**时重读库,与缓存页同一套取舍:看不见的页面不值得为它反复查库。
+        播放中的那一行标记则不分页面,因为它只影响这一页自己的渲染。
+
+        Args:
+            video: 正在播放的视频(详情已补全)。
+            page: 正在播放的分P。
+        """
+        self.history.record(history_entry_for(video, page))
+        self.history_page.set_playing(video.bvid, page.cid)
+        if self.pages.currentWidget() is self.history_page:
+            self._refresh_history_page()
 
     def _on_cover_loaded(self, url: str, pixmap: QPixmap) -> None:
         """封面到了就贴上;若已经切歌则忽略。
@@ -1038,11 +1459,15 @@ class MainWindow(FramelessWindow):
         QMessageBox.warning(self, "出错了", message)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt 命名
-        """退出前落盘进度,并停掉在飞的解析与播放。"""
+        """退出前落盘进度,并停掉在飞的解析、下载与播放。"""
         self._config.last_position_ms = self._position_ms
         self._save_config()
         self.playback.stop()
+        # 批量缓存也要收尾:取消在飞下载(顺带清掉半截的 .part)并把当前任务写成"暂停"
+        self.downloader.shutdown()
         self.client.close()
+        # 库连接在退出时显式关掉:WAL 的收尾交给 sqlite 自己做,不必留着连接等进程结束
+        self.library.close()
         super().closeEvent(event)
 
 

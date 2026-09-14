@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import sys
 import tempfile
+import time
 import unittest
 import zlib
 from pathlib import Path
@@ -24,11 +25,13 @@ from bilibili_music.core.headers import (  # noqa: E402
     decompress_all,
     media_headers,
 )
+from bilibili_music.core.library_db import LibraryDb  # noqa: E402
 from bilibili_music.core.models import (  # noqa: E402
     Page,
     Video,
     format_count,
     format_duration,
+    format_relative_time,
 )
 
 
@@ -57,6 +60,67 @@ class TestFormatCount(unittest.TestCase):
         self.assertEqual(format_count(999), "999")
         self.assertEqual(format_count(76883_000 // 1000), "7.7万")
         self.assertEqual(format_count(123_456_789), "1.2亿")
+
+
+class TestFormatRelativeTime(unittest.TestCase):
+    """「最近播放」里的相对时间。
+
+    全部用**固定的"当前时刻"**(2026-09-14 20:00)注入,不拿系统当前时间做参照 ——
+    否则跨天/跨年的用例会在特定的运行时刻随机失败。
+    """
+
+    @staticmethod
+    def _at(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> float:
+        """把本地时间拼成时间戳(``tm_isdst=-1`` 让系统自己判断夏令时)。"""
+        return time.mktime((year, month, day, hour, minute, 0, 0, 0, -1))
+
+    def setUp(self) -> None:
+        """固定"现在"。"""
+        self.now = self._at(2026, 9, 14, 20, 0)
+
+    def test_within_a_minute_is_just_now(self) -> None:
+        """一分钟以内不报秒数:秒级跳动只会让列表看着在乱动。"""
+        self.assertEqual(format_relative_time(self.now - 5, self.now), "刚刚")
+        self.assertEqual(format_relative_time(self.now - 59, self.now), "刚刚")
+
+    def test_minutes_and_hours(self) -> None:
+        """当天按"多久以前"表达。"""
+        self.assertEqual(format_relative_time(self.now - 60, self.now), "1 分钟前")
+        self.assertEqual(format_relative_time(self.now - 12 * 60, self.now), "12 分钟前")
+        self.assertEqual(format_relative_time(self.now - 3600, self.now), "1 小时前")
+        self.assertEqual(format_relative_time(self.now - 3 * 3600, self.now), "3 小时前")
+
+    def test_yesterday_shows_the_clock_time(self) -> None:
+        """跨天改说"昨天几点",而不是"23 小时前"这种要心算的表达。"""
+        when = self._at(2026, 9, 13, 21, 30)
+        self.assertEqual(format_relative_time(when, self.now), "昨天 21:30")
+        # 刚过午夜十几分钟也算“昨天”:日历分档优先于“不到一小时”
+        self.assertEqual(
+            format_relative_time(self._at(2026, 9, 13, 23, 50), self.now), "昨天 23:50"
+        )
+
+    def test_earlier_this_year_shows_month_and_day(self) -> None:
+        """同年更早的日期只需月日。"""
+        when = self._at(2026, 9, 1, 8, 0)
+        self.assertEqual(format_relative_time(when, self.now), "9月1日")
+
+    def test_another_year_shows_the_year(self) -> None:
+        """跨年要带上年份,否则“3月1日”会被误读成今年。"""
+        when = self._at(2025, 3, 1, 8, 0)
+        self.assertEqual(format_relative_time(when, self.now), "2025年3月1日")
+
+    def test_future_timestamp_is_clamped(self) -> None:
+        """时钟回拨会让"播放时间"跑到未来;显示成负数时间没有意义,统一当刚刚。"""
+        self.assertEqual(format_relative_time(self.now + 600, self.now), "刚刚")
+
+    def test_zero_means_no_record(self) -> None:
+        """没有时间戳时返回空串(调用方据此不显示这一列)。"""
+        self.assertEqual(format_relative_time(0.0, self.now), "")
+        self.assertEqual(format_relative_time(-1.0, self.now), "")
+
+    def test_defaults_to_the_system_clock(self) -> None:
+        """不传 ``now`` 时用系统当前时间(正式代码里的用法)。"""
+        self.assertEqual(format_relative_time(time.time()), "刚刚")
 
 
 class TestCleanText(unittest.TestCase):
@@ -149,7 +213,10 @@ class TestAudioCache(unittest.TestCase):
     def setUp(self) -> None:
         """为每个用例新建独立临时目录,避免用例之间互相污染缓存内容。"""
         self._tmp = tempfile.TemporaryDirectory()
-        self.cache = AudioCache(Path(self._tmp.name))
+        root = Path(self._tmp.name)
+        # 本地库必须一起指到临时目录:默认值会落到真实用户的配置目录,
+        # 而 cache.clear() 会连带剪枝索引记录
+        self.cache = AudioCache(root, db=LibraryDb(root / "library.db"))
 
     def tearDown(self) -> None:
         """用例结束后销毁临时目录,不留下残留文件影响后续断言。"""

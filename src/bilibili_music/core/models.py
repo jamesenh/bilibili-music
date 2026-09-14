@@ -10,16 +10,19 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 __all__ = [
     "AudioTrack",
     "Page",
+    "PlayableEntry",
     "Playlist",
     "Video",
     "format_count",
     "format_duration",
+    "format_relative_time",
     "format_size",
     "track_subtitle",
     "track_title",
@@ -86,6 +89,53 @@ def format_size(size_bytes: int) -> str:
     if size < 1024**3:
         return f"{size / 1024**2:.1f} MB"
     return f"{size / 1024**3:.2f} GB"
+
+
+def format_relative_time(when: float, now: float | None = None) -> str:
+    """把时间戳格式化成「最近播放」列表里的相对时间。
+
+    分档与常见播放器一致:当天看"多久以前",跨天看"昨天几点",更早看日期 ——
+    同一屏里全是完整日期(``2026-09-14 21:30``)反而难读,而"多久以前"在超过一天之后
+    又会变成"27 小时前"这种需要心算的表达。
+
+    **跨天一律按本地日历比,不按"是否满 24 小时"**:昨晚 21:00 播的歌,今天 20:00 看
+    应当是"昨天 21:00",而不是"23 小时前"。这也是本函数接受 ``now`` 参数的原因 ——
+    日历分档无法像减法那样简单构造测试样本。
+
+    Args:
+        when: 要格式化的时间戳(UTC 秒,来自 ``time.time()``)。
+        now: 当前时间戳;``None`` 表示取系统当前时间(测试注入固定值,否则跨天用例会在
+            午夜前后变成随机失败)。
+
+    Returns:
+        形如 ``"刚刚"`` / ``"12 分钟前"`` / ``"3 小时前"`` / ``"昨天 21:30"`` /
+        ``"9月12日"`` / ``"2025年3月1日"`` 的文本;``when`` 非正(没有记录)时返回空串。
+    """
+    timestamp = float(when)
+    if timestamp <= 0:
+        return ""
+    current = time.time() if now is None else float(now)
+    if timestamp >= current:
+        # 时钟被回拨(或数据来自更早的进程)时不当成负数显示,统一当作"刚刚"
+        return "刚刚"
+
+    moment = time.localtime(timestamp)
+    today = time.localtime(current)
+    if (moment.tm_year, moment.tm_yday) == (today.tm_year, today.tm_yday):
+        elapsed = current - timestamp
+        if elapsed < 60:
+            return "刚刚"
+        if elapsed < 3600:
+            return f"{int(elapsed // 60)} 分钟前"
+        return f"{int(elapsed // 3600)} 小时前"
+
+    # "昨天"用"当前时刻减一天"再取日历日:跨夏令时切换时差一小时,日历日仍然对得上
+    yesterday = time.localtime(current - 86400)
+    if (moment.tm_year, moment.tm_yday) == (yesterday.tm_year, yesterday.tm_yday):
+        return f"昨天 {moment.tm_hour:02d}:{moment.tm_min:02d}"
+    if moment.tm_year == today.tm_year:
+        return f"{moment.tm_mon}月{moment.tm_mday}日"
+    return f"{moment.tm_year}年{moment.tm_mon}月{moment.tm_mday}日"
 
 
 def track_title(video: Video, page: Page | None) -> str:
@@ -288,6 +338,40 @@ class Video:
         if url.startswith("http://"):
             return "https://" + url[len("http://"):]
         return url
+
+
+class PlayableEntry(Protocol):
+    """能把一条"已缓存 / 已播放过"的记录还原成可播放目标的最小字段集。
+
+    缓存索引的记录(:class:`~bilibili_music.core.cache_index.CachedTrack`)与播放历史的
+    记录(:class:`~bilibili_music.core.history.HistoryEntry`)字段本来就很像,两者都要求
+    "用记录重建一个只含那个分P的 ``Video``"—— 离线点播靠的正是它
+    (见 :func:`~bilibili_music.core.cache_index.video_from_entry`)。
+
+    这里用 :class:`typing.Protocol` 而不是让两个记录去继承同一个基类::
+
+    * 两个记录都是 ``core`` 里的纯数据类,凭什么为了一个转换函数而互相耦合;
+    * 契约是**结构性**的("有这些字段就行"),协议能把它写清楚,不引入任何继承关系。
+
+    Attributes:
+        bvid: 视频 BV 号。
+        cid: **分P**的 cid(领域铁律:视频级 cid 只是第 1P)。
+        page_index: 分P序号(从 1 开始)。
+        title: 展示名。
+        author: UP主名。
+        page_title: 分P标题原文。
+        duration: 该分P自己的时长(秒)。
+        cover_url: 封面地址。
+    """
+
+    bvid: str
+    cid: int
+    page_index: int
+    title: str
+    author: str
+    page_title: str
+    duration: int
+    cover_url: str
 
 
 @dataclass(slots=True)

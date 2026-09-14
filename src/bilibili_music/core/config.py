@@ -35,7 +35,9 @@ __all__ = [
     "AppConfig",
     "CONFIG_FILE_NAME",
     "ConfigStore",
+    "DEFAULT_HISTORY_LIMIT",
     "DEFAULT_VOLUME",
+    "MAX_HISTORY_LIMIT",
     "config_root",
 ]
 
@@ -46,10 +48,18 @@ _APP_DIR_NAME = "BiliMusic"
 CONFIG_FILE_NAME = "config.json"
 
 #: 默认音量(0 ~ 100 的整数,与界面滑动条同一量纲)。
-#:
 #: 取 80 而不是 100:音乐区素材的响度差异极大,默认拉满会让部分视频削波,
 #: 而用户很少主动往回拧(与 ``audio/player.py`` 的 ``DEFAULT_VOLUME`` 保持一致)。
 DEFAULT_VOLUME = 80
+
+#: 「最近播放」默认保留的条数。按一条记录几百字节估,200 条的库文件只有几十 KB。
+DEFAULT_HISTORY_LIMIT = 200
+
+#: 手改 ``config.json`` 时允许的最大条数。
+#:
+#: 封顶是为了让"每次开始播放都裁一次"的代价可控:不封顶的话,把它改成一百万就等于
+#: 每播一首都让 sqlite 去数一百万行。
+MAX_HISTORY_LIMIT = 2000
 
 
 def config_root() -> Path:
@@ -94,6 +104,24 @@ def _as_int(value: object, default: int) -> int:
         return default
 
 
+def _clamp_history_limit(value: object) -> int:
+    """把「最近播放」的条数上限收敛到合法区间。
+
+    非正整数(手改成 ``0`` / ``-1`` / ``"abc"``)退回默认值而不是理解成"不限制":
+    上限是用户为了"别把库撑大"而设的,填 0 更可能是改错了,零条历史反而更像 bug。
+
+    Args:
+        value: 配置里的原始值。
+
+    Returns:
+        ``1 ~ MAX_HISTORY_LIMIT`` 之间的整数。
+    """
+    limit = _as_int(value, DEFAULT_HISTORY_LIMIT)
+    if limit <= 0:
+        return DEFAULT_HISTORY_LIMIT
+    return min(limit, MAX_HISTORY_LIMIT)
+
+
 @dataclass(slots=True)
 class AppConfig:
     """应用配置的**纯数据**部分。
@@ -107,6 +135,13 @@ class AppConfig:
     volume: int = DEFAULT_VOLUME
     """音量,0 ~ 100 的整数(界面滑动条的量纲);换算成 ``QAudioOutput`` 的
     0.0 ~ 1.0 由界面负责,``core`` 不认识 Qt。"""
+
+    history_limit: int = DEFAULT_HISTORY_LIMIT
+    """「最近播放」最多保留多少条(超出后按播放时间从旧到新丢掉)。
+
+    **没有界面入口**,想改就手改 ``config.json`` —— 这是一个"定了就不再动"的偏好,
+    为它做一整套设置界面并不划算。
+    """
 
     play_mode: PlayMode = PlayMode.SEQUENCE
     """播放模式,取值范围由 :class:`~bilibili_music.core.queue.PlayMode` 决定。"""
@@ -142,6 +177,7 @@ class AppConfig:
             mode = PlayMode.SEQUENCE
         return AppConfig(
             volume=max(0, min(100, _as_int(self.volume, DEFAULT_VOLUME))),
+            history_limit=_clamp_history_limit(self.history_limit),
             play_mode=mode,
             last_bvid=str(self.last_bvid or ""),
             last_cid=max(0, _as_int(self.last_cid, 0)),

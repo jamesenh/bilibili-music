@@ -6,14 +6,20 @@
 封装的意义是把 Qt 那套"PlaybackState / MediaStatus / Error 三套状态互相耦合"的
 细节关在里面:界面只关心"在播还是不在播",不必知道 ``EndOfMedia`` 与
 ``InvalidMedia`` 分别属于哪个枚举。
+
+另外这里还负责**跟随系统默认音频输出设备**。``QAudioOutput`` 的设备绑定是静态的:
+它在创建那一刻认下当时的默认设备,之后不会跟着系统设置走,于是用户在播放中换输出设备
+(蓝牙耳机 ⇄ 内置扬声器)就会静默无声、且没有任何报错。修法是监听默认设备变化并手动
+``setDevice``,具体理由见 :data:`_DEVICE_POLL_INTERVAL_MS` 与
+:meth:`PlayerController._sync_output_device`。
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QUrl, Signal
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtCore import QObject, QTimer, QUrl, Signal
+from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 
 from ..core.models import format_duration
 
@@ -22,6 +28,60 @@ __all__ = ["PlayerController"]
 #: 默认音量(0.0 ~ 1.0)。0.8 是留了余量的保守值:音乐区素材的响度差异极大,
 #: 默认拉满会让部分视频削波,而用户很少主动往回拧。
 DEFAULT_VOLUME = 0.8
+
+#: 兜底轮询"系统默认输出设备变没变"的间隔(毫秒)。
+#:
+#: 为什么不只靠信号:PySide6 6.8.3 的 ``QMediaDevices`` **没有**
+#: ``defaultAudioOutputChanged``(实测 ``hasattr`` 为 ``False``,官方文档列出的信号也只有
+#: ``audioInputsChanged`` / ``audioOutputsChanged`` / ``videoInputsChanged``),而
+#: ``audioOutputsChanged`` 名义上只在"设备列表变化"时触发 —— 用户在两台**都已连接**的
+#: 设备之间切换(蓝牙耳机 ⇄ 内置扬声器)时设备集合没变,它未必发得出来。读一次默认设备
+#: 只是属性查询,2 秒一次的开销可以忽略,换来的是"用户换了设备我们一定会知道"。
+#: 若将来实测确认信号足够可靠,这个兜底可以删掉。
+_DEVICE_POLL_INTERVAL_MS = 2000
+
+
+# ============================== 输出设备判断 ==============================
+
+
+def _device_key(device: object) -> str:
+    """把 ``QAudioDevice`` 归一成可比较的字符串键。
+
+    不直接比较 ``QAudioDevice`` 对象,是因为它的实例在生命周期内会**保留自己的属性**,
+    即使物理设备已断开或系统设置已改变 —— 于是两个其实指同一台设备的对象可能不相等,
+    一个已经失效的设备看起来也可能"没变"。判断是不是同一台设备只能比 id。
+
+    Args:
+        device: ``QAudioDevice``;也接受 ``None``(当作"没有设备")。
+
+    Returns:
+        设备 id 的字符串形式;设备为空、或读取 id 失败时返回空串。
+    """
+    try:
+        if device is None or device.isNull():
+            return ""
+        return bytes(device.id().data()).decode("utf-8", "replace")
+    except Exception:
+        # 读设备信息失败时退化成"未知设备":空串会让上层倾向于不动输出,而不是崩掉
+        return ""
+
+
+def _should_migrate_output(current_key: str, target_key: str) -> bool:
+    """判断是否真的需要把音频输出迁移到新的默认设备。
+
+    两层闸门缺一不可。``target_key`` 为空串表示系统当下没有可用的输出设备,这时**不能**
+    调 ``setDevice`` —— 把输出指到空设备等于自断声音(拔掉最后一副耳机就是这种情况)。
+    两边相同则是空操作:``audioOutputsChanged`` 会因为"设备列表变化"(插拔、连接、断开)
+    而频繁触发,其中多数变化与默认设备无关,不设这道闸就会反复重建底层音频流。
+
+    Args:
+        current_key: 输出当前绑定的设备键(见 :func:`_device_key`)。
+        target_key: 系统当前默认输出设备的键。
+
+    Returns:
+        需要迁移返回 ``True``。
+    """
+    return bool(target_key) and target_key != current_key
 
 
 class PlayerController(QObject):
@@ -50,6 +110,17 @@ class PlayerController(QObject):
         self._output = QAudioOutput(self)
         self._player.setAudioOutput(self._output)
         self._output.setVolume(DEFAULT_VOLUME)
+
+        # 输出设备不会自己跟着系统默认设备走,所以这里同时挂上"设备列表变化"信号与一个
+        # 兜底轮询 —— 两条路都通向同一个幂等的 _sync_output_device()。
+        # QMediaDevices 既要交给 Qt 管生命周期(parent),也要留一个 Python 引用:
+        # 实例被回收,信号连接也就跟着没了。
+        self._media_devices = QMediaDevices(self)
+        self._media_devices.audioOutputsChanged.connect(self._on_audio_outputs_changed)
+        self._device_poll = QTimer(self)
+        self._device_poll.setInterval(_DEVICE_POLL_INTERVAL_MS)
+        self._device_poll.timeout.connect(self._sync_output_device)
+        self._device_poll.start()
 
         self._player.positionChanged.connect(self._on_position)
         self._player.durationChanged.connect(self._on_duration)
@@ -195,3 +266,36 @@ class PlayerController(QObject):
         """播放出错:忽略 ``NoError``(Qt 在正常加载时也会发一次),其余上报界面。"""
         if error != QMediaPlayer.Error.NoError:
             self.error_occurred.emit(error_string or "播放器出错")
+
+    # ------------------------------------------------------------ 输出设备跟随
+
+    def _on_audio_outputs_changed(self) -> None:
+        """音频设备列表变化(插拔、连接、断开):顺手核对一次默认设备是否也变了。
+
+        这个信号**只说明列表变了**,不保证默认设备变了,所以真正的判断放在
+        :meth:`_sync_output_device` 里做。
+        """
+        self._sync_output_device()
+
+    def _sync_output_device(self) -> None:
+        """把输出迁移到系统当前默认设备;已经绑对时什么都不做。
+
+        信号与兜底轮询都会调到这里,所以必须是**幂等**的:每次都重新读一次
+        ``self._output.device()`` 而不是缓存一份,重复调用自然成为空操作。
+
+        迁移刻意只做"改绑定"这一件事 —— ``setDevice`` 不影响音量、静音等属性,它们原样
+        保留。代价是某些平台上底层音频流会被重建、播放状态可能掉出 ``Playing``;这时按
+        原位置续播,避免"换个设备就停在半路"。
+        """
+        target = QMediaDevices.defaultAudioOutput()
+        current_key = _device_key(self._output.device())
+        if not _should_migrate_output(current_key, _device_key(target)):
+            return
+
+        was_playing = self.is_playing
+        position = self._player.position()
+        self._output.setDevice(target)
+        if was_playing and not self.is_playing:
+            # 复用 play():它内部带"一次都没 load 过就别动"的保护
+            self._player.setPosition(position)
+            self.play()
