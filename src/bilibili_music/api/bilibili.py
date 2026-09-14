@@ -14,14 +14,29 @@
 ``/x/web-interface/search/type`` 视频搜索,**无需 WBI 签名**
 ============================== ==========================================
 
-仍需登录 / WBI 签名的能力(未实现):
+需要登录(``SESSDATA``)的接口,本模块已实现:
 
-* 收藏夹列表与内容(需 ``SESSDATA`` + WBI 签名 ``w_rid``/``wts``)
+* ``/x/web-interface/nav`` 登录态与账号概况
+* ``/x/v3/fav/folder/created/list-all`` 我创建的收藏夹
+* ``/x/v3/fav/resource/list`` 收藏夹内容
+
+**不需要 WBI 签名**:2026-09-14 在真账号上实测,上面三个接口全程不带 ``w_rid``/``wts``
+都返回 ``code=0``(所以路线图 M5 里的 ``core/wbi.py`` 没有做)。但注意"不需要签名"不等于
+"可以随便请求" —— ``-352`` 的定义是"UA **或** wbi 参数不合法",限速与预热照旧。
+
+仍未实现:
+
 * CC 字幕(匿名时 ``subtitles`` 恒为空数组)
+* 收藏夹的**写回**(收藏 / 取消收藏)与私密夹之外的账号操作,见 ``AGENTS.md`` 1.4
 
 解析层的容错口径:**能少不能错**。字段缺失、类型不对、列表里混进非视频条目,
 一律跳过或取默认值,绝不让单条脏数据把整页搜索结果带崩;但"整个响应里一条音轨都
 没有"属于真实失败,必须抛 :class:`NoAudioSourceError` 让界面给出明确提示。
+
+收藏夹那三条接口另有一条**实测出来的**容错要求:未登录时
+``/x/v3/fav/folder/created/list-all`` 返回 ``code=0`` 且 ``data=null``(它不报错,只静默
+给空)。所以解析函数必须能吃下 ``data=None``,而"登录态是否有效"**只能**看
+``nav`` 的 ``isLogin``。
 """
 
 from __future__ import annotations
@@ -38,16 +53,44 @@ from ..core.models import AudioTrack, Page, Video
 from ..net.base import FetchHandle, HttpBackend
 
 __all__ = [
+    "AccountInfo",
     "BilibiliClient",
+    "FavFolder",
+    "FavItem",
+    "FavPage",
+    "PRIVATE_FOLDER_ATTR_BIT",
     "QUALITY_FALLBACK_BPS",
     "SearchResult",
     "parse_audio_tracks",
+    "parse_fav_folders",
+    "parse_fav_page",
+    "parse_nav",
     "parse_search_result",
     "parse_video",
     "pick_best",
     "track_from_cache",
     "track_from_quality",
 ]
+
+#: 收藏夹 ``attr`` 位域里表示"私密"的那一位(取值 ``2``)。
+#:
+#: 2026-09-14 实测:16 个收藏夹里多数是 ``22``(``0b10110``,含私密位),默认收藏夹是
+#: ``0``(公开)。**只钉这一位**,其余位的含义没有实测依据,不要去猜 —— 猜错会让界面
+#: 显示的"公开/私密"反过来。
+PRIVATE_FOLDER_ATTR_BIT = 2
+
+#: 收藏夹条目里"正常"的 ``attr`` 值。
+#:
+#: 2026-09-14 实测:``attr=0`` 的条目 ``pagelist`` 与 ``view`` 都成功;``attr=1`` / ``9``
+#: 的条目两个接口都失败(``-404`` / ``62002 稿件不可见``)。所以**判断条目失不失效只看
+#: 这一个字段就够了**,不必为每条多打一次请求。
+FAV_ITEM_OK_ATTR = 0
+
+#: 收藏夹条目类型:视频稿件。界面目前只处理这一类。
+FAV_ITEM_TYPE_VIDEO = 2
+
+#: 收藏夹内容一页最多取多少条(接口 ``ps`` 的定义域是 1~20,实测传 20 足额返回)。
+MAX_FAV_PAGE_SIZE = 20
 
 #: 搜索结果里的 HTML 标签(主要是关键字高亮用的 ``<em>``)。
 #:
@@ -136,7 +179,229 @@ class SearchResult:
         return len(self.videos)
 
 
+@dataclass(slots=True)
+class AccountInfo:
+    """当前登录账号的概况(``nav`` 接口)。
+
+    :attr:`is_login` 是**唯一**可信的登录态判据:收藏夹接口在未登录时也返回 ``code=0``
+    (只是 ``data`` 为 ``null``),拿它判断会得到假阳性。
+    """
+
+    is_login: bool = False
+    mid: int = 0
+    uname: str = ""
+    vip_type: int = 0
+
+
+@dataclass(slots=True)
+class FavFolder:
+    """一个收藏夹的元信息。"""
+
+    media_id: int = 0
+    title: str = ""
+    media_count: int = 0
+    attr: int = 0
+
+    @property
+    def is_private(self) -> bool:
+        """是否为私密收藏夹。
+
+        私密夹在登录态下**能读到**(2026-09-14 实测),所以界面上要标出来 ——
+        用户得知道这一页的内容不该被外人看到。
+        """
+        return bool(self.attr & PRIVATE_FOLDER_ATTR_BIT)
+
+
+@dataclass(slots=True)
+class FavItem:
+    """收藏夹里的一条内容。
+
+    注意**没有 ``cid``**:接口只给分P**数量**(:attr:`page_count`)。真要多P里的某一首,
+    必须再调一次 ``view``(:meth:`BilibiliClient.fetch_video`)拿 ``pages`` ——
+    这是本项目的领域铁律(播放一律用分P的 ``cid``)。
+    """
+
+    bvid: str = ""
+    title: str = ""
+    author: str = ""
+    cover_url: str = ""
+    duration: int = 0
+    page_count: int = 0
+    attr: int = 0
+    item_type: int = 0
+    fav_time: int = 0
+
+    @property
+    def is_dead(self) -> bool:
+        """这条收藏是否已失效(稿件被删/下架)。
+
+        失效条目在收藏夹里仍然占位,但``pagelist``/``view`` 都会失败,所以界面必须
+        禁止点击 —— 否则用户一点就是一个错误弹窗。
+        """
+        return self.attr != FAV_ITEM_OK_ATTR
+
+    @property
+    def is_playable(self) -> bool:
+        """是否可以拿去播放(是视频稿件、有 ``bvid``、且没有失效)。"""
+        return self.item_type == FAV_ITEM_TYPE_VIDEO and bool(self.bvid) and not self.is_dead
+
+    @property
+    def is_multipart(self) -> bool:
+        """是否是分P合集(``page_count > 1``,每个分P是一首歌)。"""
+        return self.page_count > 1
+
+
+@dataclass(slots=True)
+class FavPage:
+    """收藏夹内容的一页。
+
+    翻页只看 :attr:`has_more` —— 不要用"这一页条数为 0"当结束条件,接口在这一页恰好
+    全是失效条目时的行为没有实测依据。
+    """
+
+    items: list[FavItem] = field(default_factory=list)
+    media_id: int = 0
+    media_count: int = 0
+    has_more: bool = False
+
+    def __len__(self) -> int:
+        """本页返回的条目数量(含失效条目)。"""
+        return len(self.items)
+
+
 # ====================================================================== 纯解析
+
+
+def _https_url(raw: object) -> str:
+    """把封面地址升级成 https(与 :attr:`~bilibili_music.core.models.Video.cover_https` 同一口径)。
+
+    B站的图片地址有 ``//i0.hdslb.com/...`` 与 ``http://i2.hdslb.com/...`` 两种形态,
+    Qt 在部分环境下会拒绝加载非 https 的图,所以在**解析阶段**就统一掉,
+    免得每个使用方各写一遍。
+
+    Args:
+        raw: 接口给的原始地址,可能是空值或非字符串。
+
+    Returns:
+        升级后的 https 地址;拿不到有效字符串时是空串。
+    """
+    url = str(raw or "")
+    if url.startswith("//"):
+        return "https:" + url
+    if url.startswith("http://"):
+        return "https://" + url[len("http://") :]
+    return url
+
+
+def parse_nav(payload: dict[str, Any]) -> AccountInfo:
+    """解析 ``nav`` 的 ``data`` 部分。
+
+    未登录时接口会返回 ``code=-101``(由上层转成 :class:`ApiError`),所以走到这里通常
+    已经是登录态;但仍然显式读 ``isLogin`` —— 它是唯一可信的判据。
+
+    Args:
+        payload: 响应体里的 ``data`` 对象;``None`` 或结构不符时按未登录处理。
+
+    Returns:
+        账号概况;``isLogin`` 缺失或为假时 ``is_login`` 为 ``False``。
+    """
+    data = payload if isinstance(payload, dict) else {}
+    # 不能写成 ``data.get("vipStatus") or data.get("vipType")``:``vipStatus=0`` 是**有效**
+    # 取值(表示大会员已过期),用 or 会被短路成 vipType,把过期账号显示成大会员
+    vip_raw = data.get("vipStatus")
+    if vip_raw is None:
+        vip_raw = data.get("vipType")
+    return AccountInfo(
+        is_login=bool(data.get("isLogin")),
+        mid=int(data.get("mid") or 0),
+        uname=str(data.get("uname") or ""),
+        vip_type=int(vip_raw or 0),
+    )
+
+
+def parse_fav_folders(payload: dict[str, Any]) -> list[FavFolder]:
+    """解析 ``fav/folder/created/list-all`` 的 ``data`` 部分。
+
+    **必须容忍 ``data=None``**:2026-09-14 实测,未登录(或凭据失效)时这个接口返回
+    ``code=0`` + ``data=null``,不是错误码。把它当"没有收藏夹"处理,登录态的问题交给
+    ``nav`` 去说。
+
+    Args:
+        payload: 响应体里的 ``data`` 对象,或 ``None``。
+
+    Returns:
+        收藏夹列表;``data`` 为 ``null``、``list`` 缺失或全是脏数据时返回空列表。
+    """
+    data = payload if isinstance(payload, dict) else {}
+    raw_items = data.get("list")
+    if not isinstance(raw_items, list):
+        return []
+    folders: list[FavFolder] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        media_id = int(item.get("id") or 0)
+        if not media_id:
+            # 没有 media_id 的条目取不到内容,留着只会让界面点出一次必然失败的请求
+            continue
+        folders.append(
+            FavFolder(
+                media_id=media_id,
+                title=str(item.get("title") or ""),
+                media_count=int(item.get("media_count") or 0),
+                attr=int(item.get("attr") or 0),
+            )
+        )
+    return folders
+
+
+def parse_fav_page(payload: dict[str, Any]) -> FavPage:
+    """解析 ``fav/resource/list`` 的 ``data`` 部分。
+
+    Args:
+        payload: 响应体里的 ``data`` 对象,或 ``None``(未登录时实测就是 ``null``)。
+
+    Returns:
+        一页收藏夹内容。``info`` 缺失时 ``media_count`` 退化为 ``0``;非视频条目
+        (``type=12`` 音频、``21`` 合集)**保留但标成不可播**(用户得看得见"这里有一条
+        不是视频"),只有"视频类型却缺 ``bvid`` 且未失效"才算脏数据被跳过。
+    """
+    data = payload if isinstance(payload, dict) else {}
+    info = data.get("info") if isinstance(data.get("info"), dict) else {}
+    raw_items = data.get("medias")
+    items: list[FavItem] = []
+    if isinstance(raw_items, list):
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            bvid = str(raw.get("bv_id") or raw.get("bvid") or "")
+            item_type = int(raw.get("type") or 0)
+            attr = int(raw.get("attr") or 0)
+            # 只有"视频稿件却没有 bvid、又没标失效"才是脏数据(拿它必然点不动);
+            # 非视频条目与失效条目都要保留 —— 界面要如实显示它们并说明为什么不能播
+            if item_type == FAV_ITEM_TYPE_VIDEO and not bvid and attr == FAV_ITEM_OK_ATTR:
+                continue
+            items.append(
+                FavItem(
+                    bvid=bvid,
+                    title=str(raw.get("title") or ""),
+                    author=str((raw.get("upper") or {}).get("name") or "")
+                    if isinstance(raw.get("upper"), dict)
+                    else "",
+                    cover_url=_https_url(raw.get("cover")),
+                    duration=_parse_duration(raw.get("duration")),
+                    page_count=int(raw.get("page") or 0),
+                    attr=attr,
+                    item_type=item_type,
+                    fav_time=int(raw.get("fav_time") or 0),
+                )
+            )
+    return FavPage(
+        items=items,
+        media_id=int(info.get("id") or 0),
+        media_count=int(info.get("media_count") or 0),
+        has_more=bool(data.get("has_more")),
+    )
 
 
 def parse_search_result(payload: dict[str, Any], *, requested_page: int = 1) -> SearchResult:
@@ -498,6 +763,108 @@ class BilibiliClient:
             video = parse_video(data.get("data") or {}, fallback_bvid=bvid)
             self._video_cache[bvid] = video
             on_success(video)
+
+        return self.backend.get_json(url, on_success=handle_data, on_error=on_error)
+
+    # ------------------------------------------------------------ 账号与收藏夹
+
+    def fetch_nav(
+        self,
+        *,
+        on_success: Callable[[AccountInfo], None],
+        on_error: ErrorCallback,
+    ):
+        """取登录态与账号概况。
+
+        这是**唯一**可信的登录态判据(见 :func:`parse_nav`)。凭据失效时接口返回
+        ``code=-101``,会由后端转成 :class:`ApiError` 交给 ``on_error``。
+
+        Args:
+            on_success: 成功回调,接收 :class:`AccountInfo`。
+            on_error: 失败回调;凭据失效时收到 ``code=-101`` 的 :class:`ApiError`。
+
+        Returns:
+            可取消的请求句柄。
+        """
+        url = f"{API_BASE}/x/web-interface/nav"
+
+        def handle_data(data: dict[str, Any]) -> None:
+            """响应到达:解析 ``data`` 里的账号概况。"""
+            on_success(parse_nav(data.get("data") or {}))
+
+        return self.backend.get_json(url, on_success=handle_data, on_error=on_error)
+
+    def fetch_fav_folders(
+        self,
+        mid: int,
+        *,
+        on_success: Callable[[list[FavFolder]], None],
+        on_error: ErrorCallback,
+    ):
+        """取"我创建的收藏夹"。
+
+        ``web_location`` 是网页端会带的埋点参数,带上它更接近浏览器行为(风控口径,
+        见 README「账号链路」)。**未登录时这个接口也返回 ``code=0``**,只是 ``data`` 为
+        ``null`` —— 所以"拿不到收藏夹"不等于"登录失效",别在这里判断登录态。
+
+        Args:
+            mid: 账号 mid(从 :meth:`fetch_nav` 拿),作为 ``up_mid`` 参数。
+            on_success: 成功回调,接收收藏夹列表(可能是空列表)。
+            on_error: 失败回调。
+
+        Returns:
+            可取消的请求句柄。
+        """
+        query = urlencode({"up_mid": mid, "web_location": "333.1387"})
+        url = f"{API_BASE}/x/v3/fav/folder/created/list-all?{query}"
+
+        def handle_data(data: dict[str, Any]) -> None:
+            """响应到达:``data`` 可能是 ``null``,由纯解析函数容忍。"""
+            on_success(parse_fav_folders(data.get("data")))
+
+        return self.backend.get_json(url, on_success=handle_data, on_error=on_error)
+
+    def fetch_fav_page(
+        self,
+        media_id: int,
+        *,
+        page: int = 1,
+        page_size: int = MAX_FAV_PAGE_SIZE,
+        on_success: Callable[[FavPage], None],
+        on_error: ErrorCallback,
+    ):
+        """取某个收藏夹内容的一页。
+
+        ``order=mtime`` 是"最近收藏在前";``type=0`` 表示只查当前收藏夹(文档里 ``type=1``
+        是"全部收藏夹",语义完全不同,不要混)。
+
+        Args:
+            media_id: 收藏夹 id(来自 :meth:`fetch_fav_folders`)。
+            page: 页码,从 1 开始。
+            page_size: 每页条数;超过 :data:`MAX_FAV_PAGE_SIZE` 会被夹到上限 ——
+                接口的 ``ps`` 定义域是 1~20,传大了不报错但行为没有保证。
+            on_success: 成功回调,接收一页内容。
+            on_error: 失败回调。
+
+        Returns:
+            可取消的请求句柄。
+        """
+        query = urlencode(
+            {
+                "media_id": media_id,
+                "pn": page,
+                "ps": max(1, min(page_size, MAX_FAV_PAGE_SIZE)),
+                "order": "mtime",
+                "type": 0,
+                "tid": 0,
+                "platform": "web",
+            }
+        )
+        url = f"{API_BASE}/x/v3/fav/resource/list?{query}"
+
+        def handle_data(data: dict[str, Any]) -> None:
+            """响应到达:解析条目(含失效条目的占位)。"""
+            on_success(parse_fav_page(data.get("data")))
 
         return self.backend.get_json(url, on_success=handle_data, on_error=on_error)
 

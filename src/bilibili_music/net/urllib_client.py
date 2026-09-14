@@ -21,7 +21,7 @@ import urllib.request
 import zlib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from http.cookiejar import CookieJar
+from http.cookiejar import Cookie, CookieJar
 from typing import Any
 from urllib.parse import urlencode
 
@@ -40,6 +40,7 @@ from ..core.http import (
     RETRYABLE_STATUS,
 )
 from .base import (
+    BILI_COOKIE_DOMAIN,
     DownloadHandle,
     ErrorCallback,
     FetchHandle,
@@ -48,6 +49,7 @@ from .base import (
     SuccessCallback,
     backoff_delay,
     check_payload,
+    is_blank_cookie,
 )
 
 #: 单次同步请求返回的最大字节数,防止异常响应把内存吃满(20 MiB 足够所有 JSON 接口)。
@@ -140,6 +142,79 @@ class UrllibClient:
         否则调用方拿到的会是一个恒为真的绑定方法对象,诊断逻辑会"假通过"。
         """
         return sorted({c.name for c in self._cookie_jar})
+
+    def session_cookies(self) -> dict[str, str]:
+        """导出 B站 作用域下的会话 Cookie(名字→取值)。
+
+        只取 B站 域的 Cookie,理由与 Qt 后端一致(见
+        :meth:`~bilibili_music.net.client.QtNetworkClient.session_cookies`):
+        混进别的站点凭据既无意义又多一份泄露面。
+
+        Returns:
+            名字到取值的映射;没有可用 Cookie 时是空字典。
+
+        Note:
+            返回值含凭据取值,禁止打印或写日志(``AGENTS.md`` 第 5 节第 10 条)。
+        """
+        exported: dict[str, str] = {}
+        for cookie in self._cookie_jar:
+            if not (cookie.domain or "").endswith("bilibili.com"):
+                continue
+            if not is_blank_cookie(cookie.name, cookie.value or ""):
+                exported[cookie.name] = cookie.value
+        return exported
+
+    def clear_session_cookies(self) -> None:
+        """清掉 jar 里所有 B站 域的 Cookie(登出用)。
+
+        用 ``CookieJar.clear(domain, path, name)`` 逐个删而不是 ``clear()`` 一把清空:
+        两者当前效果相同(本客户端只会碰 B站),但按域删写明了意图,
+        万一以后为别的东西复用了同一个 jar,也不会顺手把别人的凭据删掉。
+
+        Note:
+            与 :meth:`set_session_cookies` 一样,只应在**没有请求在飞**时调用。
+        """
+        for cookie in list(self._cookie_jar):
+            if (cookie.domain or "").endswith("bilibili.com"):
+                self._cookie_jar.clear(cookie.domain, cookie.path, cookie.name)
+
+    def set_session_cookies(self, cookies: dict[str, str]) -> None:
+        """把一份会话 Cookie 灌进 jar(合并,不覆盖匿名预热拿到的 buvid)。
+
+        ``http.cookiejar.Cookie`` 的字段比 Qt 那边啰嗦,但同样是"域固定
+        ``.bilibili.com`` / 路径 ``/`` / ``secure``",两边必须成对,否则
+        "Qt 写进去、urllib 读出来"会静默丢凭据。
+
+        Args:
+            cookies: 名字到取值的映射;空字典是合法的空操作。
+
+        Note:
+            ``CookieJar`` 不是线程安全的。本方法只应在**还没有请求在飞**的时候调用
+            (应用里就是启动恢复会话、登录成功这两处),不要在回调里并发调用。
+        """
+        for name, value in cookies.items():
+            if is_blank_cookie(name, value):
+                continue
+            self._cookie_jar.set_cookie(
+                Cookie(
+                    version=0,
+                    name=name,
+                    value=value,
+                    port=None,
+                    port_specified=False,
+                    domain=BILI_COOKIE_DOMAIN,
+                    domain_specified=True,
+                    domain_initial_dot=True,
+                    path="/",
+                    path_specified=True,
+                    secure=True,
+                    expires=None,
+                    discard=False,
+                    comment=None,
+                    comment_url=None,
+                    rest={},
+                )
+            )
 
     # ------------------------------------------------------------ 同步核心
 

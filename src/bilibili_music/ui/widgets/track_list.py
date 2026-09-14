@@ -135,6 +135,8 @@ class TrackRow:
         prefix: 标题前的弱化前缀(如 ``"周杰伦 - "``);空串表示没有。
         cover_url: 封面地址;空串表示这一行没有封面,显示占位图。
         columns: 富信息列**之后**各列的文本,按顺序填。长度不足的列留空。
+        dimmed: 是否把这一行画成"弱化/不可用"(收藏夹里的失效条目就是这种)。
+            它只管**外观**;"点了要不要有反应"由使用方决定(见 ``FavPage``)。
     """
 
     title: str
@@ -142,6 +144,7 @@ class TrackRow:
     prefix: str = ""
     cover_url: str = ""
     columns: tuple[str, ...] = ()
+    dimmed: bool = False
 
 
 @dataclass(slots=True)
@@ -154,6 +157,8 @@ class _RowWidgets:
     subtitle_label: ElidedLabel
     #: 是否已经贴上真封面(占位图不算),供 :meth:`TrackList.has_cover_at` 回答
     has_cover: bool = False
+    #: 这一行是否是弱化行。``set_highlight`` 要用它决定"取消高亮后该恢复成什么颜色"
+    dimmed: bool = False
 
 
 class TrackList(QTableWidget):
@@ -346,13 +351,21 @@ class TrackList(QTableWidget):
     def set_highlight(self, row: int) -> None:
         """标记"当前播放的是哪一行",并把视图滚到它上面。
 
+        弱化行(``dimmed``)取消高亮时要恢复成**弱化色**而不是默认色 —— 它本来就不是
+        "可用的内容",跟着变亮会让人以为它是能播的。
+
         Args:
             row: 要突出的行号;传负数表示取消标记。
         """
         for index, record in enumerate(self._rows):
             active = index == row
             self._style_index(index, active)
-            record.title_label.setStyleSheet(f"color: {DARK.accent};" if active else "")
+            if active:
+                record.title_label.setStyleSheet(f"color: {DARK.accent};")
+            elif record.dimmed:
+                record.title_label.setStyleSheet(f"color: {DARK.muted};")
+            else:
+                record.title_label.setStyleSheet("")
         if 0 <= row < self.rowCount():
             self.selectRow(row)
             item = self.item(row, INDEX_COLUMN)
@@ -360,6 +373,22 @@ class TrackList(QTableWidget):
                 self.scrollToItem(item)
         else:
             self.clearSelection()
+
+    def is_row_dimmed(self, row: int) -> bool:
+        """某一行是不是弱化行;越界返回 ``False``。
+
+        颜色的断言只能看控件内部样式,所以这里给一个状态入口 —— 与
+        :meth:`highlighted_row` 同一个理由:"这一行是弱化的"这个状态不该只存在于颜色里。
+
+        Args:
+            row: 行号,0 起。
+
+        Returns:
+            这一行是否是弱化行(``TrackRow.dimmed``)。
+        """
+        if not 0 <= row < len(self._rows):
+            return False
+        return self._rows[row].dimmed
 
     def highlighted_row(self) -> int:
         """当前被加粗标记的行号;没有则为 ``-1``。
@@ -459,15 +488,20 @@ class TrackList(QTableWidget):
 
         title_line = QHBoxLayout()
         title_line.setSpacing(6)
-        prefix = ElidedLabel(track.prefix)
+        # 这几个标签**必须在构造时就把 box 当父对象传进来**,不能等 addWidget 去认领:
+        # 无父控件的 QWidget 自己就是一个顶层窗口,而下面要按"有没有内容"决定显不显示 ——
+        # 于是 setVisible(True) 会先把它真的 show 成一个带原生边框的小窗口,等 addWidget
+        # 重新指定父对象时才隐藏。一页 30 行的代价就是 30~40 个窗口在 300ms 里连闪
+        # (Windows 上肉眼可见;macOS 只是窗口来不及上屏,真窗口一样在创建)。
+        prefix = ElidedLabel(track.prefix, box)
         prefix.setObjectName("TrackPrefix")
         prefix.setVisible(bool(track.prefix))
-        title = ElidedLabel(track.title)
+        title = ElidedLabel(track.title, box)
         title.setObjectName("TrackTitle")
         title_line.addWidget(prefix, 0)
         title_line.addWidget(title, 1)
 
-        subtitle = ElidedLabel(track.subtitle)
+        subtitle = ElidedLabel(track.subtitle, box)
         subtitle.setObjectName("TrackSubtitle")
         subtitle.setVisible(bool(track.subtitle))
 
@@ -482,11 +516,17 @@ class TrackList(QTableWidget):
         holder.setToolTip(track.title)
         self.setItem(row, RICH_COLUMN, holder)
 
+        if track.dimmed:
+            # 弱化行只压标题色:副标题与前缀本来就是 muted(见 theme.py 的 QSS),
+            # 再把它们压一遍就等于看不见了
+            title.setStyleSheet(f"color: {DARK.muted};")
+
         return _RowWidgets(
             cover_url=track.cover_url,
             cover_label=cover,
             title_label=title,
             subtitle_label=subtitle,
+            dimmed=track.dimmed,
         )
 
     def _plain_item(self, text: str, column: int) -> QTableWidgetItem:
@@ -501,12 +541,19 @@ class TrackList(QTableWidget):
         return item
 
     def _set_plain_columns(self, row: int, track: TrackRow) -> None:
-        """把 ``TrackRow.columns`` 摊到富信息列之后的各普通列上。"""
+        """把 ``TrackRow.columns`` 摊到富信息列之后的各普通列上。
+
+        弱化行连普通列一起压暗 —— 只压标题会让"时长""分P"这些数字依旧醒目,
+        整行看起来还是可用的。
+        """
         for offset, text in enumerate(track.columns):
             column = RICH_COLUMN + 1 + offset
             if column >= self.columnCount() or column == self._action_column:
                 break
-            self.setItem(row, column, self._plain_item(text, column))
+            item = self._plain_item(text, column)
+            if track.dimmed:
+                item.setForeground(QBrush(QColor(DARK.muted)))
+            self.setItem(row, column, item)
 
     def _set_actions(self, row: int) -> None:
         """在操作列放"加入队列"与"更多操作"两个按钮。"""

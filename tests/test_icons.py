@@ -86,6 +86,8 @@ class TestIconResources(unittest.TestCase):
             "expand",
             # 「最近播放」侧栏入口新增的
             "history",
+            # 侧栏「我的歌单」的「显示/隐藏」按钮新增的
+            "eye",
         }
         self.assertEqual(expected - set(available_icons()), set())
 

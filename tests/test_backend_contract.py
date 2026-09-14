@@ -16,20 +16,41 @@ from __future__ import annotations
 import inspect
 import sys
 import unittest
+from http.cookiejar import Cookie
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from PySide6.QtCore import QUrl  # noqa: E402
+from PySide6.QtNetwork import QNetworkCookie  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402  (必须先于 QtCore)
 
 from bilibili_music.net.client import QtNetworkClient  # noqa: E402
 from bilibili_music.net.urllib_client import UrllibClient  # noqa: E402
 
 # 两个后端都必须提供的公共方法
-REQUIRED_METHODS = ("warm_up", "get_json", "get_bytes", "download", "close")
+REQUIRED_METHODS = (
+    "warm_up",
+    "get_json",
+    "get_bytes",
+    "download",
+    "close",
+    "session_cookies",
+    "set_session_cookies",
+    "clear_session_cookies",
+)
 
 # 签名必须一致的公共方法(用于把 sink / on_* 回调这类关键字参数对齐)
-SIGNATURE_MATCHED = ("get_json", "get_bytes", "download", "warm_up", "close")
+SIGNATURE_MATCHED = (
+    "get_json",
+    "get_bytes",
+    "download",
+    "warm_up",
+    "close",
+    "session_cookies",
+    "set_session_cookies",
+    "clear_session_cookies",
+)
 
 
 class TestBackendContract(unittest.TestCase):
@@ -117,6 +138,94 @@ class TestBackendContract(unittest.TestCase):
         qt.close()
         ur.close()
         ur.close()
+
+    def test_session_cookies_round_trip_on_both(self) -> None:
+        """会话导入导出必须往返一致,否则重启后登录态会静默丢失。
+
+        这条不触网:只往 jar 里灌一份凭据再读出来。两个后端的域/路径口径必须完全一样,
+        所以同一个断言跑两遍 —— 换 ``--backend`` 时凭据读写才不会有"一边能存一边读不出"。
+        """
+        cookies = {"SESSDATA": "a%2Cb%2Cc%2A11", "bili_jct": "deadbeef", "DedeUserID": "42"}
+        for backend in (QtNetworkClient(), UrllibClient()):
+            with self.subTest(backend=type(backend).__name__):
+                backend.set_session_cookies(cookies)
+                exported = backend.session_cookies()
+                for name, value in cookies.items():
+                    self.assertEqual(exported.get(name), value, f"{name} 没有往返成功")
+
+    def test_session_cookies_returns_a_dict(self) -> None:
+        """必须是 ``dict``(而不是 list/迭代器):调用方直接拿它落盘或注回 jar。"""
+        for backend in (QtNetworkClient(), UrllibClient()):
+            with self.subTest(backend=type(backend).__name__):
+                self.assertIsInstance(backend.session_cookies(), dict)
+
+    def test_session_cookies_excludes_other_domains(self) -> None:
+        """非 B站 域的 Cookie 不许进会话文件。
+
+        这里刻意碰内部 jar:公开接口没法往别的域写 Cookie,而这正是要钉死的边界 ——
+        一份"会话文件"里混进别的站点凭据,既无意义又多一份泄露面。
+        """
+        foreign = "not-bilibili"
+        qt = QtNetworkClient()
+        jar = qt._manager.cookieJar()  # noqa: SLF001  (契约测试必须直接摆布 jar)
+        cookie = QNetworkCookie(b"other", b"x")
+        cookie.setDomain(".example.com")
+        cookie.setPath("/")
+        jar.setCookiesFromUrl([cookie], QUrl("https://example.com/"))
+        self.assertNotIn(foreign, qt.session_cookies())
+
+        ur = UrllibClient()
+        ur._cookie_jar.set_cookie(  # noqa: SLF001
+            Cookie(
+                version=0,
+                name="other",
+                value="x",
+                port=None,
+                port_specified=False,
+                domain=".example.com",
+                domain_specified=True,
+                domain_initial_dot=True,
+                path="/",
+                path_specified=True,
+                secure=True,
+                expires=None,
+                discard=False,
+                comment=None,
+                comment_url=None,
+                rest={},
+            )
+        )
+        self.assertNotIn(foreign, ur.session_cookies())
+
+    def test_set_session_cookies_ignores_blank_entries(self) -> None:
+        """空名字与空取值不许进 jar —— 它们会在 ``cookie_names`` 里造出假阳性。"""
+        for backend in (QtNetworkClient(), UrllibClient()):
+            with self.subTest(backend=type(backend).__name__):
+                backend.set_session_cookies({"": "x", "SESSDATA": "   ", "bili_jct": "ok"})
+                self.assertNotIn("", backend.cookie_names)
+                self.assertEqual(backend.session_cookies(), {"bili_jct": "ok"})
+
+    def test_clear_session_cookies_empties_the_jar(self) -> None:
+        """登出必须真的把凭据从 jar 里去掉,否则"登出了还能接着用"。
+
+        两个后端都要清干净 —— 只删文件不动 jar 是最容易漏的一步:SESSDATA 还在内存里,
+        后续请求照样是登录态,用户以为已经登出,实际没有。
+        """
+        for backend in (QtNetworkClient(), UrllibClient()):
+            with self.subTest(backend=type(backend).__name__):
+                backend.set_session_cookies({"SESSDATA": "x", "bili_jct": "y"})
+                self.assertTrue(backend.session_cookies())
+                backend.clear_session_cookies()
+                self.assertEqual(backend.session_cookies(), {})
+                self.assertEqual(backend.cookie_names, [])
+
+    def test_clear_session_cookies_is_idempotent(self) -> None:
+        """重复登出(或从未登录就登出)不该抛异常。"""
+        for backend in (QtNetworkClient(), UrllibClient()):
+            with self.subTest(backend=type(backend).__name__):
+                backend.clear_session_cookies()
+                backend.clear_session_cookies()
+                self.assertEqual(backend.session_cookies(), {})
 
 
 if __name__ == "__main__":

@@ -64,8 +64,11 @@
 
 ### 1.4 当前**不做**的事（跑偏清单，除非用户当轮明确要求）
 
-- 登录、Cookie 导入、扫码、账号体系
-- WBI 签名（`w_rid`/`wts`）、收藏夹云同步、云端歌单
+- **登录 / Cookie 导入 / 扫码 / 账号体系、WBI 签名（`w_rid`/`wts`）、收藏夹**
+  —— 这三项**原为跑偏项**，自 **2026-09-14** 起按
+  [`docs/ROADMAP.md`](docs/ROADMAP.md) 的 **M5 分阶段授权**执行
+  （S0 只读验证 → S1 最小闭环 → S2 增强逐项拍板）；**授权范围以外仍按本清单处理**
+- 写回类账号操作（收藏 / 取消收藏 / 增删收藏夹）、私密收藏夹、云端歌单同步
 - 弹幕 / 评论 / 字幕抓取
 - 视频画面播放、转码、视频下载
 - 引入 QML / WebEngine / 第三方播放器或下载器库
@@ -262,6 +265,15 @@ README 的「B站接口实测笔记」有完整说明，以下是**编写代码�
    （见 `audio/resolver.py`），避免旧请求回来时污染新状态。
 9. **面向用户的文字一律中文**：界面文案、错误提示、状态文本都用中文；异常消息可含英文
    技术标识（URL、字段名、状态码）。
+10. **账号凭据纪律（自 M5 S0 起生效）**：`SESSDATA` / `bili_jct` / `refresh_token`
+    等价于账号密码，**禁止**写进日志、异常消息、测试样本、`git` 提交或 `print` 调试输出。
+    诊断只允许报告**名字、数量、长度或哈希前缀**（`HttpBackend.cookie_names` 就是这个
+    口径）。落盘形态必须由用户单独拍板，**不许在未拍板的情况下默认明文**。
+    **本仓库的拍板结果（2026-09-14，用户明确选择）：明文 JSON**
+    （`%APPDATA%\BiliMusic\session.json`，实现见 `core/session.py`）。选择明文就必须
+    同时满足三条，缺一不可：①POSIX 下落盘权限 `0o600`；②界面必须**明示**保存路径并
+    提供一键登出（登出即删文件）；③本条第 1 句的禁令原样有效。要走 DPAPI 之类的加固，
+    改 `SessionStore.save/load` 两处即可，调用方不用动。
 
 ---
 
@@ -285,6 +297,7 @@ README 的「B站接口实测笔记」有完整说明，以下是**编写代码�
 | 两种后端各跑一遍 | `uv run python scripts/smoke_test.py --both` |
 | 只验数据链路 | `uv run python scripts/smoke_test.py --no-play` |
 | 接口可用性探测 | `uv run python scripts/probe_api.py` |
+| 账号链路只读验证（M5 S0，凭据走环境变量/stdin） | `uv run python scripts/probe_login.py` |
 | 启动应用 | `uv run bilimusic` |
 
 ---

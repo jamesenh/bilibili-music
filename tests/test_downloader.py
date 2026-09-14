@@ -43,7 +43,12 @@ from bilibili_music.core.library_db import LibraryDb  # noqa: E402
 from bilibili_music.core.models import AudioTrack, Page, Video  # noqa: E402
 
 #: 落盘类用例的临时目录根(与 test_cache_index / test_history 同一套做法)。
-_SCRATCH = Path(__file__).resolve().parent / "_scratch"
+#:
+#: **带模块名**:``_scratch/<用例名>`` 在跨模块重名时会撞车 —— 本模块与
+#: ``test_download_task`` 都有 ``test_clear_finished_keeps_unfinished``。Windows 上
+#: 删不掉仍被打开的 ``library.db``(``rmtree(ignore_errors=True)`` 静默失败),后跑的
+#: 用例会读到前一个用例留下的任务,``active_count()`` 因此多出几条。
+_SCRATCH = Path(__file__).resolve().parent / "_scratch" / Path(__file__).stem
 
 #: 替身下载下来的一块数据(每个分P都是这么长)。
 CHUNK = b"x" * 1024

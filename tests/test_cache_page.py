@@ -42,6 +42,7 @@ from bilibili_music.core.config import ConfigStore  # noqa: E402
 from bilibili_music.core.cover_cache import CoverCache  # noqa: E402
 from bilibili_music.core.library_db import LibraryDb  # noqa: E402
 from bilibili_music.core.models import AudioTrack, Page, Video  # noqa: E402
+from bilibili_music.core.session import SessionStore  # noqa: E402
 from bilibili_music.ui.main_window import MainWindow  # noqa: E402
 from bilibili_music.ui.widgets import CachePage  # noqa: E402
 
@@ -410,6 +411,9 @@ class _WiringCase(unittest.TestCase):
             cover_cache=CoverCache(self.tmp / "covers"),
             config_store=ConfigStore(self.tmp / "config.json"),
             playback=self.playback,
+            # 会话存储必须落进沙箱:默认路径是用户真实的配置目录,不注入就会去读
+            # 用户真实的 session.json(见 main_window 的模块 docstring)
+            session_store=SessionStore(self.tmp / "session.json"),
         )
         self.addCleanup(self.window.close)
 

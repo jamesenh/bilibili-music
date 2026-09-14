@@ -26,6 +26,7 @@ __all__ = [
     "format_size",
     "track_subtitle",
     "track_title",
+    "video_web_url",
 ]
 
 
@@ -157,6 +158,21 @@ def track_title(video: Video, page: Page | None) -> str:
     if video.is_multipart and page is not None and page.title:
         return page.title
     return video.title
+
+
+def video_web_url(bvid: str) -> str:
+    """由 BV 号拼出B站网页地址。
+
+    抽成模块级函数是因为除了 :attr:`Video.web_url`,收藏夹条目这类"只有 bvid、还没有
+    ``Video`` 对象"的场景也要用它("在B站打开"的右键项)。两处各写一遍格式串迟早会不一致。
+
+    Args:
+        bvid: 视频 BV 号;空串会拼出一个打不开的地址,调用方应先判空。
+
+    Returns:
+        形如 ``https://www.bilibili.com/video/BV1xx`` 的地址。
+    """
+    return f"https://www.bilibili.com/video/{bvid}"
 
 
 def track_subtitle(video: Video, page: Page | None) -> str:
@@ -327,7 +343,7 @@ class Video:
     @property
     def web_url(self) -> str:
         """对应的B站网页地址,便于排查问题时人工打开对照。"""
-        return f"https://www.bilibili.com/video/{self.bvid}"
+        return video_web_url(self.bvid)
 
     @property
     def cover_https(self) -> str:

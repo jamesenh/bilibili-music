@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -122,6 +122,33 @@ def _clamp_history_limit(value: object) -> int:
     return min(limit, MAX_HISTORY_LIMIT)
 
 
+def _clean_hidden_ids(value: object) -> list[int]:
+    """把「被隐藏的收藏夹」收敛成去重、升序的正整数列表。
+
+    配置是不可信输入:这个键可能被手改成字符串、对象、甚至混着 ``null`` 的数组。
+    这里**逐项**兜底而不是整份丢弃 —— 一个坏元素不该让用户其余的隐藏设置一起失效。
+    非正数直接丢掉:``media_id`` 从 1 开始(``0`` 是"还没选"的哨兵值,见
+    ``MainWindow._fav_media_id``),拿它当隐藏项没有任何意义。
+
+    去重 + 排序不只是好看:结果既会写回配置文件,也会被上层塞进 ``set`` 参与每次重绘的
+    过滤判断,稳定顺序让"配置文件被改写"这件事只发生在用户真的改了勾选的时候。
+
+    Args:
+        value: 配置里的原始值,期望是整数数组。
+
+    Returns:
+        去重且升序的正整数列表;``value`` 不是数组时返回空列表。
+    """
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    cleaned: set[int] = set()
+    for raw in value:
+        media_id = _as_int(raw, 0)
+        if media_id > 0:
+            cleaned.add(media_id)
+    return sorted(cleaned)
+
+
 @dataclass(slots=True)
 class AppConfig:
     """应用配置的**纯数据**部分。
@@ -158,6 +185,18 @@ class AppConfig:
     last_position_ms: int = 0
     """上次播放到的位置(毫秒),用于续播。"""
 
+    fav_hidden_ids: list[int] = field(default_factory=list)
+    """在侧栏「我的歌单」里**被用户手动隐藏**的收藏夹 ``media_id``。
+
+    只影响本机侧栏列不列出来,B站 上的收藏夹不会被改动。存 ``media_id`` 而不是名字:
+    名字可以重复、实测还有一个空标题的夹子,只有 id 是唯一键。
+
+    **不按账号分开存**:``media_id`` 在 B站 全局唯一,别的账号的收藏夹不可能撞上同一个
+    id;反过来,按账号分表会让"换个账号登录"顺手丢掉上一个账号的隐藏设置。因此列表里
+    可能留着**当前账号已经没有的** id(夹子被删了、或属于另一个账号),那只是几字节的
+    死数据,不做清理 —— 清理就得先知道"这份列表属于哪个账号",那正是这里要避免的。
+    """
+
     def normalized(self) -> AppConfig:
         """返回一份把非法值收敛到合法范围的**新**配置。
 
@@ -182,6 +221,9 @@ class AppConfig:
             last_bvid=str(self.last_bvid or ""),
             last_cid=max(0, _as_int(self.last_cid, 0)),
             last_position_ms=max(0, _as_int(self.last_position_ms, 0)),
+            # 新建一份列表而不是原样传递:配置对象在界面里是长期持有的,共享同一个
+            # 列表会让"改了归一化结果"顺手改掉原对象
+            fav_hidden_ids=_clean_hidden_ids(self.fav_hidden_ids),
         )
 
 

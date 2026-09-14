@@ -22,6 +22,7 @@ from ..core.http import BASE_BACKOFF, MAX_BACKOFF, RETRYABLE_STATUS
 
 __all__ = [
     "ApiRequest",
+    "BILI_COOKIE_DOMAIN",
     "DownloadHandle",
     "ErrorCallback",
     "FetchHandle",
@@ -33,7 +34,12 @@ __all__ = [
     "SuccessCallback",
     "backoff_delay",
     "check_payload",
+    "is_blank_cookie",
 ]
+
+#: 本项目保存会话 Cookie 时使用的域。两个后端必须用同一个值,否则一边写进去、
+#: 另一边读出来(或反过来)就会静默丢凭据。
+BILI_COOKIE_DOMAIN = ".bilibili.com"
 
 #: JSON 接口成功回调:参数是校验过 ``code`` 的响应体整体(含 ``data`` 字段)。
 JsonCallback = Callable[[dict[str, Any]], None]
@@ -78,6 +84,42 @@ class HttpBackend(Protocol):
     @property
     def cookie_names(self) -> list[str]:
         """当前持有的 Cookie 名(诊断用)。必须是属性,两个后端必须一致。"""
+        ...
+
+    def session_cookies(self) -> dict[str, str]:
+        """导出 B站 作用域下的会话 Cookie(名字→取值),供 :mod:`..core.session` 落盘。
+
+        只导出**名字与取值**:domain / expires 一律不带。过期由服务端判定 ——
+        本地记一个可能算错的过期点,只会把"其实还有效"的凭据误判成失效。
+
+        非 B站 域的 Cookie 必须排除,否则一份"会话文件"里会混进别的站点凭据。
+
+        Returns:
+            名字到取值的映射;没有可用 Cookie 时是空字典。
+
+        Note:
+            返回值含**凭据取值**,按 ``AGENTS.md`` 第 5 节第 10 条,禁止打印或写日志。
+        """
+        ...
+
+    def set_session_cookies(self, cookies: dict[str, str]) -> None:
+        """把一份会话 Cookie 灌进 jar(域固定为 ``.bilibili.com``、路径 ``/``、``secure``)。
+
+        是**合并**而不是覆盖:匿名预热拿到的 ``buvid3`` / ``b_nut`` 要留着 ——
+        实测缺了它们更容易被风控。重复名字以传入值为准。
+
+        Args:
+            cookies: 名字到取值的映射;空字典是合法的空操作。
+        """
+        ...
+
+    def clear_session_cookies(self) -> None:
+        """清掉 jar 里所有 B站 域的 Cookie(登出用)。
+
+        是**连匿名 Cookie 一起清**:登出之后不该再留着任何旧会话痕迹。代价是紧接着的
+        请求会缺 ``buvid3`` / ``b_nut``(而两个后端的 ``warm_up()`` 默认不会重复预热),
+        所以调用方应当在登出后立刻 ``warm_up(force=True)`` 重新拿一份匿名身份。
+        """
         ...
 
     def warm_up(self, *, force: bool = False) -> None:
@@ -145,6 +187,24 @@ class ApiRequest:
 
     url: str
     headers: dict[str, str]
+
+
+def is_blank_cookie(name: str, value: str) -> bool:
+    """判断一份 Cookie 是不是"空白项"(名字或取值只有空白)。
+
+    两个后端在**写入**与**导出**两侧都必须用这一条口径,否则会出现"空白取值被当成有效
+    凭据存进去、又原样导出来"的不一致 —— 那会让"有没有凭据"这类判断出现假阳性
+    (这一条是被 ``test_set_session_cookies_ignores_blank_entries`` 抓出来的:
+    最初写成 ``not value``,而 ``"   "`` 在 Python 里是真值)。
+
+    Args:
+        name: Cookie 名。
+        value: Cookie 取值。
+
+    Returns:
+        名字或取值去掉首尾空白后为空时为 ``True``。
+    """
+    return not name.strip() or not value.strip()
 
 
 def check_payload(payload: bytes, url: str) -> dict[str, Any]:

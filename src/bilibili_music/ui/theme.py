@@ -364,6 +364,17 @@ QPushButton#RowActionButton:hover {{
     background: {s.card};
 }}
 
+/* ---------------------------------------------------------- 收藏夹显示/隐藏弹窗 */
+/* 列表本身不该有第二个底色:滚动区与它的视口透明,漏出弹窗的窗口色即可 */
+QScrollArea#FavVisibilityScroll, QWidget#FavVisibilityViewport {{
+    background: transparent;
+    border: none;
+}}
+QCheckBox#FavVisibilityCheck {{
+    color: {DARK.text};
+    padding: 4px 2px;
+}}
+
 /* ---------------------------------------------------------- 播放条 */
 QPushButton#TransportButton {{
     background: transparent;

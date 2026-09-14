@@ -36,7 +36,12 @@ from bilibili_music.core.library_db import LibraryDb  # noqa: E402
 from bilibili_music.core.models import Page, Video  # noqa: E402
 
 #: 落盘类用例的临时目录根(与 test_cache_index / test_history 同一套做法)。
-_SCRATCH = Path(__file__).resolve().parent / "_scratch"
+#:
+#: **带模块名**:``_scratch/<用例名>`` 在跨模块重名时会撞车 —— 本模块与
+#: ``test_downloader`` 都有 ``test_clear_finished_keeps_unfinished``。Windows 上删不掉
+#: 仍被打开的 ``library.db``(``rmtree(ignore_errors=True)`` 会静默失败),后跑的用例
+#: 就读到前一个用例留下的任务;POSIX 允许删除打开的文件,所以 macOS 基线看不出这条。
+_SCRATCH = Path(__file__).resolve().parent / "_scratch" / Path(__file__).stem
 
 
 def _video(bvid: str = "BV1", count: int = 3) -> Video:

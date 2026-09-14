@@ -14,6 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from bilibili_music.api.bilibili import (  # noqa: E402
     parse_audio_tracks,
+    parse_fav_folders,
+    parse_fav_page,
+    parse_nav,
     parse_search_result,
     parse_video,
     pick_best,
@@ -297,6 +300,170 @@ class TestTrackFromQuality(unittest.TestCase):
         self.assertEqual(track.quality_id, 99999)
         self.assertEqual(track.bandwidth, 0)
         self.assertEqual(track.label, "0K")
+
+
+class TestParseNav(unittest.TestCase):
+    """``nav`` 解析:登录态是唯一可信判据。"""
+
+    def test_logged_in_account(self) -> None:
+        """登录态、昵称、mid 与大会员状态都要取到。"""
+        info = parse_nav(
+            {"isLogin": True, "mid": 42, "uname": "甲", "vipStatus": 1, "vipType": 2}
+        )
+        self.assertTrue(info.is_login)
+        self.assertEqual((info.mid, info.uname, info.vip_type), (42, "甲", 1))
+
+    def test_not_logged_in(self) -> None:
+        """``isLogin`` 为假时一律按未登录处理。"""
+        self.assertFalse(parse_nav({"isLogin": False}).is_login)
+
+    def test_tolerates_missing_and_wrong_shapes(self) -> None:
+        """``data`` 缺失或字段类型不对时退回默认值,不能抛。"""
+        for payload in ({}, None, {"mid": "42", "uname": None}):  # type: ignore[arg-type]
+            with self.subTest(payload=payload):
+                info = parse_nav(payload)  # type: ignore[arg-type]
+                self.assertFalse(info.is_login)
+                self.assertEqual(info.uname, "")
+
+    def test_expired_vip_reads_as_zero(self) -> None:
+        """过期的大会员 ``vipType`` 仍是 2,但 ``vipStatus`` 是 0 —— 取后者才不会骗人。"""
+        self.assertEqual(parse_nav({"isLogin": True, "vipType": 2, "vipStatus": 0}).vip_type, 0)
+
+
+class TestParseFavFolders(unittest.TestCase):
+    """收藏夹列表解析。"""
+
+    SAMPLE = {
+        "count": 2,
+        "list": [
+            {"id": 169038169, "title": "默认收藏夹", "media_count": 128, "attr": 0},
+            {"id": 3756843069, "title": "mac教程", "media_count": 1, "attr": 22},
+        ],
+    }
+
+    def test_reads_id_title_count_and_attr(self) -> None:
+        """基本字段与 ``attr`` 都要取到。"""
+        folders = parse_fav_folders(self.SAMPLE)
+        self.assertEqual([f.media_id for f in folders], [169038169, 3756843069])
+        self.assertEqual(folders[0].title, "默认收藏夹")
+        self.assertEqual(folders[0].media_count, 128)
+
+    def test_private_bit_is_recognised(self) -> None:
+        """``attr`` 的私密位(2)要能认出来:实测多数收藏夹是 22,默认夹是 0。"""
+        folders = parse_fav_folders(self.SAMPLE)
+        self.assertFalse(folders[0].is_private)
+        self.assertTrue(folders[1].is_private)
+
+    def test_null_data_means_no_folders(self) -> None:
+        """**未登录时接口返回 ``code=0`` + ``data=null``** —— 必须当成空列表而不是崩溃。"""
+        self.assertEqual(parse_fav_folders(None), [])  # type: ignore[arg-type]
+        self.assertEqual(parse_fav_folders({"list": None}), [])
+
+    def test_skips_entries_without_media_id(self) -> None:
+        """没有 ``media_id`` 的条目点开必然失败,直接丢掉。"""
+        folders = parse_fav_folders({"list": [{"title": "没有 id"}, {"id": 5, "title": "x"}]})
+        self.assertEqual([f.media_id for f in folders], [5])
+
+    def test_skips_non_dict_entries(self) -> None:
+        """列表里混进非对象时跳过,不能让整页带崩。"""
+        self.assertEqual(parse_fav_folders({"list": ["x", None, {"id": 1}]})[0].media_id, 1)
+
+
+class TestParseFavPage(unittest.TestCase):
+    """收藏夹内容解析(含失效条目与多P语义)。"""
+
+    SAMPLE = {
+        "info": {"id": 169038169, "media_count": 128},
+        "has_more": True,
+        "medias": [
+            {
+                "id": 111,
+                "type": 2,
+                "bvid": "BV1ok",
+                "title": "正常单P",
+                "cover": "http://i2.hdslb.com/a.jpg",
+                "duration": 213,
+                "page": 1,
+                "attr": 0,
+                "fav_time": 1700000000,
+                "upper": {"name": "某UP"},
+            },
+            {
+                "id": 222,
+                "type": 2,
+                "bvid": "BV1multi",
+                "title": "100P 合集",
+                "cover": "//i0.hdslb.com/b.jpg",
+                "duration": 3600,
+                "page": 100,
+                "attr": 0,
+                "upper": {"name": "UP2"},
+            },
+            {"id": 333, "type": 2, "bvid": "BV1dead", "title": "已失效", "attr": 9, "page": 1},
+            {"id": 444, "type": 12, "bvid": "", "title": "音频", "attr": 0, "page": 1},
+        ],
+    }
+
+    def test_page_metadata(self) -> None:
+        """``has_more`` 与 ``media_count`` 是翻页与统计的依据。"""
+        page = parse_fav_page(self.SAMPLE)
+        self.assertTrue(page.has_more)
+        self.assertEqual(page.media_count, 128)
+        self.assertEqual(page.media_id, 169038169)
+        self.assertEqual(len(page), 4)
+
+    def test_item_fields(self) -> None:
+        """条目字段要逐个对得上(``upper.name`` 是作者)。"""
+        item = parse_fav_page(self.SAMPLE).items[0]
+        self.assertEqual(item.bvid, "BV1ok")
+        self.assertEqual(item.title, "正常单P")
+        self.assertEqual(item.author, "某UP")
+        self.assertEqual(item.duration, 213)
+        self.assertEqual(item.fav_time, 1700000000)
+
+    def test_cover_is_upgraded_to_https(self) -> None:
+        """``http://`` 与 ``//`` 两种封面形态都要升级成 https,否则 Qt 可能拒绝加载。"""
+        items = parse_fav_page(self.SAMPLE).items
+        self.assertEqual(items[0].cover_url, "https://i2.hdslb.com/a.jpg")
+        self.assertEqual(items[1].cover_url, "https://i0.hdslb.com/b.jpg")
+
+    def test_dead_items_are_kept_but_not_playable(self) -> None:
+        """失效条目要**留着**(用户得看得见),但一律标成不可播。"""
+        items = parse_fav_page(self.SAMPLE).items
+        dead = items[2]
+        self.assertTrue(dead.is_dead)
+        self.assertFalse(dead.is_playable)
+        self.assertTrue(items[0].is_playable)
+
+    def test_multipart_flag(self) -> None:
+        """``page > 1`` 即多P合集(每个分P是一首歌)。"""
+        items = parse_fav_page(self.SAMPLE).items
+        self.assertFalse(items[0].is_multipart)
+        self.assertTrue(items[1].is_multipart)
+        self.assertEqual(items[1].page_count, 100)
+
+    def test_non_video_items_are_not_playable(self) -> None:
+        """``type=12``(音频)等非视频条目解析出来但不可播 —— 界面要标注原因。"""
+        items = parse_fav_page(self.SAMPLE).items
+        self.assertFalse(items[3].is_playable)
+        self.assertFalse(items[3].is_dead)
+
+    def test_null_data_means_empty_page(self) -> None:
+        """未登录时 ``data`` 是 ``null``,要给一个空页而不是抛异常。"""
+        page = parse_fav_page(None)  # type: ignore[arg-type]
+        self.assertEqual(len(page), 0)
+        self.assertFalse(page.has_more)
+        self.assertEqual(page.media_count, 0)
+
+    def test_skips_video_entry_without_bvid(self) -> None:
+        """能播的类型却缺 ``bvid`` 属于脏数据,跳过;失效条目的空 bvid 则保留。"""
+        page = parse_fav_page({"medias": [{"type": 2, "attr": 0}, {"type": 2, "attr": 9}]})
+        self.assertEqual(len(page), 1)
+        self.assertTrue(page.items[0].is_dead)
+
+    def test_skips_non_dict_entries(self) -> None:
+        """列表里混进非对象时跳过。"""
+        self.assertEqual(len(parse_fav_page({"medias": ["x", None, {"bvid": "BV1", "type": 2}]})), 1)
 
 
 if __name__ == "__main__":

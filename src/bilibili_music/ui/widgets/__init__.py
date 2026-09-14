@@ -13,6 +13,9 @@
 * :mod:`.queue_drawer` —— ``QueueDrawer``,右侧播放队列面板
 * :mod:`.cache_page` —— ``CachePage``,本地缓存页(已缓存音频的列表与清理)
 * :mod:`.history_page` —— ``HistoryPage``,最近播放页(放过哪些歌的列表)
+* :mod:`.fav_page` —— ``FavPage``,收藏夹页(把 B站 收藏夹当歌单浏览与播放)
+* :mod:`.fav_visibility_dialog` —— ``FavVisibilityDialog``,挑哪些收藏夹显示在侧栏
+* :mod:`.account_dialog` —— ``AccountDialog``,账号对话框(粘贴 Cookie 登录 / 登出)
 * :mod:`.task_dialog` —— ``TaskDialog``,下载任务对话框(批量缓存的进度与暂停/继续)
 * :mod:`.placeholder` —— ``PlaceholderPage``,尚未实现的功能的占位页
 * :mod:`.elided_label` —— ``ElidedLabel``,按宽度省略过长文字的标签
@@ -21,27 +24,34 @@
 "下一首放什么"这类决定一律在 :mod:`bilibili_music.audio.playback` 里做。
 """
 
+from .account_dialog import AccountDialog
 from .cache_page import CachePage
 from .elided_label import ElidedLabel
+from .fav_page import FavPage
+from .fav_visibility_dialog import FavVisibilityDialog
 from .history_page import HistoryPage
 from .page_selector import PageSelector
 from .placeholder import PlaceholderPage
 from .player_bar import PlayerBar
 from .queue_drawer import QueueDrawer
-from .sidebar import Sidebar
+from .sidebar import PlaylistEntry, Sidebar
 from .task_dialog import TaskDialog, TaskRow
 from .title_bar import TitleBar
 from .track_list import TrackList, TrackRow
 from .window_frame import FramelessWindow
 
 __all__ = [
+    "AccountDialog",
     "CachePage",
     "ElidedLabel",
+    "FavPage",
+    "FavVisibilityDialog",
     "FramelessWindow",
     "HistoryPage",
     "PageSelector",
     "PlaceholderPage",
     "PlayerBar",
+    "PlaylistEntry",
     "QueueDrawer",
     "Sidebar",
     "TaskDialog",

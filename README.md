@@ -35,6 +35,10 @@ uv run python scripts/smoke_test.py --no-play           # 跳过播放,只验数
 # B站接口可用性探测(怀疑接口变动或被限速时先跑这个)
 uv run python scripts/probe_api.py
 
+# 账号链路只读验证(M5 S0):登录态 / 收藏夹接口 / 登录是否提升音质
+# 只读、不落盘、不打印凭据;不带凭据时只出匿名基线
+uv run python scripts/probe_login.py
+
 # 单元测试(不触网)
 uv run python -m unittest discover -s tests -v
 ```
@@ -81,6 +85,7 @@ src/bilibili_music/
 │   ├── history.py     PlayHistory(最近播放:去重、倒序、按上限裁剪)
 │   ├── download_task.py  DownloadTaskStore(批量缓存的任务与进度,跨重启恢复)
 │   ├── queue.py       PlayQueue / PlayMode(队列与播放模式)
+│   ├── session.py     Session / SessionStore(登录凭据的明文 JSON 落盘)
 │   └── config.py      AppConfig / ConfigStore(纯 JSON 落盘)
 ├── net/             网络后端,两者接口一致可互换
 │   ├── base.py        契约(Protocol)、重试策略、限速器、响应校验
@@ -102,13 +107,16 @@ src/bilibili_music/
     └── widgets/       可单独构造、可单独测的控件
         ├── window_frame.py  FramelessWindow(无边框 + 边缘缩放把手)
         ├── title_bar.py     TitleBar(图标 / 搜索框 / 窗口按钮)
-        ├── sidebar.py       Sidebar(导航 + 我的歌单)
+        ├── sidebar.py       Sidebar(导航 + 收藏夹列表 + 刷新/显示隐藏 + 账号入口)
         ├── track_list.py    TrackList(搜索结果与队列共用的曲目列表)
         ├── player_bar.py    PlayerBar(传输控件 / 进度 / 分P / 音质 / 音量)
         ├── page_selector.py PageSelector(分P选择器与它的弹出菜单)
         ├── queue_drawer.py  QueueDrawer(右侧播放队列)
         ├── cache_page.py    CachePage(本地缓存页)
         ├── history_page.py  HistoryPage(最近播放页)
+        ├── fav_page.py      FavPage(收藏夹页:失效条目标灰且点不动)
+        ├── fav_visibility_dialog.py FavVisibilityDialog(挑哪些收藏夹显示在侧栏)
+        ├── account_dialog.py AccountDialog(粘贴 Cookie 登录 / 查看账号 / 登出)
         ├── task_dialog.py   TaskDialog(下载任务:进度 / 暂停 / 继续 / 移除)
         ├── placeholder.py   PlaceholderPage(尚未实现的功能的说明页)
         └── elided_label.py  ElidedLabel(按宽度省略的标签)
@@ -131,10 +139,60 @@ src/bilibili_music/
 | `/x/player/playurl` (`fnval=16`) | DASH 音轨 | `code=0`,返回多条独立音频流 |
 | `/x/web-interface/search/type` | 视频搜索 | `code=0`,**无需 WBI 签名** |
 
-仍需登录 / WBI 签名的能力(本 MVP 未实现):
+仍需登录 / WBI 签名的能力:
 
-- 收藏夹列表与内容(需 `SESSDATA` + WBI 签名 `w_rid`/`wts`)
+- 收藏夹列表与内容:**需要 `SESSDATA`**;是否需要 WBI 签名见下面「账号链路」一节
+  (旧的"需 SESSDATA + WBI 签名"记载已更正)
 - CC 字幕:匿名调用 `/x/player/v2` 时 `subtitles` **恒为空数组**
+
+### 账号链路 S0 结果(2026-09-14,真账号,两轮)
+
+用 `scripts/probe_login.py` 在**真账号**(大会员)上跑完两轮。**最大未知量已经问掉:
+收藏夹接口不需要 WBI 签名** —— 所以按计划要做的 `core/wbi.py` **不做**(除非后续遇到
+别的接口)。
+
+| S0 问题 | 结论 | 对 S1 的影响 |
+|---|---|---|
+| 收藏夹接口要不要 `w_rid`/`wts` | **不需要**。16 个收藏夹列表与内容(20 条/页)**全程不带签名**都拿到了 `code=0` | 砍掉 `core/wbi.py`;但限速与"像浏览器"仍然要做 |
+| 私密收藏夹能不能读 | 能。多数夹子 `attr=22`(私密),`默认收藏夹` 是 `attr=0` | S1 必须显示私密标记,且**不能假设匿名也能看到**(匿名拿到的 `data=null`) |
+| 条目里有没有分P `cid` | **没有**。字段是 `id/type/title/cover/page/duration/upper/attr/bvid/season/...` | 多P条目必须补 `pagelist`(每条一次请求,限速下的主要成本) |
+| `ps` 上限与翻页 | `ps=20` 足额返回 20 条,`has_more=True`,`info.media_count=128` | 分页按 `has_more` 走,别用"空页"判结束 |
+| 条目 `type` 取值 | 本页 20 条**全是 2**(视频);文档里 12=音频、21=合集,两轮都没碰上 | S1 先只处理 `type=2`,`12`/`21` 跳过并标注原因 |
+| 失效条目 | 一页 20 条里 **6 条 `attr≠0`(30%)** | S1 必须把失效条目标灰、禁止点击,否则一点就报错 |
+| `pagelist` 拿分P | 100P 的合集:`条目 page=100` 与 `pagelist` 长度**完全一致**,第 1P 的 `cid` 与自己的 `duration` 都拿到了 | 补 `cid` 这条路可行 |
+| 失效条目怎么认 | `pagelist` 与 `view` **一起失败**:两条分别是 `attr=1` + `view -404`、`attr=9` + `view 62002`;**正常条目 `attr=0` 两边都成功** | **S1 只看条目自带的 `attr` 就能过滤失效条目,零额外请求**;`62002` = 稿件不可见 |
+| 登录能否换来更高音频档位 | **未能观测到增益**:5 条正常视频,匿名与登录都是 `[30216, 30232, 30280]`、`flac/dolby` 全空。**匿名本来就已拿到 30280(常规最高档)**,会员档位(30250 杜比 / 30251 Hi-Res)取决于**稿件本身有没有那条音轨** —— 这 5 条投稿都没有 | **不是 S1 的阻塞项**:登录是收藏夹的前置件,M5 的价值来自"收藏夹当歌单"。要不要支持会员档位归 S2,且先得找到一条真有 Hi-Res/杜比的视频来验 |
+| 登录态风控节奏 | 登录臂 14 次 + 匿名臂 10 次请求,**风控码 0 次**(业务码只有 `-404`/`62002`,属失效条目而非风控) | 小批量安全;S1 逐条补 `pagelist` 时必须继续限速 |
+| `cookie/info` | `refresh=False`(两轮都不需要刷新) | 保鲜机制可以先不做,但要在设置里显示"凭据可能过期" |
+
+**仍未验证**:结论清单里明列的"扫码成功时的凭据形态""扫码轮询的 `86090`""Cookie 保鲜
+三段式"(都排进 S1/S2);以及"登录能否拿到会员音质"—— 这需要一条本身就带 Hi-Res/杜比
+音轨的视频才能定案,用 `scripts/probe_login.py --bvid BV...` 可单独验。
+
+### 账号链路:匿名实测(2026-09-14)
+
+| 探测项 | 2026-09-14 匿名实测 | 设计含义 |
+|---|---|---|
+| `passport.../qrcode/generate` | `code=0`,返回 `url` + `qrcode_key` | 扫码入口不需要登录态 |
+| `.../qrcode/poll` | **外层 `code` 恒为 0**,状态在内层 `data.code`:假 key=`86038 已失效`、真 key 未扫码=`86101 未扫码` | 现有 `check_payload` 只看外层码,扫码逻辑必须单独解析内层 |
+| `/x/v3/fav/folder/created/list-all` | 匿名 `code=0` 但 **`data=null`**(换 5 个 mid 都一样;分页版是 `count=0/list=0`) | **不能靠它判断登录是否失效** —— 它不报错、只静默给空,登录态判定必须用 `nav.isLogin` |
+| `/x/web-interface/nav` | 匿名 `code=-101`,但 `data.wbi_img` 里有密钥 | WBI 密钥不需要登录就能拿 |
+| `playurl` + 伪造 SESSDATA | `code=0`,音轨与匿名完全相同(3 条) | 失效登录态**不会拖垮**匿名链路,可以优雅降级 |
+| `/x/player/playurl` 与 `/x/player/wbi/playurl` | **两条路径都不带 `w_rid`/`wts`** 也返回 `code=0`、3 条音轨 | 至少音频这一路目前没强制 WBI(与文档标注的"playurl 需 Wbi 签名"不一致) |
+| `/x/space/wbi/acc/info`(已知需签名的对照组) | 匿名 `-403`,另一轮变 `-352`;**本地实现签名后仍 `-352`** | **WBI 实现无法在匿名条件下验证**,必须真账号 |
+| `QNetworkCookieJar.toRawForm()` / `parseCookies()` | 往返保真(含 domain/secure/expires),过期 Cookie 会被 jar 拒收 | 登录态持久化**零新依赖**可行,而且天然挡住"复活过期凭据" |
+| PySide6 6.8.3 的二维码能力 | **没有 QR 编码 API**;venv 里也没有 `qrcode` / `segno` / `PIL` | 扫码登录要么新增依赖,要么在 `core/` 手写 QR 编码器 |
+| 主页预热 | 偶尔**不下发** `buvid3`(同一轮里先跑的臂没拿到、后跑的拿到了) | 预热"请求成功"不等于"拿到了 Cookie",诊断要分开判断 |
+
+**关于旧记载的更正**:本节曾写"收藏夹列表与内容(需 `SESSDATA` + WBI 签名 `w_rid`/`wts`)"。
+社区文档口径其实只要求 Cookie(`SESSDATA`),**没有要求 WBI** —— 把文档里全部 198 个 md
+按 `鉴权方式:[Wbi 签名]` grep,命中的是评论、私信、搜索、用户信息、用户空间、playurl、
+AI 总结与直播信息流,**一个收藏夹接口都没有**;真账号实测也确认了这一点。但
+"不需要签名 ≠ 可以随便请求":`-352` 的官方定义是"UA **或** wbi 参数不合法"。
+
+> 社区权威接口文档仓库 `SocialSisterYi/bilibili-API-collect` 已被作者关停(GitHub API
+> 实测 `archived=true`、`default_branch=deprecated`、最后推送 `2026-01-30`)。此后的接口
+> 变更不再有社区权威记录 —— 这也是本节的实测结论必须自己沉淀的原因。
 
 ### 坑 1:`Referer` 是硬性要求,`Origin` 反而要摘掉
 
@@ -384,19 +442,33 @@ CREATE TABLE download_tasks (     -- 「缓存整个合集」的任务,bvid 是�
 - [x] **封面显示**(播放条与列表行,内存缓存,失败静默退回占位图);
       列表封面**一次只取一张**,避免把几十个请求一起甩给 CDN
 - [x] **深色单主题**:近黑底 + B站粉强调色,`QPalette` 与全局样式表一起上(设计稿即深色,不做浅色变体)
-- [x] 音量、播放模式与上次播放位置持久化到配置文件(`%APPDATA%\BiliMusic\config.json`);
-      缓存索引与最近播放放在同目录的 `library.db`(sqlite,标准库)
+- [x] 音量、播放模式、上次播放位置与「我的歌单」里被隐藏的收藏夹持久化到配置文件
+      (`%APPDATA%\BiliMusic\config.json`);缓存索引与最近播放放在同目录的 `library.db`
+      (sqlite,标准库)
 - [x] 两种网络后端可互换(Qt / urllib)
+- [x] **登录(粘贴 Cookie)与收藏夹当歌单**(路线图 M5 S1):侧栏「我的歌单」就是 B站
+      收藏夹(带内容条数;私密夹在页面标题行标出);点一个就列出里面的视频,可过滤、
+      翻页(每页 20 条,显式的「加载更多」按钮)、双击播放、行内入队、右键菜单
+      (播放 / 下一首播放 / 加入队列 / 在B站打开)。**失效条目标灰且点不动**,点了只说原因
+- [x] **收藏夹列表的本地操作**:侧栏「我的歌单」上的「刷新」重新从 B站 取一遍列表
+      (在网页上新建 / 删除收藏夹后本机不会自己知道);「显示/隐藏」打开弹窗勾选哪些
+      收藏夹列进侧栏。隐藏是**纯本机偏好**(只影响本机侧栏,B站 上的收藏夹不会被改),
+      落 `config.json` 的 `fav_hidden_ids`
+- [x] **账号对话框**:从浏览器复制 Cookie 整行即可登录(输入框遮蔽取值、**明示凭据保存
+      路径**、一键登出会删掉凭据文件);启动时恢复上次登录态并用 `nav` 校验一次
 
 ## 尚未实现
 
-- [ ] 登录(扫码 / Cookie 导入)与收藏夹同步为歌单
-- [ ] WBI 签名(`w_rid` + `wts`),收藏夹等接口的前提
+- [ ] **M5 账号能力的剩余部分**:扫码登录(要定二维码方案:加依赖 / 手写 `core/qr.py`)、
+      Cookie 保鲜(三段式,需自己实现 RSA-OAEP)、登录后的会员音质(仍未观测到增益)、
+      收藏夹写回(收藏 / 取消收藏,属写回类操作,不在当前授权内)。
+      分阶段计划见 `docs/ROADMAP.md`;S0 验证脚本 `scripts/probe_login.py`
+- [ ] WBI 签名(`w_rid` + `wts`):真账号实测**不需要**(收藏夹与音频 playurl 都不带签名
+      也能拿到 `code=0`),所以 `core/wbi.py` 没有做
 - [ ] 歌词:目前匿名拿不到 CC 字幕;可考虑从视频弹幕或第三方歌词库补齐
 - [ ] "发现"(音乐区排行榜)页面:侧栏已留入口,点开是占位页
 - [ ] 本地曲库的进阶能力:断点续传(路线图 M2.5,需先实测音频 CDN 是否接受 `Range`)
-- [ ] 歌单(含"喜欢"按钮):侧栏已留分组,点开是占位页
-- [ ] 全屏播放(播放条右下角的按钮当前**禁用**,没有假装能用)
+- [ ] 歌单(含"喜欢"按钮):侧栏已留分组,点开是占位页- [ ] 全屏播放(播放条右下角的按钮当前**禁用**,没有假装能用)
 - [ ] 上次播放位置**续播**:配置里已经在记录,但启动时不会自动接着放
       (开机自动出声比较打扰,要不要做得先定;见 `docs/ROADMAP.md`)
 - [ ] 队列跨重启恢复(当前只记播放模式与位置,不记住队列内容)
@@ -418,6 +490,18 @@ CREATE TABLE download_tasks (     -- 「缓存整个合集」的任务,bvid 是�
 - 请遵守 B站用户协议与相关法律法规,不要高频请求(项目已内置限速)
 - 第三方接口随时可能变更或失效,`scripts/probe_api.py` 可用于快速定位问题
 - 音频版权归原UP主与版权方所有,本项目不存储、不传播任何受版权保护的内容
+- **账号能力(M5)额外风险**:登录态打的是"带真实账号"的非官方接口,风控代价落在**账号**
+  而不是 IP 上(`-352` 风控校验失败 / `-412` 请求被拦截 / `-799` 请求过于频繁 /
+  `-102` 账号被封停都是接口文档里定义过的码)。验证与使用**建议只用小号或可弃账号**;
+  `scripts/probe_login.py` 全程只读、不落盘、不打印凭据取值
+- **凭据以明文保存(用户 2026-09-14 明确选择的方案)**:登录凭据(`SESSDATA` 等)写在
+  `%APPDATA%\BiliMusic\session.json`(与 `config.json` 同目录)。POSIX 下权限收紧到
+  `0o600`,Windows 上 `%APPDATA%` 本身是每用户目录。**任何能读到这个文件的程序都能接管
+  该账号** —— 不打算继续用时请用应用内的"登出"(它会删掉这个文件)。要换成系统加密
+  (如 Windows DPAPI),只需改 `core/session.py` 的 `SessionStore.save/load` 两处
+- **社区权威文档已关停**:`SocialSisterYi/bilibili-API-collect` 自 2026-01-30 起
+  `archived` + `default_branch=deprecated`(GitHub API 实测)。此后接口变更不再有社区
+  权威记录,一切以本仓库「B站接口实测笔记」里的自测结论为准
 
 ---
 

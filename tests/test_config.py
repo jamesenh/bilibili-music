@@ -126,6 +126,32 @@ class TestAppConfig(unittest.TestCase):
         self.assertEqual(original.volume, 999)
         self.assertEqual(original.play_mode, "bogus")
 
+    def test_hidden_folders_default_to_empty(self) -> None:
+        """默认一个收藏夹都不隐藏 —— 全新安装不该凭空藏掉用户的歌单。"""
+        self.assertEqual(AppConfig().fav_hidden_ids, [])
+
+    def test_normalized_cleans_hidden_folders(self) -> None:
+        """手改过的隐藏列表要去重、升序,并逐项丢掉非法值。
+
+        ``media_id`` 从 1 开始(``0`` 是界面里"还没选收藏夹"的哨兵值),所以 ``0`` / 负数
+        都不该被当成隐藏项。
+        """
+        cleaned = AppConfig(fav_hidden_ids=[3, "5", 3, None, -1, 0, "abc", 2]).normalized()
+        self.assertEqual(cleaned.fav_hidden_ids, [2, 3, 5])
+
+    def test_normalized_recovers_from_non_list_hidden_folders(self) -> None:
+        """整个键被改成非数组时退回空列表,而不是让加载流程抛异常。"""
+        for value in ("169038169", 42, None, {"a": 1}):
+            with self.subTest(value=value):
+                self.assertEqual(AppConfig(fav_hidden_ids=value).normalized().fav_hidden_ids, [])
+
+    def test_normalized_returns_a_fresh_hidden_list(self) -> None:
+        """归一化要给出新列表:共享同一个列表会让"改结果"顺手把原对象也改了。"""
+        original = AppConfig(fav_hidden_ids=[3])
+        normalized = original.normalized()
+        normalized.fav_hidden_ids.append(9)
+        self.assertEqual(original.fav_hidden_ids, [3])
+
     def test_normalized_is_idempotent(self) -> None:
         """已合法的配置再收敛一次不应发生变化(保存路径会重复调用它)。"""
         once = AppConfig(volume=999, play_mode="shuffle").normalized()
@@ -169,6 +195,18 @@ class TestConfigStore(_ScratchCase):
         raw = json.loads(store.path.read_text(encoding="utf-8"))
         self.assertEqual(raw["history_limit"], 88)
         self.assertEqual(store.load().history_limit, 88)
+
+    def test_hidden_folders_survive_a_round_trip(self) -> None:
+        """手动隐藏的收藏夹要能落盘并原样读回来。
+
+        它是纯本机偏好(见 ``AppConfig.fav_hidden_ids``):丢了用户就得每次启动重新勾一遍,
+        而这恰恰是"隐藏"这种设置最招人烦的失败方式。
+        """
+        store = self._store()
+        store.save(AppConfig(fav_hidden_ids=[3756, 169038169]))
+        raw = json.loads(store.path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["fav_hidden_ids"], [3756, 169038169])
+        self.assertEqual(store.load().fav_hidden_ids, [3756, 169038169])
 
     def test_save_returns_written_path(self) -> None:
         """保存要返回真正落盘的路径,方便调用方记日志或断言。"""

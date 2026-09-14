@@ -25,6 +25,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QTimer, QUrl
 from PySide6.QtNetwork import (
     QNetworkAccessManager,
+    QNetworkCookie,
     QNetworkCookieJar,
     QNetworkReply,
     QNetworkRequest,
@@ -45,6 +46,7 @@ from ..core.http import (
     RETRYABLE_STATUS,
 )
 from .base import (
+    BILI_COOKIE_DOMAIN,
     DownloadHandle,
     ErrorCallback,
     FetchHandle,
@@ -54,6 +56,7 @@ from .base import (
     SuccessCallback,
     backoff_delay,
     check_payload,
+    is_blank_cookie,
 )
 
 #: ``QNetworkRequest`` 上取 HTTP 状态码 / 原因短语的两个属性。
@@ -146,6 +149,71 @@ class QtNetworkClient(QObject):
             return []
         cookies = jar.cookiesForUrl(QUrl(HOME))
         return sorted({bytes(c.name()).decode("utf-8", "replace") for c in cookies})
+
+    def session_cookies(self) -> dict[str, str]:
+        """导出 B站 作用域下的会话 Cookie(名字→取值)。
+
+        只取 B站 域的 Cookie:把别的站点凭据混进会话文件既无意义、又多一份泄露面。
+        刻意不带 expires —— 过期由服务端判定,见 ``core/session.py`` 的说明。
+
+        Returns:
+            名字到取值的映射;没有 jar 或没有 Cookie 时是空字典。
+
+        Note:
+            返回值含凭据取值,禁止打印或写日志(``AGENTS.md`` 第 5 节第 10 条)。
+        """
+        jar = self._manager.cookieJar()
+        if jar is None:
+            return {}
+        exported: dict[str, str] = {}
+        for cookie in jar.allCookies():
+            domain = cookie.domain() or ""
+            if not domain.endswith("bilibili.com"):
+                continue
+            name = bytes(cookie.name()).decode("utf-8", "replace")
+            value = bytes(cookie.value()).decode("utf-8", "replace")
+            if not is_blank_cookie(name, value):
+                exported[name] = value
+        return exported
+
+    def set_session_cookies(self, cookies: dict[str, str]) -> None:
+        """把一份会话 Cookie 灌进 jar(合并,不覆盖匿名预热拿到的 buvid)。
+
+        域固定 ``.bilibili.com`` / 路径 ``/`` / ``secure``:与浏览器对这些字段的下发
+        方式一致,也正是 :meth:`session_cookies` 的过滤口径,两边必须成对。
+
+        Args:
+            cookies: 名字到取值的映射;空字典是合法的空操作。
+        """
+        jar = self._manager.cookieJar()
+        if jar is None or not cookies:
+            return
+        items: list[QNetworkCookie] = []
+        for name, value in cookies.items():
+            if is_blank_cookie(name, value):
+                continue
+            cookie = QNetworkCookie(name.encode("utf-8"), value.encode("utf-8"))
+            cookie.setDomain(BILI_COOKIE_DOMAIN)
+            cookie.setPath("/")
+            cookie.setSecure(True)
+            items.append(cookie)
+        if items:
+            # 用 HOME 作为"来源 URL":jar 只接受域与它匹配的 Cookie,而 HOME 正是预热
+            # 用的那个来源,少引入一个变量
+            jar.setCookiesFromUrl(items, QUrl(HOME))
+
+    def clear_session_cookies(self) -> None:
+        """清掉 jar 里所有 B站 域的 Cookie(登出用)。
+
+        ``QNetworkCookieJar.deleteCookie`` 只删"域 + 路径 + 名字"完全一致的那一条,
+        所以逐个遍历再删,而不是指望有什么批量接口。
+        """
+        jar = self._manager.cookieJar()
+        if jar is None:
+            return
+        for cookie in jar.allCookies():
+            if (cookie.domain() or "").endswith("bilibili.com"):
+                jar.deleteCookie(cookie)
 
     def warm_up(self, *, force: bool = False) -> None:
         """预热会话:访问主页,让 ``QNetworkCookieJar`` 收下 ``buvid3`` / ``b_nut``。

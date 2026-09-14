@@ -23,10 +23,26 @@
 分P都是一首独立的歌,所以换分P既不改队列,也不在搜索结果列表里 —— 它显示当前正在播
 那个视频的分P,选中的目标交给 ``audio.playback`` 走既有的播放切换流程。
 
-侧栏入口里"发现"与"我的歌单"对应的功能分别属于路线图 M3 / M5,当前还没有实现 ——
-点开是一张把话说清楚的占位页,而不是点了没反应(见
-:class:`~bilibili_music.ui.widgets.placeholder.PlaceholderPage`)。"播放队列"不是页面入口,
-它是右侧队列面板的开关,只有播放条上那一个按钮(见 ``PlayerBar.queue_button``)。
+侧栏入口里"发现"还没有对应功能(路线图 M3)—— 点开是一张把话说清楚的占位页,而不是点了
+没反应(见 :class:`~bilibili_music.ui.widgets.placeholder.PlaceholderPage`)。"播放队列"不是
+页面入口,它是右侧队列面板的开关,只有播放条上那一个按钮(见 ``PlayerBar.queue_button``)。
+
+**"我的歌单"就是 B站 收藏夹(路线图 M5 S1)**:登录后把收藏夹列表填进侧栏
+(:meth:`MainWindow._on_folders`),点一个就在内容区打开收藏夹页
+(:class:`~bilibili_music.ui.widgets.fav_page.FavPage`)。登录态**只认** ``nav`` 的
+``isLogin``:收藏夹接口在未登录时也返回 ``code=0``(只是 ``data`` 是 ``null``),
+拿它判断会得到假阳性(见 README「账号链路」)。
+
+收藏夹列表还带两个本地操作(侧栏「我的歌单」那两行按钮,见
+:class:`~bilibili_music.ui.widgets.sidebar.Sidebar`):**「刷新」**重新从B站取一遍列表
+(:meth:`MainWindow._on_refresh_playlists`)—— 列表是服务端的东西,在网页上新建 / 删除
+之后本机不会自己知道;**「显示/隐藏」**打开
+:class:`~bilibili_music.ui.widgets.fav_visibility_dialog.FavVisibilityDialog`,挑哪些夹子
+出现在侧栏(:meth:`MainWindow._open_fav_visibility_dialog`)。后者是**纯本机偏好**,落
+``config.json`` 的 ``fav_hidden_ids``,B站 上的收藏夹一个都不会动 —— 界面上也这么写,
+免得用户以为自己在删东西。两条纪律与别的异步请求一致:刷新期间禁按钮挡连点(每次刷新
+都是真请求,风控口径见 README「坑 3」)、用 ``_folders_token`` 让迟到的列表响应作废
+(否则"刷新完再登出"会被一份旧列表把侧栏重新填满)。
 
 **"本地缓存"页(路线图 M2.2)是真的**:它列出 ``AudioCache`` 索引里的已缓存音轨,
 支持过滤、离线点播与删除;这一页的数据来自索引(见 ``core/cache_index.py``),而
@@ -44,20 +60,23 @@
 "用户快到底了"。
 
 依赖以参数注入的只有"可替换的外部资源"(客户端 / 音频缓存 / 封面缓存 / 配置 / 编排器 /
-本地库):默认全部走真实实现,测试可以塞替身进来,于是界面接线能被自动化验证,
+本地库 / 会话存储):默认全部走真实实现,测试可以塞替身进来,于是界面接线能被自动化验证,
 而不是只能靠肉眼点。**本地库必须与缓存一起注入同一个实例** —— 两者写的是同一个库文件,
 各建一个连接虽然也能跑,但测试里一个漏注入就会写到用户真实的配置目录。
+**会话存储也必须显式注入**:它的默认路径是用户真实的配置目录,漏注入的用例会把凭据写到
+真实用户身上。
 """
 
 from __future__ import annotations
 
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
-from PySide6.QtCore import QEvent, Qt, QUrl
+from PySide6.QtCore import QEvent, Qt, QUrl, Slot
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QHBoxLayout,
     QLabel,
     QMenu,
@@ -69,7 +88,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..api.bilibili import BilibiliClient, SearchResult
+from ..api.bilibili import (
+    FAV_ITEM_TYPE_VIDEO,
+    AccountInfo,
+    BilibiliClient,
+    FavFolder,
+    FavItem,
+    SearchResult,
+)
+
+#: ``api`` 里那个"一页收藏夹内容"的数据类,与 ``ui.widgets.FavPage``(页面控件)**重名**。
+#: 这里显式改名导入,免得两个 ``FavPage`` 在同一个文件里互相遮蔽 —— 那种错误在
+#: "看起来能用、只是参数类型不对"的表象下极难查。
+from ..api.bilibili import FavPage as FavPageData
 from ..audio.downloader import Downloader
 from ..audio.playback import PlaybackController
 from ..audio.player import PlayerController
@@ -81,18 +112,30 @@ from ..core.cover_cache import CoverCache
 from ..core.download_task import DownloadTaskStore
 from ..core.history import HistoryEntry, PlayHistory, history_entry_for
 from ..core.library_db import LibraryDb
-from ..core.models import Page, PlayableEntry, Video, format_count, format_size
+from ..core.models import (
+    Page,
+    PlayableEntry,
+    Video,
+    format_count,
+    format_size,
+    video_web_url,
+)
 from ..core.queue import QueueItem
+from ..core.session import Session, SessionStore, parse_cookie_header, session_from_cookies
 from ..net.base import FetchHandle
 from .cover_loader import CoverLoader
 from .icons import app_icon_path
 from .theme import apply_theme
 from .widgets import (
+    AccountDialog,
     CachePage,
+    FavPage,
+    FavVisibilityDialog,
     FramelessWindow,
     HistoryPage,
     PlaceholderPage,
     PlayerBar,
+    PlaylistEntry,
     QueueDrawer,
     Sidebar,
     TaskDialog,
@@ -100,6 +143,7 @@ from .widgets import (
     TrackList,
     TrackRow,
 )
+from .widgets.sidebar import EMPTY_PLAYLIST_HINT
 from .widgets.track_list import split_title_prefix
 
 __all__ = ["MainWindow", "run"]
@@ -132,7 +176,10 @@ _PLACEHOLDER_PAGES: dict[str, tuple[str, str]] = {
 }
 
 #: 歌单相关入口的占位说明。
-_PLAYLIST_HINT = "歌单功能还没实现(路线图 M5,当前冻结)"
+#:
+#: 只剩"新建歌单":真正的歌单(收藏夹)已经能用了,而"在 B站 里新建一个收藏夹"属于写回类
+#: 账号操作,不在 M5 的授权范围内(``AGENTS.md`` 1.4)。
+_NEW_PLAYLIST_HINT = "新建收藏夹属于写回类账号操作,当前版本不做(见 AGENTS.md 1.4)"
 
 
 class MainWindow(FramelessWindow):
@@ -163,6 +210,7 @@ class MainWindow(FramelessWindow):
         playback: PlaybackController | None = None,
         downloader: Downloader | None = None,
         library: LibraryDb | None = None,
+        session_store: SessionStore | None = None,
     ) -> None:
         """建依赖、建界面、接线,并套用配置。
 
@@ -174,6 +222,8 @@ class MainWindow(FramelessWindow):
             playback: 播放编排器。
             downloader: 批量缓存的调度器。
             library: 本地库。
+            session_store: 登录凭据的读写;``None`` 表示用平台默认路径
+                (测试**必须**注入沙箱路径,否则会动到真实用户的凭据)。
         """
         super().__init__()
         self.setWindowTitle("BiliMusic")
@@ -193,6 +243,8 @@ class MainWindow(FramelessWindow):
             cover_cache if cover_cache is not None else CoverCache()
         )
         self.config_store = config_store if config_store is not None else ConfigStore()
+        #: 登录凭据的读写。**默认值是用户真实的配置目录** —— 测试必须注入沙箱路径
+        self.sessions = session_store if session_store is not None else SessionStore()
         self.playback = (
             playback
             if playback is not None
@@ -259,15 +311,52 @@ class MainWindow(FramelessWindow):
         self.history_covers = CoverLoader(
             self.client.fetch_cover, cache=self.cover_cache
         )
+        self.fav_covers = CoverLoader(
+            self.client.fetch_cover, cache=self.cover_cache
+        )
+
+        # ---------------------------------------------------------- 账号与收藏夹
+        #: 当前登录账号;``None`` 表示未登录(或凭据还没校验完)。**只由 nav 的结果写**,
+        #: 别处不得凭"收藏夹接口没报错"就断定已登录
+        self._account: AccountInfo | None = None
+        #: 当前收藏夹列表(接口返回顺序)
+        self._folders: list[FavFolder] = []
+        #: 当前打开的收藏夹 id;``0`` 表示还没选
+        self._fav_media_id = 0
+        #: 已加载到第几页(第 1 页记 1);0 表示一条都没加载
+        self._fav_page_no = 0
+        #: 是否有收藏夹内容请求在飞(挡住重复点"加载更多")
+        self._fav_loading = False
+        #: 请求序号:切收藏夹会让在飞的旧请求作废,否则旧响应会追加进新收藏夹的列表里
+        self._fav_token = 0
+        #: 在飞的收藏夹内容请求句柄(切换时取消)
+        self._fav_handle: FetchHandle | None = None
+        #: 被用户手动隐藏的收藏夹 id(``config.json`` 的 ``fav_hidden_ids``)。
+        #: 只影响侧栏列不列出来,不改 B站 上的任何东西
+        self._hidden_fav_ids: set[int] = set(self._config.fav_hidden_ids)
+        #: 收藏夹**列表**是否有请求在飞(挡住连点「刷新」:每次刷新都是真请求)
+        self._folders_loading = False
+        #: 列表请求序号。与内容分页的 ``_fav_token`` **分开**:一次刷新与一次翻页互不相干,
+        #: 共用序号会让其中一个把另一个误判成过期响应
+        self._folders_token = 0
+        #: 收藏夹「显示 / 隐藏」对话框。**每次打开重建**:列表会随刷新与换账号而变,复用
+        #: 一个旧对话框就要处理"控件对不上数据"的一堆边界;它里面也没有凭据那类必须
+        #: 只留一份的东西(与 ``account_dialog`` 的取舍不同)
+        self.visibility_dialog: FavVisibilityDialog | None = None
 
         self._build_ui()
         #: 下载任务对话框。**懒建、只建一个**:非模态窗口关掉只是隐藏,
         #: 再点"下载任务"应该看到同一条列表,而不是又开一个窗
         self.task_dialog: TaskDialog | None = None
+        #: 账号对话框。同样懒建、只建一个:它承载输入框里的凭据,重复建会在内存里
+        #: 留下多份副本
+        self.account_dialog: AccountDialog | None = None
         self._connect()
         self._apply_config()
         # 启动时先把任务角标刷对(上次没下完的任务还在库里等着)
         self.cache_page.set_task_summary(self.downloader.active_count())
+        # 恢复上次的登录态(有凭据才发请求;没有就什么都不做)
+        self._restore_session()
 
     # ------------------------------------------------------------ 构建界面
 
@@ -292,10 +381,12 @@ class MainWindow(FramelessWindow):
         self.results_page = self._build_results_page()
         self.cache_page = CachePage(self.cache_covers)
         self.history_page = HistoryPage(self.history_covers)
+        self.fav_page = FavPage(self.fav_covers)
         self.placeholder_page = PlaceholderPage()
         self.pages.addWidget(self.results_page)
         self.pages.addWidget(self.cache_page)
         self.pages.addWidget(self.history_page)
+        self.pages.addWidget(self.fav_page)
         self.pages.addWidget(self.placeholder_page)
         body.addWidget(self.pages, 1)
 
@@ -419,7 +510,10 @@ class MainWindow(FramelessWindow):
 
         self.sidebar.nav_selected.connect(self._on_nav_selected)
         self.sidebar.playlist_selected.connect(self._on_playlist_selected)
+        self.sidebar.refresh_playlists_requested.connect(self._on_refresh_playlists)
+        self.sidebar.manage_playlists_requested.connect(self._open_fav_visibility_dialog)
         self.sidebar.create_playlist_requested.connect(self._on_create_playlist)
+        self.sidebar.account_requested.connect(self._open_account_dialog)
 
         self.cache_page.row_activated.connect(self._on_cache_activated)
         self.cache_page.row_menu_requested.connect(self._on_cache_menu)
@@ -439,11 +533,18 @@ class MainWindow(FramelessWindow):
         self.history_page.remove_requested.connect(self._on_history_remove)
         self.history_page.clear_requested.connect(self._on_history_clear)
 
+        self.fav_page.row_activated.connect(self._on_fav_activated)
+        self.fav_page.row_menu_requested.connect(self._on_fav_menu)
+        self.fav_page.add_requested.connect(self._on_fav_add)
+        self.fav_page.load_more_requested.connect(self._on_fav_load_more)
+        self.fav_page.unplayable_requested.connect(self.status_label.setText)
+
         self.cover_loader.loaded.connect(self._on_cover_loaded)
         self.cover_loader.failed.connect(self._on_cover_failed)
         self.list_covers.loaded.connect(self.result_list.set_cover)
         self.queue_covers.loaded.connect(self.queue_drawer.set_cover)
         self.cache_covers.loaded.connect(self.cache_page.set_cover)
+        self.fav_covers.loaded.connect(self.fav_page.set_cover)
         self.history_covers.loaded.connect(self.history_page.set_cover)
 
     def _apply_window_icon(self) -> None:
@@ -703,6 +804,512 @@ class MainWindow(FramelessWindow):
         elif chosen is open_action:
             QDesktopServices.openUrl(QUrl(video.web_url))
 
+    # ------------------------------------------------------------ 账号与收藏夹
+
+    def _open_account_dialog(self) -> None:
+        """打开账号对话框。
+
+        懒建且只建一个:对话框里放着用户粘贴的凭据,重复建会在内存里留下多份副本;
+        每次打开都按**当前**登录态刷一遍面板,而不是让对话框自己记状态。
+        """
+        if self.account_dialog is None:
+            self.account_dialog = AccountDialog(self.sessions.path, self)
+            self.account_dialog.login_requested.connect(self._on_login_requested)
+            self.account_dialog.logout_requested.connect(self._on_logout_requested)
+        account = self._account
+        self.account_dialog.set_account(
+            account.uname if account is not None else "",
+            account.mid if account is not None else 0,
+        )
+        self.account_dialog.show()
+        self.account_dialog.raise_()
+
+    def _restore_session(self) -> None:
+        """启动时恢复上次保存的登录态。
+
+        **没有凭据就什么都不做**(不发请求、不碰网络)。有凭据时先注入网络层,再用
+        ``nav`` 问一次服务端"它还有效吗" —— 启动时多一次请求是值得的:不然界面会拿着
+        一份早就失效的凭据显示"已登录",用户点开收藏夹却什么都没有。
+        """
+        session = self.sessions.load()
+        if session is None:
+            return
+        self.client.backend.set_session_cookies(session.cookies)
+        # 先用本地记住的昵称把界面点亮(离线启动也能看到"上次登录的是谁"),随后用 nav 校正
+        self.sidebar.set_account(session.uname)
+        self._verify_session(session)
+
+    def _verify_session(self, session: Session) -> None:
+        """用 ``nav`` 校验一份凭据,并按结果落盘或清理。
+
+        Args:
+            session: 要校验的凭据(已经注入网络层)。
+        """
+
+        def on_success(info: AccountInfo) -> None:
+            """服务端回话了:认就保存并展开收藏夹,不认就清干净。"""
+            if not info.is_login:
+                self._drop_session("登录凭据已失效,请重新登录")
+                return
+            stored = session_from_cookies(session.cookies, uname=info.uname, mid=info.mid)
+            try:
+                self.sessions.save(stored)
+            except OSError as exc:
+                # 落盘失败不算登录失败:这一次会话照样能用,只是下次启动要重新粘贴
+                self._fail(f"登录成功,但凭据没能保存到磁盘:{exc}")
+            self._apply_account(info)
+
+        def on_error(exc: Exception) -> None:
+            """请求失败:这**不是**凭据失效,绝不删凭据。"""
+            self.status_label.setText(f"登录态暂时没校验成功(网络问题):{exc}")
+
+        self.client.fetch_nav(on_success=on_success, on_error=on_error)
+
+    def _on_login_requested(self, raw_cookie: str) -> None:
+        """用户粘贴了 Cookie 并点了登录。
+
+        **校验通过才落盘**:先把凭据注入网络层问一次 ``nav``,服务端认了再写文件 ——
+        否则一次粘错就会把原来好用的凭据覆盖掉,而且用户下次启动还得再踩一次。
+
+        Args:
+            raw_cookie: 粘贴的 Cookie 头原文。
+        """
+        cookies = parse_cookie_header(raw_cookie)
+        self.client.backend.set_session_cookies(cookies)
+
+        def on_success(info: AccountInfo) -> None:
+            """服务端回话了。"""
+            if not info.is_login:
+                # 粘进来的凭据不管用:把它从 jar 里撤掉,别让它继续跟着每个请求发出去
+                self.client.backend.clear_session_cookies()
+                self.client.backend.warm_up(force=True)
+                if self.account_dialog is not None:
+                    self.account_dialog.set_error("这个凭据登录不了,请重新复制一份 Cookie")
+                return
+            self._apply_account(info)
+            try:
+                self.sessions.save(
+                    session_from_cookies(cookies, uname=info.uname, mid=info.mid)
+                )
+            except OSError as exc:
+                self._fail(f"登录成功,但凭据没能保存到磁盘:{exc}")
+                return
+            if self.account_dialog is not None:
+                self.account_dialog.set_account(info.uname, info.mid)
+            self.status_label.setText(f"已登录:{info.uname}")
+
+        def on_error(exc: Exception) -> None:
+            """请求本身失败了(网络 / 风控):如实说,不写文件。"""
+            if self.account_dialog is not None:
+                self.account_dialog.set_error(f"校验登录态失败:{exc}")
+
+        self.client.fetch_nav(on_success=on_success, on_error=on_error)
+
+    def _on_logout_requested(self) -> None:
+        """用户点了登出:删凭据文件 + 把网络层里的凭据也清掉。
+
+        两步缺一不可:只删文件的话,SESSDATA 还在内存的 jar 里,后续请求照样是登录态
+        用户以为登出了,其实没有。清完 jar 还要 ``warm_up(force=True)`` —— 那一步会把
+        匿名 Cookie(``buvid3`` / ``b_nut``)一起清掉,而 ``warm_up()`` 默认不会重复预热,
+        不强制补一次的话后续请求更容易被风控(README「坑 3」)。
+        """
+        removed = self.sessions.clear()
+        self.client.backend.clear_session_cookies()
+        self.client.backend.warm_up(force=True)
+        self._apply_account(None)
+        if self.account_dialog is not None:
+            self.account_dialog.set_account("", 0)
+        self.status_label.setText("已登出" + ("(本机凭据文件已删除)" if removed else ""))
+
+    def _drop_session(self, message: str) -> None:
+        """凭据被服务端拒了:清内存 + 清文件 + 把界面退回未登录。
+
+        Args:
+            message: 给用户看的中文原因。
+        """
+        self.client.backend.clear_session_cookies()
+        self.client.backend.warm_up(force=True)
+        self.sessions.clear()
+        self._apply_account(None)
+        if self.account_dialog is not None:
+            self.account_dialog.set_error(message)
+        else:
+            self.status_label.setText(message)
+
+    def _apply_account(self, info: AccountInfo | None) -> None:
+        """把登录态推给界面;已登录时顺带拉一遍收藏夹列表。
+
+        Args:
+            info: ``nav`` 的结果;``None``(或 ``is_login`` 为假)表示未登录。
+        """
+        self._account = info if (info is not None and info.is_login) else None
+        self.sidebar.set_playlist_actions_enabled(self._account is not None)
+        if self._account is None:
+            self.sidebar.set_account("")
+            # 登出 / 凭据失效时把在飞的列表请求作废:否则它回来时会按"还登录着"的口径
+            # 把侧栏重新填满(用户都已经登出了,那一排夹子却还在)
+            self._folders_token += 1
+            self._folders_loading = False
+            self.sidebar.set_refresh_busy(False)
+            self._folders = []
+            self.sidebar.set_playlists((), empty_hint=EMPTY_PLAYLIST_HINT)
+            self._fav_media_id = 0
+            self._fav_page_no = 0
+            self.fav_page.set_folder("")
+            self.fav_page.set_items([])
+            self.fav_page.set_has_more(False)
+            return
+        self.sidebar.set_account(self._account.uname)
+        if self.account_dialog is not None:
+            self.account_dialog.set_account(self._account.uname, self._account.mid)
+        self._refresh_folders()
+
+    def _refresh_folders(self) -> None:
+        """(重新)取一遍"我创建的收藏夹"并填进侧栏。
+
+        登录、启动恢复与「刷新」按钮都走这里。``_folders_loading`` 挡连点:这个接口也是
+        一次真实请求,连点两下就是两次(风控口径见 README「坑 3」)。
+
+        响应回来前先自增 ``_folders_token``:登出或又刷新一次之后,这份列表就过期了,
+        迟到的响应必须丢掉(与切收藏夹时的 ``_fav_token`` 同一类防护)。
+        """
+        if self._account is None or self._folders_loading:
+            return
+        self._folders_loading = True
+        self._folders_token += 1
+        token = self._folders_token
+        self.sidebar.set_refresh_busy(True)
+        self.client.fetch_fav_folders(
+            self._account.mid,
+            on_success=lambda folders: self._on_folders(folders, token),
+            on_error=lambda exc: self._on_folders_failed(exc, token),
+        )
+
+    def _on_folders(self, folders: list[FavFolder], token: int) -> None:
+        """收藏夹列表回来了:过掉"被隐藏"的那一层,再换成侧栏条目。
+
+        Args:
+            folders: 接口返回的收藏夹(可能是空列表)。
+            token: 请求序号;与当前序号对不上说明这次列表已经过期,直接丢弃。
+        """
+        if token != self._folders_token:
+            return
+        self._folders_loading = False
+        self.sidebar.set_refresh_busy(False)
+        self._folders = list(folders)
+        self._render_playlists()
+        if not self._folders and self._account is not None:
+            self.status_label.setText(f"账号「{self._account.uname}」下没有收藏夹")
+            return
+        if self.status_label.text().startswith(("登录态暂时", "账号「")):
+            self.status_label.setText("")
+
+    def _on_folders_failed(self, exc: Exception, token: int) -> None:
+        """收藏夹列表没取到:如实说,并保住手里已有的那份列表。
+
+        **不把侧栏清空**:这个失败很可能来自一次手动「刷新」(网络抖一下、撞上 412),
+        把用户正看着的列表擦掉换一句报错,比报错本身更糟。真正的"没有列表"只出现在
+        登录后的第一次请求上,那时侧栏本来就是空的。
+
+        Args:
+            exc: 失败原因。
+            token: 请求序号;过期响应直接丢弃。
+        """
+        if token != self._folders_token:
+            return
+        self._folders_loading = False
+        self.sidebar.set_refresh_busy(False)
+        self.status_label.setText(f"收藏夹列表没取到:{exc}")
+
+    def _playlist_empty_hint(self) -> str:
+        """侧栏一个歌单都不显示时,那句说明该写什么。
+
+        三种空态必须分得清,否则用户会以为"登录丢了"或者"我的收藏夹没了":
+
+        * 未登录 —— 说清楚登录之后才会有;
+        * 登录了但账号下一个夹子都没有 —— 如实说,而不是继续提示去登录;
+        * 有夹子但全被隐藏 —— 告诉他去哪恢复(隐藏是本机设置,不是数据没了)。
+
+        Returns:
+            给侧栏 ``set_playlists(empty_hint=...)`` 用的中文文案。
+        """
+        if self._account is None:
+            return EMPTY_PLAYLIST_HINT
+        if not self._folders:
+            return "这个账号下还没有收藏夹"
+        return "收藏夹都被隐藏了,点上面的「显示/隐藏」可以放出来"
+
+    def _render_playlists(self) -> None:
+        """按"当前收藏夹列表 + 隐藏集合"重建侧栏「我的歌单」。
+
+        隐藏只在这里生效(侧栏列不列出来):正在打开的收藏夹页不被抽走 —— 用户隐藏的可能
+        正是他在听的那个夹子,把内容页一起关掉比留着更打扰。
+        """
+        visible = [
+            folder
+            for folder in self._folders
+            if folder.media_id not in self._hidden_fav_ids
+        ]
+        self.sidebar.set_playlists(
+            [self._entry_of(folder) for folder in visible],
+            empty_hint=self._playlist_empty_hint(),
+        )
+
+    def _on_refresh_playlists(self) -> None:
+        """点了「刷新」:重新取一遍收藏夹列表。
+
+        没有任何缓存可复用 —— 每次都是真请求,这正是这个按钮存在的意义(在 B站 网页上
+        新建 / 删除了收藏夹,本机要能看见变化)。正在刷新时 :meth:`_refresh_folders`
+        会直接返回,按钮也已经被禁掉。
+        """
+        if self._account is None:
+            self.status_label.setText("还没登录,先点侧栏的账号按钮登录")
+            return
+        self.status_label.setText("正在刷新收藏夹列表…")
+        self._refresh_folders()
+
+    def _open_fav_visibility_dialog(self) -> None:
+        """打开「显示 / 隐藏收藏夹」弹窗,确定后落盘并重建侧栏。
+
+        弹窗只负责收集勾选,写配置与重画侧栏由 :meth:`_set_hidden_folders` 做 —— 与
+        ``AccountDialog`` 同一条纪律(``AGENTS.md`` 第 4 节)。
+        """
+        if self._account is None:
+            self.status_label.setText("还没登录,先点侧栏的账号按钮登录")
+            return
+        if not self._folders:
+            self.status_label.setText("还没取到收藏夹列表,先点「刷新」取一遍")
+            return
+        dialog = FavVisibilityDialog(
+            self._playlist_entries(), self._hidden_fav_ids, self
+        )
+        # 只建一个引用并挂到 self 上:模态对话框在 exec() 期间必须活着,而这里还要让
+        # 测试能拿到它(与 account_dialog / task_dialog 同一口径)
+        self.visibility_dialog = dialog
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            self._set_hidden_folders(dialog.hidden_media_ids())
+        finally:
+            self.visibility_dialog = None
+
+    def _playlist_entries(self) -> list[PlaylistEntry]:
+        """把接口给的收藏夹翻成侧栏 / 弹窗都认的展示结构。
+
+        两处共用同一份转换(而不是各写一遍):弹窗里的勾选项必须与侧栏里的按钮一一对应,
+        条数与私密记号少了一个都会让用户在两边看到不一样的东西。
+        """
+        return [self._entry_of(folder) for folder in self._folders]
+
+    @staticmethod
+    def _entry_of(folder: FavFolder) -> PlaylistEntry:
+        """把一条收藏夹元信息摊成侧栏条目。
+
+        Args:
+            folder: 接口返回的收藏夹。
+
+        Returns:
+            侧栏与「显示/隐藏」弹窗共用的展示数据。
+        """
+        return PlaylistEntry(
+            media_id=folder.media_id,
+            title=folder.title,
+            media_count=folder.media_count,
+            is_private=folder.is_private,
+        )
+
+    def _set_hidden_folders(self, media_ids: Sequence[int]) -> None:
+        """保存用户勾掉的收藏夹,并重建侧栏。
+
+        只落配置 + 重画侧栏:正在打开的收藏夹页**不动** —— 用户隐藏的可能正是他在听的
+        那个夹子,把内容页抽走比留着更打扰。
+
+        Args:
+            media_ids: 用户选择隐藏的 ``media_id``(弹窗返回的那一份)。
+        """
+        hidden: set[int] = set()
+        for raw in media_ids:
+            media_id = int(raw)
+            if media_id > 0:
+                hidden.add(media_id)
+        self._hidden_fav_ids = hidden
+        # 写的是排序后的列表:``ConfigStore.save`` 还会再收敛一次(非法值不落盘),这里
+        # 排好序只是让"配置文件里那一行长什么样"稳定可读
+        self._config.fav_hidden_ids = sorted(hidden)
+        self._save_config()
+        self._render_playlists()
+        count = len(hidden)
+        if count:
+            self.status_label.setText(f"已隐藏 {count} 个收藏夹(只影响侧栏显示)")
+        else:
+            self.status_label.setText("已显示全部收藏夹")
+
+    def _load_fav_page(self, page_no: int, *, append: bool) -> None:
+        """取某个收藏夹的一页内容。
+
+        切夹子 / 翻页都走这里,并用 ``_fav_token`` 让"已经过时的响应"作废 —— 否则
+        128 条的收藏夹还没回来、用户已经点了另一个夹子,旧响应会追加进新夹子的列表。
+
+        Args:
+            page_no: 页码,从 1 开始。
+            append: 为真时追加到列表末尾(翻页),否则整体替换(切夹子)。
+        """
+        if not self._fav_media_id:
+            return
+        self._fav_token += 1
+        token = self._fav_token
+        if self._fav_handle is not None:
+            self._fav_handle.cancel()
+        self._fav_loading = True
+        self.fav_page.set_loading(True)
+
+        def on_success(page: FavPageData) -> None:
+            """响应到达:先确认它还是"当前这一次"的响应。"""
+            if token != self._fav_token:
+                return
+            self._fav_handle = None
+            self._fav_loading = False
+            if append:
+                self.fav_page.append_items(page.items)
+            else:
+                self.fav_page.set_items(page.items)
+            self._fav_page_no = page_no
+            self.fav_page.set_has_more(page.has_more)
+            self.fav_page.set_loading(False)
+            if not page.has_more:
+                self.status_label.setText("")
+
+        def on_error(exc: Exception) -> None:
+            """失败:留在当前页,给一个能再点的出口(页脚按钮还在)。"""
+            if token != self._fav_token:
+                return
+            self._fav_handle = None
+            self._fav_loading = False
+            self.fav_page.set_failed(f"加载收藏夹失败:{exc}")
+
+        self._fav_handle = self.client.fetch_fav_page(
+            self._fav_media_id,
+            page=page_no,
+            on_success=on_success,
+            on_error=on_error,
+        )
+
+    def _on_fav_load_more(self) -> None:
+        """点了"加载更多":取下一页并追加。"""
+        if not self._fav_media_id or self._fav_loading:
+            return
+        self._load_fav_page(self._fav_page_no + 1, append=True)
+
+    def _with_video(self, bvid: str, on_ready: Callable[[Video], None]) -> None:
+        """先补一次详情,拿到 ``pages`` 之后再执行动作。
+
+        收藏夹条目**没有 ``cid``**(实测只有分P数量),所以"播放 / 加入队列"这些需要
+        ``Video`` 的动作都得先补一次 ``view``。命中详情缓存时 ``fetch_video`` 是同步回调的,
+        所以调用方不要假定回调发生在方法返回之后。
+
+        Args:
+            bvid: 目标视频 BV 号。
+            on_ready: 详情到手后的回调。
+        """
+
+        def on_success(video: Video) -> None:
+            """详情到手。"""
+            on_ready(video)
+
+        def on_error(exc: Exception) -> None:
+            """拿不到详情:说清是哪一条失败,不动队列。"""
+            self.status_label.setText(f"取视频详情失败({bvid}):{exc}")
+
+        self.client.fetch_video(bvid, on_success=on_success, on_error=on_error)
+
+    def _on_fav_activated(self, row: int) -> None:
+        """双击收藏夹里的一条:补详情后**只播这一条**。
+
+        这里与搜索结果 / 缓存页的"整列变成队列"**故意不同**:那些页面的条目手上就有
+        ``Video``(搜索结果有详情缓存的可能、缓存页能从索引重建),而收藏夹条目要变成队列
+        就得为每一条各发一次 ``view`` —— 一页 20 条就是 20 次请求,还都在限速下排队。
+        多P合集内部仍然会自动往下播(那是播放层的事),所以听歌体验不受影响。
+
+        Args:
+            row: 行号(以过滤后的列表为准)。
+        """
+        item = self.fav_page.entry_at(row)
+        if item is None or not item.is_playable:
+            return
+        self._with_video(
+            item.bvid,
+            lambda video: self.playback.play_queue([QueueItem(video=video)], start=0),
+        )
+
+    def _on_fav_add(self, row: int) -> None:
+        """点行内"+":补详情后加到队列末尾。
+
+        Args:
+            row: 行号(以过滤后的列表为准)。
+        """
+        item = self.fav_page.entry_at(row)
+        if item is None or not item.is_playable:
+            return
+
+        def ready(video: Video) -> None:
+            """详情到手:入队并提示。"""
+            self.playback.enqueue(QueueItem(video=video))
+            self.status_label.setText(f"已加入播放队列:{video.title}")
+
+        self._with_video(item.bvid, ready)
+
+    def _on_fav_menu(self, row: int, position) -> None:  # noqa: ANN001 - QPoint
+        """收藏夹右键菜单:播放 / 下一首播放 / 加入队列 / 缓存 / 在B站打开。
+
+        除"在B站打开"外都要先补详情:收藏夹条目没有 ``cid`` 和分P列表,而缓存任务
+        必须按每个分P的 ``cid`` 落盘。"在B站打开"是唯一拿到 bvid 就能立刻做的事。
+
+        Args:
+            row: 行号(以过滤后的列表为准)。
+            position: 全局坐标,交给 ``QMenu.exec``。
+        """
+        item = self.fav_page.entry_at(row)
+        if item is None or not item.is_playable:
+            return
+        menu = QMenu(self)
+        play_action = menu.addAction("播放")
+        next_action = menu.addAction("下一首播放")
+        queue_action = menu.addAction("加入队列")
+        menu.addSeparator()
+        cache_action = menu.addAction("缓存到本地")
+        menu.addSeparator()
+        open_action = menu.addAction("在B站打开")
+
+        chosen = menu.exec(position)
+        if chosen is play_action:
+            self._on_fav_activated(row)
+        elif chosen is next_action:
+            self._with_video(
+                item.bvid,
+                lambda video: self.playback.enqueue_next(QueueItem(video=video)),
+            )
+        elif chosen is queue_action:
+            self._on_fav_add(row)
+        elif chosen is cache_action:
+            self._on_fav_cache(row)
+        elif chosen is open_action:
+            QDesktopServices.openUrl(QUrl(video_web_url(item.bvid)))
+
+    def _on_fav_cache(self, row: int) -> None:
+        """缓存收藏夹中的一个视频及其全部分P。
+
+        收藏夹接口只返回视频级元数据,没有每首歌实际必须使用的 ``cid``。因此先用
+        :meth:`_with_video` 补详情,再复用搜索结果的批量缓存入口;这样确认文案、已缓存
+        跳过、串行下载和任务列表都保持同一套规则。
+
+        Args:
+            row: 行号(以过滤后的列表为准)。
+        """
+        item = self.fav_page.entry_at(row)
+        if item is None or not item.is_playable:
+            return
+        self._with_video(item.bvid, self._cache_all_pages)
+
     # ------------------------------------------------------------ 批量缓存
 
     @staticmethod
@@ -826,14 +1433,38 @@ class MainWindow(FramelessWindow):
         self.placeholder_page.set_content(title, hint)
         self._show_page(self.placeholder_page, key)
 
-    def _on_playlist_selected(self, name: str) -> None:
-        """点了某个歌单:歌单功能还没做,先给一张说清楚原因的占位页。"""
-        self.placeholder_page.set_content(name, _PLAYLIST_HINT)
-        self._show_page(self.placeholder_page, None)
+    @Slot(str)
+    def _on_playlist_selected(self, media_id_text: str) -> None:
+        """点了某个收藏夹:打开收藏夹页并加载第一页内容。
+
+        切夹子时**先让在飞的旧请求作废**(token +1)再发新的 —— 否则 128 条的收藏夹
+        还没回来、用户已经点了另一个夹子,旧响应会把内容追加到新夹子的列表里
+        (与 ``audio/resolver.py`` 的 ``_alive`` 是同一类防护)。侧栏以文本发 id,因为 B站
+        的 ``media_id`` 可能超过 Qt ``int`` 的有符号 32 位上限;这里才回到 Python ``int``。
+
+        Args:
+            media_id_text: 收藏夹 id 的十进制文本(侧栏信号带的就是它;名字可以重复,不能当键)。
+        """
+        if not media_id_text.isdecimal():
+            return
+        media_id = int(media_id_text)
+        folder = next((f for f in self._folders if f.media_id == media_id), None)
+        if folder is None:
+            # 侧栏是按上一次的收藏夹列表画的,列表刚被刷新过时可能对不上
+            return
+        self._fav_media_id = media_id
+        self._fav_page_no = 0
+        self.fav_page.set_folder(
+            folder.title, is_private=folder.is_private, media_count=folder.media_count
+        )
+        self.fav_page.set_items([])
+        self.fav_page.set_has_more(False)
+        self._show_page(self.fav_page, None)
+        self._load_fav_page(1, append=False)
 
     def _on_create_playlist(self) -> None:
-        """点了"新建歌单":同上,进占位页。"""
-        self.placeholder_page.set_content("新建歌单", _PLAYLIST_HINT)
+        """点了"新建歌单"(在B站新建收藏夹属于写回操作,当前版本不做)。"""
+        self.placeholder_page.set_content("新建歌单", _NEW_PLAYLIST_HINT)
         self._show_page(self.placeholder_page, None)
 
     def _show_page(self, page: QWidget, nav_key: str | None) -> None:
@@ -1272,6 +1903,8 @@ class MainWindow(FramelessWindow):
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)  # 不定长进度,表示"忙碌"
         self.result_list.set_highlight(self._result_row_for(item.video.bvid))
+        # 收藏夹页按 bvid 标记"正在播的是哪一条"(收藏夹条目是视频级的)
+        self.fav_page.set_playing(item.video.bvid)
         self.queue_drawer.set_current(self.playback.queue.current_index)
         self._sync_page_selector()
 

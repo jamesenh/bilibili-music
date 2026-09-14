@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from ..icons import DARK, get_icon
 from ..pixmaps import logo_pixmap
+from .sidebar import SIDEBAR_WIDTH
 
 __all__ = ["TITLE_BAR_HEIGHT", "TitleBar"]
 
@@ -30,14 +31,18 @@ __all__ = ["TITLE_BAR_HEIGHT", "TitleBar"]
 #: 决定"左上角图标正对着侧栏"的观感,所以两处都写成常量。
 TITLE_BAR_HEIGHT = 64
 
+#: 标题栏这一行的左边距(像素)。
+_TITLE_BAR_LEFT_MARGIN = 14
+
 #: 应用图标尺寸(像素)。
 _LOGO_SIZE = 28
 
 #: 图标所在方块的宽度(像素)。
 #:
-#: 取"侧栏宽度 - 本行的左边距",目的是让搜索框的左边缘与内容区的左边缘对齐 ——
-#: 设计稿里这两条竖线是齐的,而侧栏宽度写在 :mod:`.sidebar` 里。
-_LOGO_BOX_WIDTH = 162
+#: 由"侧栏宽度 - 本行的左边距"**算出来**,目的是让搜索框的左边缘与内容区的左边缘对齐
+#: —— 设计稿里这两条竖线是齐的。以前这里写死 162(对应 176 宽的侧栏),侧栏一加宽就
+#: 会悄悄错位,所以改成从 :data:`~bilibili_music.ui.widgets.sidebar.SIDEBAR_WIDTH` 推导。
+_LOGO_BOX_WIDTH = SIDEBAR_WIDTH - _TITLE_BAR_LEFT_MARGIN
 
 #: 窗口按钮尺寸(像素)。
 _WINDOW_BUTTON = 30
@@ -69,7 +74,7 @@ class TitleBar(QWidget):
         self.setFixedHeight(TITLE_BAR_HEIGHT)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 0, 8, 0)
+        layout.setContentsMargins(_TITLE_BAR_LEFT_MARGIN, 0, 8, 0)
         layout.setSpacing(12)
 
         self.logo_label = QLabel()

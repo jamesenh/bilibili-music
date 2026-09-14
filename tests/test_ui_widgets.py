@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (  # noqa: E402
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import QPoint, QRect, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt  # noqa: E402
 
 from bilibili_music.core.models import Page  # noqa: E402
 from bilibili_music.ui.pixmaps import cover_pixmap, logo_pixmap  # noqa: E402
@@ -61,7 +61,11 @@ from bilibili_music.ui.widgets.page_selector import (  # noqa: E402
     POPUP_ROW_HEIGHT,
     POPUP_SPACING,
 )
-from bilibili_music.ui.widgets.sidebar import NAV_ITEMS  # noqa: E402
+from bilibili_music.ui.widgets.sidebar import (  # noqa: E402
+    NAV_ITEMS,
+    PlaylistEntry,
+    Sidebar,
+)
 from bilibili_music.ui.widgets.track_list import (  # noqa: E402
     INDEX_COLUMN,
     RICH_COLUMN,
@@ -99,6 +103,26 @@ class _FakeCovers:
     def clear(self) -> None:
         """记录一次清空。"""
         self.clear_count += 1
+
+
+class _TopLevelShowSpy(QObject):
+    """记录"被 show 出来的顶层控件"的应用级事件过滤器。
+
+    用来抓"控件还没有父对象就被 ``setVisible(True)``"这类问题:无父控件的 QWidget
+    本身就是顶层窗口,show 它会真的往屏幕上弹一个窗口(见
+    ``TestTrackList.test_rows_never_flash_stray_top_level_windows``)。
+    """
+
+    def __init__(self) -> None:
+        """建一个空记录。"""
+        super().__init__()
+        self.shown: list[str] = []
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: ANN001, N802
+        """把 Show 事件里的顶层控件记下来。"""
+        if event.type() == QEvent.Type.Show and isinstance(obj, QWidget) and obj.isWindow():
+            self.shown.append(f"{type(obj).__name__}#{obj.objectName()}")
+        return False
 
 
 def _rows() -> list[TrackRow]:
@@ -196,6 +220,27 @@ class TestTrackList(unittest.TestCase):
         """只有一列时富信息没地方放,必须在构造时就报错而不是画出个半成品。"""
         with self.assertRaises(ValueError):
             TrackList(("#",))
+
+    def test_rows_never_flash_stray_top_level_windows(self) -> None:
+        """插行时不许冒出游离的顶层窗口(回归用例)。
+
+        ``_set_rich`` 一度把还没有父对象的 ``TrackPrefix`` / ``TrackSubtitle`` 先
+        ``setVisible(True)``,而**无父控件的 QWidget 自己就是顶层窗口** —— 于是每插一行
+        都会真的弹出一个带原生边框的小窗口,几行之后加进布局时才隐藏。一页 30 行就是
+        30~40 个窗口在 300ms 里连闪(Windows 上肉眼可见,实测每次翻页都出现;
+        在 macOS 上由于窗口要等 runloop 提交才上屏,看不见但同样在创建真窗口)。
+
+        这里用应用级事件过滤器抓"插行期间被 show 出来的顶层控件":正常实现里一个都不该有。
+        """
+        spy = _TopLevelShowSpy()
+        app = QApplication.instance()
+        app.installEventFilter(spy)
+        try:
+            widget = TrackList(_COLUMNS, action_column=_ACTION_COLUMN)
+            widget.set_tracks(_rows())
+        finally:
+            app.removeEventFilter(spy)
+        self.assertEqual(spy.shown, [])
 
     def test_rows_expose_title_subtitle_and_index(self) -> None:
         """富信息列的内容要能被读出来(它是单元格控件,不是 QTableWidgetItem)。"""
@@ -655,8 +700,15 @@ class TestSidebar(unittest.TestCase):
     """左侧导航。"""
 
     def _sidebar(self) -> Sidebar:
-        """造一个侧栏(不需要父对象)。"""
-        return Sidebar()
+        """造一个侧栏(不需要父对象),并填两个收藏夹。"""
+        sidebar = Sidebar()
+        sidebar.set_playlists(
+            [
+                PlaylistEntry(media_id=169038169, title="默认收藏夹", media_count=128),
+                PlaylistEntry(media_id=3756, title="华语经典", media_count=0, is_private=True),
+            ]
+        )
+        return sidebar
 
     def test_nav_entries_raise_their_key(self) -> None:
         """每个入口都要把 key 发出来,主窗口靠它决定切哪一页。"""
@@ -666,6 +718,81 @@ class TestSidebar(unittest.TestCase):
         sidebar.nav_buttons["discover"].click()
         sidebar.nav_buttons["cache"].click()
         self.assertEqual(got, ["discover", "cache"])
+
+    def test_playlists_start_empty_with_a_hint(self) -> None:
+        """没有收藏夹时不许摆假歌单:显示"登录后显示收藏夹"。
+
+        这里用 ``isHidden()`` 而不是 ``isVisible()``:后者对"父窗口没 show"的控件恒为假,
+        拿它断言会让这条用例永远通过(假通过)。
+        """
+        sidebar = Sidebar()
+        self.assertEqual(sidebar.playlist_buttons, {})
+        self.assertFalse(sidebar.playlist_hint.isHidden())
+        self.assertIn("登录", sidebar.playlist_hint.text())
+
+    def test_set_playlists_replaces_and_hides_the_hint(self) -> None:
+        """整组替换:旧按钮要撤掉,新按钮要能点,提示标签随之隐藏。"""
+        sidebar = self._sidebar()
+        self.assertEqual(sorted(sidebar.playlist_buttons), ["169038169", "3756"])
+        self.assertTrue(sidebar.playlist_hint.isHidden())
+        self.assertEqual(sidebar.playlist_buttons["169038169"].text(), "默认收藏夹  128")
+        # 0 条时不显示数字:"0" 只会让人以为坏了
+        self.assertEqual(sidebar.playlist_buttons["3756"].text(), "华语经典")
+        self.assertIn("私密", sidebar.playlist_buttons["3756"].toolTip())
+
+        sidebar.set_playlists([])
+        self.assertEqual(sidebar.playlist_buttons, {})
+        self.assertFalse(sidebar.playlist_hint.isHidden())
+
+    def test_playlist_click_clears_page_selection(self) -> None:
+        """选收藏夹要清掉页面入口的选中态,侧栏不能同时亮两个。"""
+        sidebar = self._sidebar()
+        sidebar.nav_buttons["results"].click()
+        sidebar.playlist_buttons["169038169"].click()
+        self.assertFalse(sidebar.nav_buttons["results"].isChecked())
+        self.assertTrue(sidebar.playlist_buttons["169038169"].isChecked())
+
+    def test_page_click_clears_playlist_selection(self) -> None:
+        """反过来也一样:切回页面时收藏夹要熄灭。"""
+        sidebar = self._sidebar()
+        sidebar.playlist_buttons["169038169"].click()
+        sidebar.nav_buttons["results"].click()
+        self.assertFalse(sidebar.playlist_buttons["169038169"].isChecked())
+
+    def test_playlist_selection_raises_the_media_id(self) -> None:
+        """信号要发 id 文本而不是名字,这样大于 Qt ``int`` 上限的 id 也不溢出。"""
+        sidebar = self._sidebar()
+        got: list[str] = []
+        sidebar.playlist_selected.connect(got.append)
+        sidebar.playlist_buttons["3756"].click()
+        self.assertEqual(got, ["3756"])
+
+    def test_playlist_selection_keeps_a_large_media_id(self) -> None:
+        """大于有符号 32 位上限的收藏夹 id 要完整穿过 Qt 信号。"""
+        media_id = 4_140_917_469
+        sidebar = Sidebar()
+        sidebar.set_playlists([PlaylistEntry(media_id=media_id, title="大收藏夹")])
+        got: list[str] = []
+        sidebar.playlist_selected.connect(got.append)
+
+        sidebar.playlist_buttons[str(media_id)].click()
+
+        self.assertEqual(got, [str(media_id)])
+
+    def test_account_button_raises_its_signal_and_follows_state(self) -> None:
+        """账号按钮要能上报点击,文案随登录态变。"""
+        sidebar = self._sidebar()
+        got: list[bool] = []
+        sidebar.account_requested.connect(lambda: got.append(True))
+        self.assertEqual(sidebar.account_button.text(), "登录")
+        sidebar.account_button.click()
+        self.assertEqual(got, [True])
+
+        sidebar.set_account("一个很长的昵称")
+        self.assertTrue(sidebar.account_button.text().endswith("…"))
+        self.assertIn("一个很长的昵称", sidebar.account_button.toolTip())
+        sidebar.set_account("")
+        self.assertEqual(sidebar.account_button.text(), "登录")
 
     def test_queue_entry_is_gone(self) -> None:
         """"播放队列"的开关只在播放条上,侧栏不该再留一个入口。
@@ -679,29 +806,6 @@ class TestSidebar(unittest.TestCase):
             [item.key for item in NAV_ITEMS],
             ["discover", "results", "history", "cache"],
         )
-
-    def test_playlist_click_clears_page_selection(self) -> None:
-        """选歌单要清掉页面入口的选中态,侧栏不能同时亮两个。"""
-        sidebar = self._sidebar()
-        sidebar.nav_buttons["results"].click()
-        sidebar.playlist_buttons["周杰伦"].click()
-        self.assertFalse(sidebar.nav_buttons["results"].isChecked())
-        self.assertTrue(sidebar.playlist_buttons["周杰伦"].isChecked())
-
-    def test_page_click_clears_playlist_selection(self) -> None:
-        """反过来也一样:切回页面时歌单要熄灭。"""
-        sidebar = self._sidebar()
-        sidebar.playlist_buttons["周杰伦"].click()
-        sidebar.nav_buttons["results"].click()
-        self.assertFalse(sidebar.playlist_buttons["周杰伦"].isChecked())
-
-    def test_playlist_selection_raises_the_name(self) -> None:
-        """歌单名要原样发出去(占位页的标题就是它)。"""
-        sidebar = self._sidebar()
-        got: list[str] = []
-        sidebar.playlist_selected.connect(got.append)
-        sidebar.playlist_buttons["华语经典"].click()
-        self.assertEqual(got, ["华语经典"])
 
     def test_create_button_raises_its_signal(self) -> None:
         """"+"按钮要有信号,不能是哑的。"""
@@ -719,6 +823,126 @@ class TestSidebar(unittest.TestCase):
         sidebar.set_active_page("results")
         self.assertTrue(sidebar.nav_buttons["results"].isChecked())
         self.assertEqual(got, [])
+
+
+class TestSidebarPlaylistActions(unittest.TestCase):
+    """「我的歌单」那两行:刷新 / 显示隐藏,以及重建时的选中态。"""
+
+    def _sidebar(self) -> Sidebar:
+        """造一个侧栏并打开收藏夹操作(等价于"已登录")。"""
+        sidebar = Sidebar()
+        sidebar.set_playlist_actions_enabled(True)
+        sidebar.set_playlists(
+            [
+                PlaylistEntry(media_id=169038169, title="默认收藏夹", media_count=128),
+                PlaylistEntry(media_id=3756, title="华语经典", media_count=0, is_private=True),
+            ]
+        )
+        return sidebar
+
+    def test_action_buttons_raise_their_signals(self) -> None:
+        """两个按钮各发各的信号:主窗口靠它们决定"刷新列表"还是"打开弹窗"。"""
+        sidebar = self._sidebar()
+        hits: list[str] = []
+        sidebar.refresh_playlists_requested.connect(lambda: hits.append("refresh"))
+        sidebar.manage_playlists_requested.connect(lambda: hits.append("manage"))
+
+        sidebar.refresh_button.click()
+        sidebar.visibility_button.click()
+
+        self.assertEqual(hits, ["refresh", "manage"])
+
+    def test_actions_start_disabled_until_logged_in(self) -> None:
+        """未登录时两个按钮都不可点,并说明为什么(没有登录就没有收藏夹可操作)。"""
+        sidebar = Sidebar()
+        self.assertFalse(sidebar.refresh_button.isEnabled())
+        self.assertFalse(sidebar.visibility_button.isEnabled())
+        self.assertIn("登录", sidebar.refresh_button.toolTip())
+
+        sidebar.set_playlist_actions_enabled(True)
+        self.assertTrue(sidebar.refresh_button.isEnabled())
+        self.assertTrue(sidebar.visibility_button.isEnabled())
+        self.assertNotIn("登录后", sidebar.refresh_button.toolTip())
+
+        sidebar.set_playlist_actions_enabled(False)
+        self.assertFalse(sidebar.visibility_button.isEnabled())
+
+    def test_refresh_button_shows_the_busy_state(self) -> None:
+        """刷新期间按钮要变成"刷新中…"并禁掉 —— 连点等于连发请求(风控)。"""
+        sidebar = self._sidebar()
+        sidebar.set_refresh_busy(True)
+        self.assertEqual(sidebar.refresh_button.text(), "刷新中…")
+        self.assertFalse(sidebar.refresh_button.isEnabled())
+        # 只有「刷新」被挡:另一个按钮与在飞的列表请求无关
+        self.assertTrue(sidebar.visibility_button.isEnabled())
+
+        sidebar.set_refresh_busy(False)
+        self.assertEqual(sidebar.refresh_button.text(), "刷新")
+        self.assertTrue(sidebar.refresh_button.isEnabled())
+
+    def test_busy_state_does_not_re_enable_buttons_while_logged_out(self) -> None:
+        """未登录时"刷新结束"不该把按钮重新点亮 —— 两个条件是两回事。"""
+        sidebar = Sidebar()
+        sidebar.set_refresh_busy(True)
+        sidebar.set_refresh_busy(False)
+        self.assertFalse(sidebar.refresh_button.isEnabled())
+        self.assertFalse(sidebar.visibility_button.isEnabled())
+
+    def test_set_playlists_keeps_the_selected_folder(self) -> None:
+        """整组重建要接回选中态:点一次「刷新」不该把正在听的夹子从侧栏熄灭。"""
+        sidebar = self._sidebar()
+        sidebar.playlist_buttons["169038169"].click()
+
+        sidebar.set_playlists(
+            [
+                PlaylistEntry(media_id=169038169, title="默认收藏夹", media_count=129),
+                PlaylistEntry(media_id=3756, title="华语经典", media_count=0, is_private=True),
+            ]
+        )
+
+        self.assertTrue(sidebar.playlist_buttons["169038169"].isChecked())
+        self.assertFalse(sidebar.playlist_buttons["3756"].isChecked())
+
+    def test_set_playlists_drops_the_selection_when_it_is_gone(self) -> None:
+        """选中的夹子在新列表里没了(被删除 / 被隐藏)时不该报错,也不该乱点一行。"""
+        sidebar = self._sidebar()
+        sidebar.playlist_buttons["169038169"].click()
+
+        sidebar.set_playlists([PlaylistEntry(media_id=3756, title="华语经典")])
+
+        self.assertFalse(sidebar.playlist_buttons["3756"].isChecked())
+
+    def test_set_active_playlist_ignores_an_unknown_id(self) -> None:
+        """上层替用户选一个不在列表里的 id 时什么都不做(那是合法的"没选中")。"""
+        sidebar = self._sidebar()
+        sidebar.nav_buttons["results"].click()
+
+        sidebar.set_active_playlist(999)
+
+        self.assertTrue(sidebar.nav_buttons["results"].isChecked())
+
+    def test_set_active_playlist_does_not_emit(self) -> None:
+        """同步选中态不是"用户点了":不该反过来触发一次加载。"""
+        sidebar = self._sidebar()
+        got: list[int] = []
+        sidebar.playlist_selected.connect(got.append)
+
+        sidebar.set_active_playlist(3756)
+
+        self.assertTrue(sidebar.playlist_buttons["3756"].isChecked())
+        self.assertEqual(got, [])
+
+    def test_empty_hint_is_what_the_caller_says(self) -> None:
+        """"一个夹子都没有"的三种原因必须由上层讲清楚,侧栏不认识登录态。"""
+        sidebar = Sidebar()
+        sidebar.set_playlists([], empty_hint="收藏夹都被隐藏了,点上面的「显示/隐藏」可以放出来")
+        self.assertFalse(sidebar.playlist_hint.isHidden())
+        self.assertIn("隐藏", sidebar.playlist_hint.text())
+
+        sidebar.set_playlists(
+            [PlaylistEntry(media_id=1, title="夹子")], empty_hint="不会再显示了"
+        )
+        self.assertTrue(sidebar.playlist_hint.isHidden())
 
 
 # ====================================================================== 标题栏
