@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # 注意导入顺序:先 QtWidgets/QtGui 再 QtCore(见 scripts/_helpers.py 的说明)
-from PySide6.QtGui import QColor, QGuiApplication, QIcon  # noqa: E402
+from PySide6.QtGui import QColor, QGuiApplication, QIcon, QImage, QImageReader  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 from PySide6.QtCore import QSize  # noqa: E402
 
@@ -42,6 +42,56 @@ from bilibili_music.ui.icons import (  # noqa: E402
 def _app() -> QApplication:
     """确保存在 QApplication(幂等);已有实例时直接复用。"""
     return QApplication.instance() or QApplication(sys.argv)
+
+
+def _read_asset(name: str) -> QImage:
+    """读出应用图标资产里**最大的一档**位图。
+
+    ``.ico`` 里有 7 档尺寸,而 ``QImage(path)`` 只拿第一档(16×16),所以多图文件
+    要自己逐档跳过去挑最大的一张。
+
+    Args:
+        name: ``resources/app/`` 下的文件名。
+
+    Returns:
+        该文件里最大的那档位图;文件缺失或读不出时返回空 ``QImage``(由用例断言)。
+    """
+    path = icons_mod.APP_ICON_DIR / name
+    reader = QImageReader(str(path))
+    if reader.imageCount() <= 1:
+        return QImage(str(path))
+
+    largest = QImage()
+    for index in range(reader.imageCount()):
+        reader.jumpToImage(index)
+        image = reader.read()
+        if image.width() > largest.width():
+            largest = image
+    return largest
+
+
+def _ink_ratios(image: QImage) -> tuple[float, float]:
+    """量出实心画面在水平/垂直方向占画布的比例。
+
+    只扫穿过中心的一行和一列:圆角方块最宽/最高的位置就在中线上,足以判断留白量,
+    又不必逐像素扫 1024×1024(在 Python 里会把整个测试套件拖慢)。
+
+    Args:
+        image: 待测量的位图。
+
+    Returns:
+        ``(水平占比, 垂直占比)``,均为 0~1 的小数。
+    """
+    assert not image.isNull(), "图标读不出来(文件缺失或不是有效的位图)"
+    mid_x, mid_y = image.width() // 2, image.height() // 2
+    # 阈值取 250 而不是 >0:抗锯齿的描边像素很淡,算进去会把留白量量小
+    xs = [x for x in range(image.width()) if image.pixelColor(x, mid_y).alpha() > 250]
+    ys = [y for y in range(image.height()) if image.pixelColor(mid_x, y).alpha() > 250]
+    assert xs and ys, "图标整张都是透明的"
+    return (
+        (xs[-1] - xs[0] + 1) / image.width(),
+        (ys[-1] - ys[0] + 1) / image.height(),
+    )
 
 
 class TestIconResources(unittest.TestCase):
@@ -107,6 +157,49 @@ class TestIconResources(unittest.TestCase):
         self.assertIsNotNone(path)
         assert path is not None
         self.assertTrue(path.is_file())
+
+    def test_app_icon_path_picks_asset_by_platform(self) -> None:
+        """两个平台必须挑到各自的资产:macOS 拿带留白的,其余拿满幅的 ``.ico``。"""
+        macos = app_icon_path("darwin")
+        other = app_icon_path("win32")
+        self.assertIsNotNone(macos)
+        self.assertIsNotNone(other)
+        assert macos is not None and other is not None
+        self.assertEqual(macos.name, "app-macos.png")
+        self.assertEqual(other.name, "app.ico")
+
+
+class TestAppIconArtwork(unittest.TestCase):
+    """应用图标的留白量(平台差异的根源所在)。
+
+    macOS 的原生图标网格要求圆角方块只占画布约 80%(四周留白给系统投影),
+    而 Windows 的任务栏/资源管理器按满幅图标设计 —— 这两类资产的"画面占比"
+    是分开的两条约束,改一边不能把另一边带偏。
+    """
+
+    def setUp(self) -> None:
+        """读位图不建 QPixmap,但还是统一建一次应用实例。"""
+        _app()
+
+    def test_macos_asset_is_padded_to_the_apple_grid(self) -> None:
+        """macOS 专用位图的画面必须只占画布约 80%,否则在 Dock 里比系统图标大一圈。"""
+        image = _read_asset("app-macos.png")
+        self.assertFalse(
+            image.isNull(), "缺少 app-macos.png,app_icon_path 会退回满幅图标"
+        )
+        for ratio in _ink_ratios(image):
+            with self.subTest(ratio=ratio):
+                # 本机实测系统自带的 Music.app / Finder.app 图标都在 0.80 附近
+                self.assertGreaterEqual(ratio, 0.78)
+                self.assertLessEqual(ratio, 0.83)
+
+    def test_full_bleed_assets_stay_full_bleed(self) -> None:
+        """满幅资产不能被 macOS 的留白改动波及 —— Windows 的图标惯例就是画满画布。"""
+        for name in ("app.png", "app.ico"):
+            with self.subTest(asset=name):
+                horizontal, vertical = _ink_ratios(_read_asset(name))
+                self.assertAlmostEqual(horizontal, 1.0, places=2)
+                self.assertAlmostEqual(vertical, 1.0, places=2)
 
 
 class TestIconRendering(unittest.TestCase):

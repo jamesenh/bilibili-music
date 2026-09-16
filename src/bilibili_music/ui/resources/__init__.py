@@ -1,7 +1,9 @@
 """静态资源目录。
 
 ``icons/``  线性 SVG 图标源文件(单色蒙版,运行时着色),见 :mod:`bilibili_music.ui.icons`。
-``app/``    应用图标位图(``app.ico`` / ``app.png``)及其源 ``app.svg``。
+``app/``    应用图标位图(``app.ico`` / ``app.png``,加 macOS 专用的
+            ``app-macos.png``)及其源 ``app.svg``。macOS 的那份缩到画布约 80%
+            并留透明边 —— 它的图标网格要求这样,满幅会在 Dock 里显得偏大。
 
 放一个 ``__init__.py`` 是为了让它成为**规范的包目录** —— hatchling 配置里
 ``packages = ["src/bilibili_music"]`` 会连带打进包内数据文件,显式成包可以避免

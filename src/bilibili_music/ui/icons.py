@@ -26,6 +26,7 @@ SVG 约定
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -40,6 +41,15 @@ ICONS_DIR = Path(__file__).resolve().parent / "resources" / "icons"
 
 #: 应用图标(窗口/任务栏)用的位图目录。SVG 做不了 Windows 的 ``.ico``。
 APP_ICON_DIR = Path(__file__).resolve().parent / "resources" / "app"
+
+#: 其他平台(主要是 Windows)的应用图标候选文件,按优先级排列。
+#: ``.ico`` 内含 16~256 共 7 档尺寸,任务栏/标题栏要按 DPI 自己挑档。
+_APP_ICON_NAMES = ("app.ico", "app.png", "app.svg")
+
+#: macOS 的应用图标候选文件。macOS 的原生图标网格要求圆角方块只占画布约 80%
+#: (四周留白给系统投影),而 Windows 按满幅图标设计 —— 同一份位图两边通用不了,
+#: 所以 ``resources/app/`` 下各存一份(生成方式见 ``scripts/make_app_icon.py``)。
+_APP_ICON_NAMES_MACOS = ("app-macos.png", "app.png", "app.svg")
 
 
 # ================================================================ 调色板
@@ -104,9 +114,24 @@ def icon_path(name: str) -> Path:
     return path
 
 
-def app_icon_path() -> Path | None:
-    """应用图标(``.ico`` 优先,退回 ``.png``)。没有资源时返回 ``None``。"""
-    for name in ("app.ico", "app.png", "app.svg"):
+def app_icon_path(platform: str | None = None) -> Path | None:
+    """定位当前平台该用的应用图标位图。
+
+    Windows 用满幅的 ``app.ico``;macOS 用带留白的 ``app-macos.png`` —— macOS
+    的图标网格把圆角方块限制在画布约 80%,满幅位图在 Dock 里会比系统图标大出
+    一圈(见 ``scripts/make_app_icon.py`` 的 ``MACOS_ARTWORK_RATIO``)。
+
+    Args:
+        platform: ``sys.platform`` 的取值。``None`` 表示取当前平台;显式传入只是
+            为了两个分支都能被单测覆盖(不能真去改测试进程的 ``sys.platform``)。
+
+    Returns:
+        该平台图标文件的路径。整条候选链都不存在时返回 ``None``,由调用方跳过
+        设置图标 —— 资源缺失不该把应用拦在启动阶段。
+    """
+    current = sys.platform if platform is None else platform
+    names = _APP_ICON_NAMES_MACOS if current == "darwin" else _APP_ICON_NAMES
+    for name in names:
         candidate = APP_ICON_DIR / name
         if candidate.is_file():
             return candidate
