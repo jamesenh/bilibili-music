@@ -67,10 +67,13 @@ DB_FILE_NAME = "library.db"
 #: 与旧的 ``index.json`` 一样:当前只写不校验,留着它是为了以后真要改表结构时能一眼看出
 #: 这份库是哪一代建的,而不是为将来的迁移提前写一堆没人走的代码。
 #:
-#: 版本 2(2026-09-14):新增 ``download_tasks`` 表。建表语句全部是
-#: ``CREATE TABLE IF NOT EXISTS``、**不做任何 ALTER**,所以老库直接打开就能多出这张新表,
-#: 不需要迁移代码 —— 这也正是当初选"每次打开都重跑一遍建表"而非"探测版本再升级"的原因。
-SCHEMA_VERSION = 2
+#: 版本 2(2026-09-14):新增 ``download_tasks`` 表。
+#: 版本 3(2026-09-16):新增 ``search_history`` 表。
+#:
+#: 建表语句全部是 ``CREATE TABLE IF NOT EXISTS``、**不做任何 ALTER**,所以老库直接打开
+#: 就能多出这张新表,不需要迁移代码 —— 这也正是当初选"每次打开都重跑一遍建表"而非
+#: "探测版本再升级"的原因。
+SCHEMA_VERSION = 3
 
 #: 建表语句。``IF NOT EXISTS`` 让"每次打开都执行一遍"变成幂等操作,不必先探测文件是否存在。
 #:
@@ -80,6 +83,8 @@ SCHEMA_VERSION = 2
 #: 完成,不靠应用层判断)。
 #: ``download_tasks`` 以 ``bvid`` 为主键 —— "同一个视频不能有两个任务"这条规则因此由
 #: 主键而不是应用层保证,重启后重新入队也会自然收敛成一行。
+#: ``search_history`` 以 ``keyword`` 为主键 —— "同一个词只留最近一次"同样交给主键 +
+#: UPSERT,不靠应用层去比对文本。
 _SCHEMA: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS cached_tracks (
@@ -130,6 +135,12 @@ _SCHEMA: tuple[str, ...] = (
         cover_url   TEXT NOT NULL DEFAULT '',
         played_at   REAL NOT NULL DEFAULT 0,
         PRIMARY KEY (bvid, cid)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS search_history (
+        keyword     TEXT PRIMARY KEY NOT NULL,
+        searched_at REAL NOT NULL DEFAULT 0
     )
     """,
 )
@@ -239,7 +250,7 @@ class LibraryDb:
             conn.commit()
         except (sqlite3.Error, OSError) as exc:
             self._broken = True
-            _LOGGER.warning("本地库打不开,缓存索引与播放历史本次不可用 文件=%s 原因=%s", self.path, exc)
+            _LOGGER.warning("本地库打不开,缓存索引与各类历史(播放/搜索)本次不可用 文件=%s 原因=%s", self.path, exc)
             return None
         self._conn = conn
         return conn
