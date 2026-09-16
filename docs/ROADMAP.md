@@ -246,8 +246,10 @@ M1 落地时的取舍与遗留,后续动作前先看这里:
 - **M3.2 音乐区排行榜**:候选接口 `/x/web-interface/ranking/v2?rid=3`,需先 probe。
 - **M3.3 合集/系列与 UP主投稿**:**UP主投稿可能与收藏夹同受 WBI 限制**,
   必须先 probe;若确认需要签名,本项并入 M5 或直接搁置。
-- **M3.4 搜索历史**:依赖 M1.1 的配置层;存储位置可以直接沿用 2026-09-14 落地的
-  `core/library_db.py`(再加一张表即可,不必另起一份文件)。
+- **M3.4 搜索历史**:**已落地**(实现与取舍见第 7 节 2026-09-16 的变更记录)。
+  存储沿用 2026-09-14 落地的 `core/library_db.py`(再加一张 `search_history` 表即可,
+  不必另起一份文件):库里留 50 条,搜索框的历史下拉框最多显示最近 10 条、输入时按
+  包含匹配过滤。
 
 ### M4 歌词
 
@@ -422,6 +424,55 @@ M1 落地时的取舍与遗留,后续动作前先看这里:
 ---
 
 ## 7. 变更记录
+
+- 2026-09-16:**搜索历史(M3.4)+ 搜索框的历史下拉框(用户当轮明确要求)**。
+  需求由用户逐条拍定:点搜索框弹下拉、按顺序显示最近搜索词、最多 10 条、点一条自动填充
+  并提交搜索、点其它任何地方收起下拉框并取消输入焦点。澄清阶段追问后确定三条细节:
+  输入时**按包含匹配过滤**、库里**存 50 条而只显示 10 条**(过滤要能命中第 10 条以前的词)、
+  不要求删除单条/上下键选词等额外交互。
+
+  * `core/search_history.py`(新增):`SearchHistory`(`record` / `entries` / `trim` /
+    `suggest`)+ 纯函数 `normalize_keyword` / `filter_terms`。分表 `search_history(keyword
+    PRIMARY KEY, searched_at)`(**结构版本 2 → 3**;建表语句仍是幂等的
+    `CREATE TABLE IF NOT EXISTS`,所以不需要迁移代码),`keyword` 主键 + UPSERT 实现
+    "同一个词只留最近一次并提到最前"。规范化只做 `strip()` —— 必须与
+    `MainWindow.on_search` 提交时的口径**完全一致**,否则"搜过的词"填回搜索框会变成另一个词。
+    `suggest` 先读整份历史(≤50 条)再在内存里按 `casefold()` 做包含匹配:量级极小,
+    用 SQL `LIKE` 还得处理通配符转义(关键字里 `%` 很常见)与大小写,不值这个复杂度。
+    条数上限是**模块常量**而不是配置项(与 `history_limit` 不同):它只决定下拉框能给多少
+    提示,没有值得让用户去手改 `config.json` 的分量。库打不开、行被手改坏(空串/二进制)
+    一律当"没有这条",不影响搜索本身 —— 与 `core/history.py` 同一口径。
+  * `ui/widgets/search_suggest.py`(新增):`SearchSuggest` + `SearchSuggestRow`。
+    下拉框是**中间内容控件下的普通子控件**,不是 `Qt.Popup` 顶层窗口:后者会抓走键盘、
+    输入框随即失焦,"边打字边看历史被过滤"就不成立了;代价是"点外面就收起"要自己实现。
+    另外,父对象刻意取**内容区**而不是主窗口:直接挂在 `QMainWindow` 下的子控件会被
+    `QMainWindowLayout` 接管,浮层的位置就不再由我们说了算。行一律
+    `FocusPolicy.NoFocus` —— 否则点在行上会先让输入框失焦、触发"失焦就收起",
+    下拉框在 `mouseRelease` 之前就没了,那一行永远收不到点击。
+  * 三条**由实测逼出来的**防守(`search_suggest.py` 模块 docstring 有完整记录):
+    ①焦点只认用户主动给的那种(`Mouse` / `Tab` / `Backtab` / `Shortcut`),排除
+    `ActiveWindowFocusReason` —— 否则切出去再切回来下拉框会自己冒出来,并与"失焦就收起"
+    凑成来回闪烁;②尺寸**只在真的变了才 `resize`**,绝不用 `setFixedWidth` /
+    `setFixedHeight`(它们每次都 `updateGeometry()`,对父控件意味着一次布局请求,布局又会
+    把 `Resize` 发回来,"贴一次 → 布局 → 再贴一次"会自己转起来 —— 用户实测到的
+    **CPU 占满 + 界面卡在闪烁上**正是这条链路),且**关着时 `_reposition` 直接返回**;
+    ③列表内容没变就不重建行(同一次点击会先来 `MouseButtonPress` 再来 `FocusIn`)。
+  * `ui/theme.py`:新增 `QFrame#SearchSuggest` / `QPushButton#SearchSuggestRow` /
+    `QLabel#SearchSuggestTerm`(悬停铺底与分P菜单同一套)。`ui/widgets/__init__.py`
+    导出新控件;`main_window.py` 负责接线(数据源是 `search_history.suggest`)、
+    `on_search` 里记一条历史、并新增 `_on_suggest_activated`(填回输入框 + 立即搜索)。
+  * 顺手修掉一个**会让全量单测崩溃**的坑:应用级事件过滤器**不能**由窗口树里的控件自己
+    安装(`app.installEventFilter(下拉框)`)—— 应用会长期持有过滤器对象、而控件又在窗口树
+    里,窗口销毁时的垃圾回收会让 PySide6 崩在 GC 里(实测 SIGSEGV)。改为全进程唯一的
+    `_PressWatcher`(模块级、只持各下拉框的**弱引用**),并在 `MainWindow.closeEvent` 里
+    调 `SearchSuggest.detach()` 注销。
+  * 验证:`uv run python -m unittest discover -s tests` → `Ran 942 tests ... OK`
+    (新增 42 例:`tests/test_search_history.py` 19 例、`tests/test_search_suggest.py`
+    16 例、`tests/test_ui_wiring.py` 里 7 例接线)。另外用一次性 cocoa 脚本(跑完即删)
+    在**真平台**上量过:点击搜索框后下拉框与搜索框左对齐、紧贴下方、宽度一致,
+    "是独立窗口"为假;空转 2.6s 期间 `refresh` 增量为 0、CPU 4%。
+    **未覆盖**:真实鼠标的多次点选与拖拽、多屏 / HiDPI、IME 输入法下的焦点行为,
+    以及 Windows 平台的真机表现。
 
 - 2026-09-15:**收藏夹列表的两个本地操作(侧栏「刷新」+「显示/隐藏」弹窗)**。
 
