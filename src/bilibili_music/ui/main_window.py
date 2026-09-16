@@ -54,6 +54,11 @@
 记录与缓存索引共用一个本地库(``core/library_db.py`` 下的 ``library.db``),但**分表**:
 "清空缓存"不会影响历史。
 
+**搜索历史也是真的**:每次提交搜索往 ``core/search_history.py`` 记一条(同一个词只留
+最近一次、库里保留 50 条),点搜索框时在它下方给出最近搜过的词、输入时按**包含匹配**
+过滤(最多显示 10 条),点一条就填回输入框并立即搜索。它同样落在 ``library.db`` 里,
+但**另起一张表** —— "清空播放历史"不会顺手清掉搜索词,反之亦然。
+
 **搜索结果是分页加载的**:接口一次只给一页(见 ``api.bilibili.py`` 的 ``search_video``),
 列表滚到接近底部时自动取下一页并追加,失败时底部会出现一个"重试"按钮。页码、去重与
 停止条件全在这里裁决(见 :meth:`MainWindow._decide_has_more`),``TrackList`` 只报
@@ -132,6 +137,7 @@ from ..core.models import (
     video_web_url,
 )
 from ..core.queue import QueueItem
+from ..core.search_history import SearchHistory
 from ..core.session import Session, SessionStore, parse_cookie_header, session_from_cookies
 from ..net.base import FetchHandle
 from .cover_loader import CoverLoader
@@ -148,6 +154,7 @@ from .widgets import (
     PlayerBar,
     PlaylistEntry,
     QueueDrawer,
+    SearchSuggest,
     Sidebar,
     TaskDialog,
     TitleBar,
@@ -311,6 +318,9 @@ class MainWindow(FramelessWindow):
         #: 最近播放的读写。条数上限来自配置(可手改 ``config.json``,没有界面入口)。
         #: 必须在读到配置**之后**建:它要把 ``history_limit`` 带进每一次裁剪。
         self.history = PlayHistory(self.library, limit=self._config.history_limit)
+        #: 搜索历史的读写(与最近播放同库**不同表**)。上限是模块里的常量而不是配置项:
+        #: 它只决定搜索框下拉里能给多少提示,没有值得让用户去手改配置的分量。
+        self.search_history = SearchHistory(self.library)
         #: 播放条封面用的加载器。它只关心"当前这一首",所以还要配合 is_current 过滤
         self.cover_loader = CoverLoader(
             self.client.fetch_cover, cache=self.cover_cache
@@ -421,6 +431,13 @@ class MainWindow(FramelessWindow):
         self.player_bar.set_page_menu_avoid_widget(self.queue_drawer)
         layout.addWidget(self.player_bar)
 
+        # 搜索历史下拉框:普通子控件,**浮在内容区之上**(不是 Qt.Popup 顶层窗口 ——
+        # 那会抓走键盘、让输入框失焦,用户就没法边打字边看历史被过滤了。见
+        # ``ui/widgets/search_suggest.py`` 的模块 docstring)。父对象取**中间内容控件**
+        # ``root`` 而不是主窗口本身:``QMainWindow`` 会把直接挂在它下面的子控件收进自己的
+        # 布局管理,浮层的位置就不再由我们说了算;挂在 ``root`` 下才锚得住搜索框
+        self.search_suggest = SearchSuggest(root)
+
         self.setCentralWidget(root)
         self.sidebar.set_active_page("results")
         self._set_queue_visible(True)
@@ -523,6 +540,11 @@ class MainWindow(FramelessWindow):
         self.queue_drawer.clear_requested.connect(self.playback.clear)
 
         self.title_bar.search_requested.connect(self.on_search)
+        # 搜索历史下拉框:数据来自 search_history(过滤规则在 core 里),交互(点搜索框
+        # 展开、输入时过滤、点别处收起并清焦点)由控件自己接管
+        self.search_suggest.set_source(self.search_history.suggest)
+        self.search_suggest.attach(self.title_bar.search_input)
+        self.search_suggest.term_activated.connect(self._on_suggest_activated)
         # 列表只报"快到底了",要不要真去翻页由 _load_more 一处决定
         self.result_list.load_more_requested.connect(self._load_more)
         self.title_bar.minimize_requested.connect(self.showMinimized)
@@ -604,10 +626,18 @@ class MainWindow(FramelessWindow):
         新搜索一律从第 1 页重来:作废在飞的旧请求、清掉上一次的结果与页码,再取第一页。
         请求是异步的,所以过程中禁掉搜索按钮 —— 否则用户连点会叠出多个请求,在这个接口上
         等于自找风控。
+
+        这是**唯一**记搜索历史的地方(点历史词搜、回车搜、点按钮搜都会走到这里):
+        记的是提交出去的那个关键字。
         """
         keyword = self.title_bar.search_input.text().strip()
         if not keyword:
             return
+        # 同一个词再搜一次会被提到最前,去重由主键 + UPSERT 完成(见 core/search_history.py)。
+        # 记在"提交"这一刻而不是每次按键:否则"周”“周杰”“周杰伦”会存成三条
+        self.search_history.record(keyword)
+        # 下拉框留在这里已经没有意义 —— 下面马上要把结果列表换成这个词的结果
+        self.search_suggest.close_suggest()
         self._search_keyword = keyword
         self._videos = []
         self._seen_bvids.clear()
@@ -620,6 +650,17 @@ class MainWindow(FramelessWindow):
         self.result_list.set_tracks([])
         self.result_list.set_highlight(-1)
         self._request_search_page(1)
+
+    def _on_suggest_activated(self, term: str) -> None:
+        """点搜索历史里的一条词:填回输入框,并立刻提交这次搜索。
+
+        Args:
+            term: 被点中的历史词(原文,已去掉首尾空白)。
+        """
+        # 用 setText 而不是让用户自己按回车:需求就是"点一下就搜"。setText 只发
+        # textChanged 不发 textEdited,所以不会又触发一遍下拉框的过滤(见 SearchSuggest.attach)
+        self.title_bar.search_input.setText(term)
+        self.on_search()
 
     def _request_search_page(self, page: int) -> None:
         """请求某一页搜索结果,并给这次请求编号。
@@ -2210,6 +2251,9 @@ class MainWindow(FramelessWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt 命名
         """退出前落盘进度,并停掉在飞的解析、下载与播放。"""
+        # 搜索历史下拉框装的是**应用级**事件过滤器,它的命比窗口长:窗口关掉之前必须
+        # 摘掉,否则它会被继续调用到一个正在拆的窗口上(见 SearchSuggest.detach)
+        self.search_suggest.detach()
         self._config.last_position_ms = self._position_ms
         self._save_config()
         self.playback.stop()

@@ -6,6 +6,7 @@
 
 * :mod:`.window_frame` —— ``FramelessWindow``,无边框窗口与八个边缘缩放把手
 * :mod:`.title_bar` —— ``TitleBar``,自绘标题栏(应用图标 / 搜索框 / 窗口按钮)
+* :mod:`.search_suggest` —— ``SearchSuggest``,搜索框下方的搜索历史下拉框
 * :mod:`.sidebar` —— ``Sidebar``,左侧导航与"我的歌单"
 * :mod:`.track_list` —— ``TrackList``,搜索结果与播放队列共用的曲目列表
 * :mod:`.player_bar` —— ``PlayerBar``,底部播放条
@@ -34,6 +35,7 @@ from .page_selector import PageSelector
 from .placeholder import PlaceholderPage
 from .player_bar import PlayerBar
 from .queue_drawer import QueueDrawer
+from .search_suggest import SearchSuggest
 from .sidebar import PlaylistEntry, Sidebar
 from .task_dialog import TaskDialog, TaskRow
 from .title_bar import TitleBar
@@ -53,6 +55,7 @@ __all__ = [
     "PlayerBar",
     "PlaylistEntry",
     "QueueDrawer",
+    "SearchSuggest",
     "Sidebar",
     "TaskDialog",
     "TaskRow",

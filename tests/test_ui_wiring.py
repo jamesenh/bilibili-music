@@ -31,7 +31,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # 注意导入顺序:先 QtWidgets/QtGui 再 QtCore(见 AGENTS.md 第 5 节)
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox  # noqa: E402
 from PySide6.QtGui import QDesktopServices, QPalette, QPixmap, QPixmapCache  # noqa: E402
-from PySide6.QtCore import QBuffer, QIODevice, QObject, Qt, Signal, qVersion  # noqa: E402
+from PySide6.QtCore import QBuffer, QIODevice, QObject, QPoint, Qt, Signal, qVersion  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 
 from bilibili_music.api.bilibili import (  # noqa: E402
     AccountInfo,
@@ -771,6 +772,81 @@ class TestSearchWiring(_WindowCase):
         self.window.result_list.add_requested.emit(2)
         self.assertEqual(len(self.playback.queue), 1)
         self.assertEqual(self.playback.queue.items[0].video.bvid, "C")
+
+
+class TestSearchHistoryWiring(_WindowCase):
+    """搜索历史的接线:记一条、下拉框列什么、点一条会发生什么。
+
+    数据侧用的是**真的** :class:`~bilibili_music.core.search_history.SearchHistory`
+    (落在沙箱库里),所以这里失败说明是接线问题,而不是某条纯逻辑改了。
+    """
+
+    def test_search_records_the_keyword(self) -> None:
+        """提交一次搜索要在历史里留下这个词(否则下拉框永远是空的)。"""
+        self._search("周杰伦")
+        self.assertEqual(self.window.search_history.entries(), ("周杰伦",))
+
+    def test_searching_the_same_keyword_again_keeps_one_entry(self) -> None:
+        """重搜同一个词:只把它提到最前,而不是多出一条重复项。"""
+        self._search("周杰伦")
+        self._search("晴天")
+        self._search("周杰伦")
+        self.assertEqual(self.window.search_history.entries(), ("周杰伦", "晴天"))
+
+    def test_blank_keyword_is_not_recorded(self) -> None:
+        """空白关键字早退,不该在历史里留下一行空白(它点也没法搜)。"""
+        self.window.title_bar.search_input.setText("   ")
+        self.window.on_search()
+        self.assertEqual(self.window.search_history.entries(), ())
+
+    def test_typing_filters_the_history_list_with_the_core_rule(self) -> None:
+        """输入时按**包含匹配**过滤(过滤规则来自 core,而不是控件里另写一套)。"""
+        for keyword in ("周杰伦 MV", "晴天", "夜曲"):
+            self.window.search_history.record(keyword)
+        self.window.title_bar.search_input.setText("杰伦")
+        self.window.title_bar.search_input.textEdited.emit("杰伦")
+        self.assertTrue(self.window.search_suggest.is_open)
+        self.assertEqual(self.window.search_suggest.terms(), ("周杰伦 MV",))
+
+    def test_clicking_a_history_term_fills_the_box_and_searches(self) -> None:
+        """点一条历史词:填回输入框 + 立刻发请求(需求里的第 4 条)。"""
+        self.window.search_history.record("晴天")
+        self.window.search_suggest.refresh()
+        self.assertEqual(self.window.search_suggest.terms(), ("晴天",))
+        self.window.search_suggest.rows[0].click()
+        self.assertEqual(self.window.title_bar.search_input.text(), "晴天")
+        self.assertEqual(self.client.keywords, ["晴天"])
+        self.assertFalse(self.window.search_suggest.is_open)
+
+    def test_searching_closes_the_history_list(self) -> None:
+        """下拉框开着的时候提交搜索:搜完不该还留着一个浮层。"""
+        self.window.search_history.record("周杰伦")
+        self.window.title_bar.search_input.setText("周杰伦")
+        self.window.search_suggest.refresh()
+        self.assertTrue(self.window.search_suggest.is_open)
+        self.window.on_search()
+        self.assertFalse(self.window.search_suggest.is_open)
+
+    def test_clicking_outside_closes_the_list_and_drops_focus(self) -> None:
+        """点搜索结果区(既不是搜索框也不是下拉框):收起 + 输入框不再有焦点。
+
+        必须先把窗口 ``show()`` 出来:焦点只对可见窗口有意义(与 ``test_ui_widgets``
+        里测省略、把手时必须先 show 是同一个原因)。
+        """
+        self.addCleanup(self.window.hide)
+        self.window.show()
+        QApplication.processEvents()
+        self.window.search_history.record("周杰伦")
+        self.window.title_bar.search_input.setFocus()
+        self.window.search_suggest.refresh()
+        self.assertTrue(self.window.title_bar.search_input.hasFocus())
+        self.assertTrue(self.window.search_suggest.is_open)
+
+        QTest.mouseClick(
+            self.window.result_list, Qt.MouseButton.LeftButton, pos=QPoint(20, 20)
+        )
+        self.assertFalse(self.window.search_suggest.is_open)
+        self.assertFalse(self.window.title_bar.search_input.hasFocus())
 
 
 class TestSearchPagingWiring(_WindowCase):

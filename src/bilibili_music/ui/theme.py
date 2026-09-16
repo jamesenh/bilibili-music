@@ -473,6 +473,28 @@ QLabel#PageDuration {{
     font-size: 12px;
 }}
 
+/* ---------------------------------------------------------- 搜索历史下拉 */
+/* 下拉框是普通子控件(不是 Qt::Popup 顶层窗口),浮在内容区之上:圆角要真的透出下面 */
+QFrame#SearchSuggest {{
+    background: {s.card};
+    border: 1px solid {s.border};
+    border-radius: 8px;
+}}
+QPushButton#SearchSuggestRow {{
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    text-align: left;
+}}
+QPushButton#SearchSuggestRow:hover {{
+    background: {s.accent_soft};
+}}
+/* 历史词**不许**复用 #PageRowTitle 之类的名字:QSS 按 objectName 选控件,名字撞了样式就一起撞 */
+QLabel#SearchSuggestTerm {{
+    color: {DARK.text};
+    font-size: 13px;
+}}
+
 /* ---------------------------------------------------------- 滑块与进度 */
 QSlider::groove:horizontal {{
     height: 4px;
