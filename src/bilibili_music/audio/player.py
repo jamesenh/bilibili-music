@@ -21,7 +21,14 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 
+from ..core.logging_setup import get_logger
 from ..core.models import format_duration
+
+#: 本模块的日志器。命名空间由 ``core.logging_setup`` 统一决定。
+#:
+#: 这里的日志专治一种最常见的用户反馈"点了没声音":文件确实落盘了、也确实交给了
+#: ``QMediaPlayer``,但后端解码失败。没有这一条就只能靠猜。
+_LOGGER = get_logger(__name__)
 
 __all__ = ["PlayerController"]
 
@@ -173,6 +180,7 @@ class PlayerController(QObject):
         """
         self._current_path = Path(path)
         self._duration_ms = 0
+        _LOGGER.debug("加载音轨 文件=%s 自动播放=%s", self._current_path.name, autoplay)
         self._player.setSource(QUrl.fromLocalFile(str(self._current_path)))
         if autoplay:
             self._player.play()
@@ -263,8 +271,18 @@ class PlayerController(QObject):
             self.track_finished.emit()
 
     def _on_error(self, error: QMediaPlayer.Error, error_string: str) -> None:
-        """播放出错:忽略 ``NoError``(Qt 在正常加载时也会发一次),其余上报界面。"""
+        """播放出错:忽略 ``NoError``(Qt 在正常加载时也会发一次),其余上报界面。
+
+        除了上报界面,还记一条 ``ERROR``:用户看到的只是"播放失败"四个字或一个弹窗,
+        而排查需要知道出错的是哪个文件、Qt 报的是什么。
+        """
         if error != QMediaPlayer.Error.NoError:
+            _LOGGER.error(
+                "播放器出错 文件=%s 错误=%s 说明=%s",
+                self._current_path.name if self._current_path else "(未加载)",
+                error,
+                error_string,
+            )
             self.error_occurred.emit(error_string or "播放器出错")
 
     # ------------------------------------------------------------ 输出设备跟随

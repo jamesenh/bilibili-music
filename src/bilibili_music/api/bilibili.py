@@ -49,8 +49,17 @@ from urllib.parse import urlencode
 
 from ..core.errors import NoAudioSourceError
 from ..core.headers import API_BASE
+from ..core.logging_setup import get_logger
 from ..core.models import AudioTrack, Page, Video
 from ..net.base import FetchHandle, HttpBackend
+
+#: 本模块的日志器。命名空间由 ``core.logging_setup`` 统一决定。
+#:
+#: 接口层只记 ``DEBUG`` 一件事:**哪个接口、带什么显式入参**。
+#: 这是本方案里"看得见搜索词与 bvid"的唯一来源 —— 网络层记的 URL 已经把 query 取值
+#: 全抹了(见 :mod:`..core.redact`),而那些取值恰恰是排障时最想看的。
+#: 取值在这里是**显式变量**(``keyword`` / ``bvid`` / ``cid``),不必从 URL 里反解。
+_LOGGER = get_logger(__name__)
 
 __all__ = [
     "AccountInfo",
@@ -703,6 +712,7 @@ class BilibiliClient:
         if not keyword:
             on_success(SearchResult())
             return None
+        _LOGGER.debug("接口 search 关键词=%s 页=%d", keyword, page)
         query = urlencode(
             {
                 "search_type": "video",
@@ -715,7 +725,15 @@ class BilibiliClient:
 
         def handle_data(data: dict[str, Any]) -> None:
             """响应到达:只取 ``data`` 部分交给纯解析函数。"""
-            on_success(parse_search_result(data.get("data") or {}, requested_page=page))
+            result = parse_search_result(data.get("data") or {}, requested_page=page)
+            _LOGGER.debug(
+                "接口 search 结果 命中=%d 页=%d/%d 总数=%d",
+                len(result.videos),
+                result.page,
+                result.total_pages,
+                result.total,
+            )
+            on_success(result)
 
         return self.backend.get_json(url, on_success=handle_data, on_error=on_error)
 
@@ -750,8 +768,10 @@ class BilibiliClient:
         if use_cache:
             hit = self._video_cache.get(bvid)
             if hit is not None:
+                _LOGGER.debug("接口 view bvid=%s 命中缓存=是", bvid)
                 on_success(hit)
                 return None
+        _LOGGER.debug("接口 view bvid=%s 命中缓存=否", bvid)
         url = f"{API_BASE}/x/web-interface/view?bvid={bvid}"
 
         def handle_data(data: dict[str, Any]) -> None:
@@ -762,6 +782,12 @@ class BilibiliClient:
             """
             video = parse_video(data.get("data") or {}, fallback_bvid=bvid)
             self._video_cache[bvid] = video
+            _LOGGER.debug(
+                "接口 view 结果 bvid=%s 分P=%d 时长=%ds",
+                video.bvid,
+                len(video.pages),
+                video.duration,
+            )
             on_success(video)
 
         return self.backend.get_json(url, on_success=handle_data, on_error=on_error)
@@ -787,10 +813,14 @@ class BilibiliClient:
             可取消的请求句柄。
         """
         url = f"{API_BASE}/x/web-interface/nav"
+        _LOGGER.debug("接口 nav")
 
         def handle_data(data: dict[str, Any]) -> None:
             """响应到达:解析 ``data`` 里的账号概况。"""
-            on_success(parse_nav(data.get("data") or {}))
+            info = parse_nav(data.get("data") or {})
+            # 只记“是否登录”与会员类型,不记 uname / mid —— 凭据与身份纪律见 AGENTS.md 5.10
+            _LOGGER.debug("接口 nav 结果 已登录=%s 会员类型=%d", info.is_login, info.vip_type)
+            on_success(info)
 
         return self.backend.get_json(url, on_success=handle_data, on_error=on_error)
 
@@ -817,10 +847,14 @@ class BilibiliClient:
         """
         query = urlencode({"up_mid": mid, "web_location": "333.1387"})
         url = f"{API_BASE}/x/v3/fav/folder/created/list-all?{query}"
+        # mid 是账号标识,不落盘:排障需要的是“有没有取到夹子”而不是“是谁的”
+        _LOGGER.debug("接口 fav_folders")
 
         def handle_data(data: dict[str, Any]) -> None:
             """响应到达:``data`` 可能是 ``null``,由纯解析函数容忍。"""
-            on_success(parse_fav_folders(data.get("data")))
+            folders = parse_fav_folders(data.get("data"))
+            _LOGGER.debug("接口 fav_folders 结果 个数=%d", len(folders))
+            on_success(folders)
 
         return self.backend.get_json(url, on_success=handle_data, on_error=on_error)
 
@@ -861,10 +895,15 @@ class BilibiliClient:
             }
         )
         url = f"{API_BASE}/x/v3/fav/resource/list?{query}"
+        _LOGGER.debug("接口 fav_page 页=%d 每页=%d", page, max(1, min(page_size, MAX_FAV_PAGE_SIZE)))
 
         def handle_data(data: dict[str, Any]) -> None:
             """响应到达:解析条目(含失效条目的占位)。"""
-            on_success(parse_fav_page(data.get("data")))
+            page_data = parse_fav_page(data.get("data"))
+            _LOGGER.debug(
+                "接口 fav_page 结果 条目=%d 还有更多=%s", len(page_data.items), page_data.has_more
+            )
+            on_success(page_data)
 
         return self.backend.get_json(url, on_success=handle_data, on_error=on_error)
 
@@ -894,10 +933,18 @@ class BilibiliClient:
         """
         query = urlencode({"bvid": bvid, "cid": cid, "fnval": 16, "fourk": 1, "try_look": 1})
         url = f"{API_BASE}/x/player/playurl?{query}"
+        _LOGGER.debug("接口 playurl bvid=%s cid=%d", bvid, cid)
 
         def handle_data(data: dict[str, Any]) -> None:
             """响应到达:交给纯解析函数,音轨为空时它会抛出异常。"""
-            on_success(parse_audio_tracks(data.get("data") or {}, bvid=bvid))
+            tracks = parse_audio_tracks(data.get("data") or {}, bvid=bvid)
+            # 只记档位与编码,不记地址(地址是带签名的直链,见 core/redact)
+            _LOGGER.debug(
+                "接口 playurl 结果 音轨=%d 档位=%s",
+                len(tracks),
+                ",".join(str(track.quality_id) for track in tracks),
+            )
+            on_success(tracks)
 
         return self.backend.get_json(url, on_success=handle_data, on_error=on_error)
 

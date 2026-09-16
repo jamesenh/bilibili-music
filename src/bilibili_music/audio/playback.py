@@ -28,9 +28,16 @@ from collections.abc import Sequence
 
 from PySide6.QtCore import QObject, Signal
 
+from ..core.logging_setup import get_logger
 from ..core.queue import PlayMode, PlayQueue, QueueItem
 from .player import PlayerController
 from .resolver import AudioResolver, ResolvedAudio
+
+#: 本模块的日志器。命名空间由 ``core.logging_setup`` 统一决定。
+#:
+#: 这里记的是**播放时间线**:什么时候切到了哪一首、哪一分P、是用户手动切的还是
+#: 自动前进的。出问题时它能把"用户说的操作"翻译成"程序真的做了什么"。
+_LOGGER = get_logger(__name__)
 
 __all__ = [
     "PlaybackController",
@@ -356,6 +363,13 @@ class PlaybackController(QObject):
             return
         self._page_index = item.page_index if page_index is None else int(page_index)
         self._resume_position_ms = max(0, int(position_ms))
+        _LOGGER.info(
+            "开始播放 bvid=%s 分P=%d 指定档位=%s 续播位置=%dms",
+            item.video.bvid,
+            self._page_index,
+            self._quality_id if self._quality_id is not None else "自动",
+            self._resume_position_ms,
+        )
         self.track_changed.emit(item)
         self.resolver.resolve(
             item.video,
@@ -368,6 +382,13 @@ class PlaybackController(QObject):
 
     def _on_resolved(self, resolved: ResolvedAudio) -> None:
         """音源就绪:开始播放并把结果交给界面。"""
+        _LOGGER.info(
+            "音源就绪 bvid=%s 分P=%d 档位=%d 文件=%s",
+            resolved.video.bvid,
+            resolved.page.index,
+            resolved.track.quality_id,
+            resolved.path.name,
+        )
         self.player.load(resolved.path, autoplay=True)
         self.audio_ready.emit(resolved)
 
@@ -376,7 +397,16 @@ class PlaybackController(QObject):
 
         自动跳过失败项会把"这一首取不到音源"变成静默跳歌,用户不知道发生了什么;
         让他看到错误再自己决定更诚实。
+
+        日志记 ``WARNING`` 而不是 ``ERROR``:技术现场已由网络层 / 解析层记过,
+        这里只补"是队列里的哪一项"。
         """
+        item = self.current
+        _LOGGER.warning(
+            "当前项解析失败 bvid=%s:%s",
+            item.video.bvid if item is not None else "(无当前项)",
+            exc,
+        )
         self.error_occurred.emit(str(exc))
 
     def _on_progress(self, done: int, total: int) -> None:
@@ -395,20 +425,25 @@ class PlaybackController(QObject):
         """
         item = self.current
         if item is None:
+            _LOGGER.debug("播放结束 队列已空")
             self.stopped.emit()
             return
         if self.queue.mode is PlayMode.REPEAT_ONE:
             # 显式带上当前分P:走通用路径会退回"队列项记的那个分P",于是合集播到
             # 第 2P 时按单曲循环反而跳回第 1P
+            _LOGGER.debug("单曲循环 重播分P=%d", self._page_index)
             self._start_current(page_index=self._page_index)
             return
         next_page = self._page_index + 1
         if item.video.page(next_page) is not None:
+            _LOGGER.info("自动前进到下一分P 第 %d P", next_page)
             self._start_current(page_index=next_page)
             return
         if self.queue.next_item(auto=True) is None:
+            _LOGGER.debug("播放结束 已到队列末尾")
             self.stopped.emit()
             return
+        _LOGGER.info("自动前进到队列下一项")
         self._start_current()
 
     def _on_position_changed(self, position: int, duration: int) -> None:

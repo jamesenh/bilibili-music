@@ -39,18 +39,24 @@ from ..core.http import (
     DEFAULT_TIMEOUT,
     RETRYABLE_STATUS,
 )
+from ..core.logging_setup import get_logger
 from .base import (
     BILI_COOKIE_DOMAIN,
     DownloadHandle,
     ErrorCallback,
     FetchHandle,
+    LOG_BODY_PREVIEW_BYTES,
     ProgressCallback,
     RateLimiter,
+    RequestLogger,
     SuccessCallback,
     backoff_delay,
     check_payload,
     is_blank_cookie,
 )
+
+#: 本模块的日志器。命名空间由 ``core.logging_setup`` 统一决定。
+_LOGGER = get_logger(__name__)
 
 #: 单次同步请求返回的最大字节数,防止异常响应把内存吃满(20 MiB 足够所有 JSON 接口)。
 #: 注意:这个上限只作用于 :meth:`UrllibClient._fetch` 那条"先攒后解压"的路径,
@@ -97,6 +103,9 @@ class UrllibClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self._limiter = RateLimiter(min_interval)
+        #: 请求日志。两种后端共用 ``net.base.RequestLogger``,
+        #: 所以“两边日志字段一致”由构造保证而不是靠人盯(见 ``tests/test_backend_contract.py``)。
+        self._log = RequestLogger(_LOGGER, backend="urllib")
         self._cookie_jar = CookieJar()
         self._opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self._cookie_jar)
@@ -224,6 +233,29 @@ class UrllibClient:
         if delay > 0:
             time.sleep(delay)
 
+    @staticmethod
+    def _read_error_body(exc: urllib.error.HTTPError) -> bytes:
+        """尽力读一点出错响应的正文,只为日志留证。
+
+        ``HTTPError`` 本身就是一个可读的响应对象。读之前不知道里面是 412 的 HTML 还是
+        一行 JSON,两种都是风控复盘的关键证据。读失败(连接已断、流不可读)只返回空字节串
+        —— 这里是日志路径,不能因为它再抛一个异常出来。
+
+        Args:
+            exc: ``urllib`` 抛出的 HTTP 错误。
+
+        Returns:
+            响应体前 :data:`~bilibili_music.net.base.LOG_BODY_PREVIEW_BYTES` 字节;
+            读不出来时是空字节串。
+        """
+        try:
+            return exc.read(LOG_BODY_PREVIEW_BYTES) or b""
+        except Exception:  # noqa: BLE001 - 取证失败不能拖垮控制流
+            return b""
+        finally:
+            # 无论如何都要关掉:现在不关的话,重试与新请求会一直堆着这些半死的连接
+            exc.close()
+
     def _open(self, request: urllib.request.Request):
         """带退避重试的请求。命中风控会重新预热再试。
 
@@ -237,6 +269,7 @@ class UrllibClient:
             _Cancelled: 客户端已 close,请求作废。
             NetworkError: 重试耗尽,或状态码不可重试(如 403/404)。
         """
+        url = request.full_url
         last_error: Exception | None = None
         for attempt in range(self.max_retries):
             if self._closed:
@@ -248,16 +281,51 @@ class UrllibClient:
                 return response
             except urllib.error.HTTPError as exc:
                 self._limiter.touch()
+                body = self._read_error_body(exc)
                 if exc.code not in RETRYABLE_STATUS and exc.code < 500:
-                    raise NetworkError(f"HTTP {exc.code} {request.full_url}") from exc
+                    # 不可重试的失败(403/404 等):证据就在手上,就地记 ERROR
+                    error = NetworkError(f"HTTP {exc.code} {url}")
+                    self._log.failure(
+                        url, status=exc.code, exc=error, body=body, headers=request.headers,
+                        note="不可重试",
+                    )
+                    raise error from exc
                 last_error = exc
+                if attempt >= self.max_retries - 1:
+                    # 重试耗尽:这一次的正文才是真实现场,记在这里
+                    error = NetworkError(
+                        f"请求失败(已重试 {self.max_retries} 次): {last_error}"
+                    )
+                    self._log.failure(
+                        url, status=exc.code, exc=error, body=body, headers=request.headers,
+                        note="重试耗尽",
+                    )
+                    raise error from exc
+                wait_s = backoff_delay(attempt)
+                self._log.retry(
+                    url, attempt=attempt + 1, total=self.max_retries, wait_s=wait_s, status=exc.code
+                )
                 # 被风控了,换一份新鲜 Cookie 再试
                 self.warm_up(force=True)
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
                 self._limiter.touch()
                 last_error = exc
+                if attempt >= self.max_retries - 1:
+                    error = NetworkError(
+                        f"请求失败(已重试 {self.max_retries} 次): {last_error}"
+                    )
+                    self._log.failure(url, exc=error, headers=request.headers, note="重试耗尽")
+                    raise error from exc
+                self._log.retry(
+                    url,
+                    attempt=attempt + 1,
+                    total=self.max_retries,
+                    wait_s=backoff_delay(attempt),
+                    exc=exc,
+                )
             if attempt < self.max_retries - 1:
                 time.sleep(backoff_delay(attempt))
+        # 理论上到不了这里(循环内已经覆盖了所有分支),兜底留给类型检查器
         raise NetworkError(f"请求失败(已重试 {self.max_retries} 次): {last_error}")
 
     def _fetch(self, url: str, headers: dict[str, str]) -> bytes:
@@ -278,7 +346,11 @@ class UrllibClient:
             NetworkError: 请求失败、响应过大或解压失败。
         """
         request = urllib.request.Request(url, headers=headers)
+        self._log.request(url, headers=headers, cookie_names=self.cookie_names)
+        started = time.monotonic()
         with self._open(request) as response:
+            status = int(getattr(response, "status", 0) or 0)
+            encoding = response.headers.get("Content-Encoding", "")
             chunks: list[bytes] = []
             total = 0
             while True:
@@ -288,9 +360,22 @@ class UrllibClient:
                 chunks.append(chunk)
                 total += len(chunk)
                 if total > MAX_JSON_BYTES:
-                    raise NetworkError(f"响应过大(超过 {MAX_JSON_BYTES} 字节): {url}")
+                    error = NetworkError(f"响应过大(超过 {MAX_JSON_BYTES} 字节): {url}")
+                    self._log.failure(url, status=status, exc=error, note="JSON 接口")
+                    raise error
             payload = b"".join(chunks)
-            return decompress_all(payload, response.headers.get("Content-Encoding", ""))
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            self._log.response(
+                url, status=status, length=total, elapsed_ms=elapsed_ms, encoding=encoding
+            )
+            try:
+                return decompress_all(payload, encoding)
+            except NetworkError as exc:
+                # 解压失败是“数据坏了”而不是“请求失败”,正文就是现场证据,一并记下
+                self._log.failure(
+                    url, status=status, exc=exc, body=payload, note="解压失败"
+                )
+                raise
 
     def _download_to_sink(self, url: str, sink: Any, on_progress: ProgressCallback | None) -> None:
         """同步流式下载并写入已打开的 sink。
@@ -310,6 +395,8 @@ class UrllibClient:
             BiliMusicError: 收完得到 0 字节(由 ``sink.commit()`` 抛出)。
         """
         request = urllib.request.Request(url, headers=self._media_headers)
+        self._log.request(url, headers=self._media_headers, cookie_names=self.cookie_names)
+        started = time.monotonic()
         with self._open(request) as response:
             raw_length = response.headers.get("Content-Length")
             total = int(raw_length) if raw_length and raw_length.isdigit() else 0
@@ -320,6 +407,13 @@ class UrllibClient:
                 sink.write(chunk)
                 if on_progress:
                     on_progress(sink.bytes_written, total)
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            self._log.response(
+                url,
+                status=int(getattr(response, "status", 0) or 0),
+                length=sink.bytes_written,
+                elapsed_ms=elapsed_ms,
+            )
         sink.commit()
 
     # ------------------------------------------------------------ 异步接口
@@ -370,13 +464,33 @@ class UrllibClient:
         self.warm_up()
 
         def job() -> None:
-            """线程池任务:取数据、校验 ``code``、回调。"""
+            """线程池任务:取数据、校验 ``code``、回调。
+
+            失败分两段记日志,分界是"证据在谁手里":
+
+            * 传输层失败(``NetworkError``)的证据是状态码、响应体、请求头,只有
+              :meth:`_open` / :meth:`_fetch` 拿得到,所以那条 ``ERROR`` 由它们就地记;
+              这里再记一遍只会让一次失败出现两条 ``ERROR``。
+            * 其余失败(业务 ``code`` 非 0、不是合法 JSON)的现场是响应体本身,正好在
+              这里手上,所以由这里记。
+            """
             try:
                 payload = self._fetch(url, self._api_headers)
-                on_success(check_payload(payload, url))
             except _Cancelled:
                 raise
-            except Exception as exc:
+            except NetworkError as exc:
+                # 证据已由下层记过(状态码/响应体/请求头只有那里拿得到),
+                # 这里只负责把失败送回去 —— 一次失败只允许有一条 ERROR
+                on_error(exc)
+                return
+            except Exception as exc:  # noqa: BLE001 - 回调前必须兜住所有失败
+                self._log.failure(url, exc=exc, note="JSON 接口")
+                on_error(exc)
+                return
+            try:
+                on_success(check_payload(payload, url))
+            except Exception as exc:  # noqa: BLE001 - 同上
+                self._log.failure(url, exc=exc, body=payload, note="JSON 接口")
                 on_error(exc)
 
         return self._submit(job)
@@ -399,7 +513,12 @@ class UrllibClient:
             headers: 额外覆盖的请求头,会合并进默认 API 头(同键以它为准)。
         """
         def job() -> None:
-            """线程池任务:合并请求头、取字节、回调。"""
+            """线程池任务:合并请求头、取字节、回调。
+
+            **成功不记 ``DEBUG``**:这条路径只有封面在用,滚一次列表就是几十张图,
+            逐张记会把网络日志冲掉。失败仍然记 ``ERROR`` —— "某张封面拿不到"是
+            需要能回答的问题。
+            """
             try:
                 merged = dict(self._api_headers)
                 if headers:
@@ -407,7 +526,13 @@ class UrllibClient:
                 on_success(self._fetch(url, merged))
             except _Cancelled:
                 raise
-            except Exception as exc:
+            except NetworkError as exc:
+                # 传输层失败的 ERROR 已由 _fetch / _open 记过(带状态码与正文),
+                # 这里不再重复记一条
+                on_error(exc)
+                return
+            except Exception as exc:  # noqa: BLE001 - 回调前必须兜住所有失败
+                self._log.failure(url, exc=exc, note="原始字节")
                 on_error(exc)
 
         return self._submit(job)
@@ -433,8 +558,13 @@ class UrllibClient:
                 on_success(sink.final_path)
             except _Cancelled:
                 sink.abort()
-            except Exception as exc:
+            except NetworkError as exc:
+                # 同上:传输层失败不在这里重记
                 sink.abort()
+                on_error(exc)
+            except Exception as exc:  # noqa: BLE001 - 回调前必须兜住所有失败
+                sink.abort()
+                self._log.failure(url, exc=exc, note="下载音轨(已清理 .part)")
                 on_error(exc)
 
         return self._submit(job)

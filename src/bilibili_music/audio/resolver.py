@@ -41,7 +41,15 @@ from pathlib import Path
 from ..api.bilibili import BilibiliClient, pick_best, track_from_cache
 from ..core.cache import AudioCache, DownloadSink
 from ..core.errors import NoAudioSourceError
+from ..core.logging_setup import get_logger
 from ..core.models import AudioTrack, Page, Video, track_subtitle, track_title
+
+#: 本模块的日志器。命名空间由 ``core.logging_setup`` 统一决定。
+#:
+#: 这里最关键的一类日志是"**丢弃过期回调**":快速切歌/切分P 时旧请求的回调会在新任务
+#: 开始之后才回来,少了 :meth:`AudioResolver._alive` 这道判断就会串歌。把丢弃记下来,
+#: 事后才能分清"这首歌没声是因为回调被丢了"还是"CDN 没给数据"。
+_LOGGER = get_logger(__name__)
 
 #: 常见音轨的 (quality_id, codec) 组合,用于在不发请求的情况下盲查缓存。
 #:
@@ -244,6 +252,13 @@ class AudioResolver:
             on_progress=on_progress,
         )
         self._state = state
+        _LOGGER.debug(
+            "开始解析 bvid=%s 分P=%d 指定档位=%s 已有分P表=%s",
+            video.bvid,
+            page_index,
+            quality_id if quality_id is not None else "自动",
+            "是" if video.pages else "否",
+        )
 
         if not video.pages:
             state.handle = self.client.fetch_video(
@@ -266,10 +281,26 @@ class AudioResolver:
         return self._state is state and not state.cancelled
 
     def _fail(self, state: _ResolveState, exc: Exception) -> None:
-        """统一失败出口:先让出"当前任务"身份,再回调。"""
+        """统一失败出口:先让出"当前任务"身份,再回调。
+
+        按 ``WARNING`` 记而不是 ``ERROR``:技术现场(状态码、响应体)已经由网络层记过
+        一条 ``ERROR`` 了,这里补的是"哪首歌、哪个分P 失败了"这一层上下文。一次失败
+        两条 ERROR 只会让日志越排越乱。
+        """
         if not self._alive(state):
+            _LOGGER.debug(
+                "丢弃过期回调 阶段=失败 bvid=%s 分P=%d", state.video.bvid, state.page_index
+            )
             return
         self._state = None
+        if isinstance(exc, NoAudioSourceError):
+            _LOGGER.warning(
+                "无可用音源 bvid=%s 分P=%d", state.video.bvid, state.page_index
+            )
+        else:
+            _LOGGER.warning(
+                "解析失败 bvid=%s 分P=%d:%s", state.video.bvid, state.page_index, exc
+            )
         state.on_error(exc)
 
     def _after_detail(self, state: _ResolveState, video: Video) -> None:
@@ -279,6 +310,9 @@ class AudioResolver:
         可以直接用同一份数据,不必再打一次 ``view`` 接口。
         """
         if not self._alive(state):
+            _LOGGER.debug(
+                "丢弃过期回调 阶段=详情 bvid=%s 分P=%d", state.video.bvid, state.page_index
+            )
             return
         # 详情里带了分P列表,写回对象,后续切换分P就不用再请求
         if video.pages and not state.video.pages:
@@ -309,6 +343,13 @@ class AudioResolver:
         if state.quality_id is None:
             hit = pick_best_cached(self.cache, state.video, page)
             if hit is not None:
+                _LOGGER.debug(
+                    "缓存命中(免请求) bvid=%s cid=%d 档位=%d 编码=%s",
+                    state.video.bvid,
+                    page.cid,
+                    hit.quality_id,
+                    hit.codec,
+                )
                 state.track = track_from_cache(hit.quality_id, hit.codec, hit.bandwidth)
                 self._done(state, hit.path)
                 return
@@ -326,21 +367,37 @@ class AudioResolver:
         先查缓存再下载,是让"重复播放"退化成零网络请求的关键路径。
         """
         if not self._alive(state):
+            _LOGGER.debug(
+                "丢弃过期回调 阶段=音轨 bvid=%s 分P=%d", state.video.bvid, state.page_index
+            )
             return
         track = None
         if state.quality_id is not None:
             track = next((t for t in tracks if t.quality_id == state.quality_id), None)
+        degraded = track is None and state.quality_id is not None
         if track is None:
             # 指定档位不存在(同一视频不同时刻给的档位会变)时退回最高码率,
             # 不因为"用户指定的 192K 这次没有"就让整次播放失败
             track = pick_best(tracks)
         state.track = track
+        _LOGGER.info(
+            "选档 bvid=%s cid=%d 档位=%d 编码=%s 指定=%s 降级=%s",
+            state.video.bvid,
+            state.page.cid if state.page is not None else 0,
+            track.quality_id,
+            track.codec,
+            state.quality_id if state.quality_id is not None else "自动",
+            "是" if degraded else "否",
+        )
 
         assert state.page is not None
         cached = self.cache.lookup(
             state.video.bvid, state.page.cid, track.quality_id, track.codec
         )
         if cached is not None:
+            _LOGGER.debug(
+                "缓存命中 bvid=%s cid=%d 档位=%d", state.video.bvid, state.page.cid, track.quality_id
+            )
             self._done(state, cached)
             return
 
@@ -366,6 +423,9 @@ class AudioResolver:
     def _done(self, state: _ResolveState, path: Path) -> None:
         """成功出口:写缓存索引,组装 :class:`ResolvedAudio` 并回调。"""
         if not self._alive(state):
+            _LOGGER.debug(
+                "丢弃过期回调 阶段=完成 bvid=%s 分P=%d", state.video.bvid, state.page_index
+            )
             return
         self._state = None
         assert state.page is not None and state.track is not None

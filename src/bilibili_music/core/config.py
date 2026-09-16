@@ -29,7 +29,14 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from .logging_setup import DEFAULT_LOG_LEVEL, get_logger, normalize_level
 from .queue import PlayMode
+
+#: 本模块的日志器。命名空间由 ``core.logging_setup`` 统一决定。
+#:
+#: 只记**真出了事**的那几种情况:文件坏了、顶层不是对象。"文件不存在"是首次启动的
+#: 正常路径,不能记 —— 否则每个人第一天打开应用都会先看到一条警告。
+_LOGGER = get_logger(__name__)
 
 __all__ = [
     "AppConfig",
@@ -185,6 +192,17 @@ class AppConfig:
     last_position_ms: int = 0
     """上次播放到的位置(毫秒),用于续播。"""
 
+    log_level: str = DEFAULT_LOG_LEVEL
+    """日志级别(``DEBUG`` / ``INFO`` / ``WARNING`` / ``ERROR`` / ``CRITICAL``)。
+
+    默认 ``INFO``:**没有界面入口**,想抓详细日志就手改 ``config.json`` 再重启。
+    之所以不做开关,是因为 ``DEBUG`` 会把每一次网络请求都写下来,量级比 ``INFO`` 大两个
+    数量级,把它做成一个随手可点的按钮只会让日志更难找。
+
+    非法值(手改成 ``"verbose"``、数字等)由 :func:`~.logging_setup.normalize_level`
+    收敛回 ``INFO`` —— 一句写错的配置不该让应用起不来。
+    """
+
     fav_hidden_ids: list[int] = field(default_factory=list)
     """在侧栏「我的歌单」里**被用户手动隐藏**的收藏夹 ``media_id``。
 
@@ -221,6 +239,7 @@ class AppConfig:
             last_bvid=str(self.last_bvid or ""),
             last_cid=max(0, _as_int(self.last_cid, 0)),
             last_position_ms=max(0, _as_int(self.last_position_ms, 0)),
+            log_level=normalize_level(self.log_level),
             # 新建一份列表而不是原样传递:配置对象在界面里是长期持有的,共享同一个
             # 列表会让"改了归一化结果"顺手改掉原对象
             fav_hidden_ids=_clean_hidden_ids(self.fav_hidden_ids),
@@ -257,19 +276,26 @@ class ConfigStore:
     def load(self) -> AppConfig:
         """读取并收敛配置;任何失败都退回默认值。
 
-        以下情况**都算"配置不可用"并静默退回默认值**,不抛异常:文件不存在
+        以下情况**都算"配置不可用"并退回默认值**,不抛异常:文件不存在
         (首次启动)、不是合法 JSON(写到一半被杀)、顶层不是对象(手改成数组)、
         字段类型不对(手改过)。此时按默认设置正常启动,比弹一个用户看不懂的
         错误更有用。
+
+        区别只在日志:文件不存在是正常路径,不记;其余几种会通过 ``WARNING`` 留一条
+        —— "设置莫名其妙全丢了"这种事,事后必须能查到原因。
 
         Returns:
             已做过合法性收敛的 :class:`AppConfig`;读不到文件时是默认配置。
         """
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            return AppConfig()  # 首次启动,没有配置文件是完全正常的
+        except (OSError, ValueError) as exc:
+            _LOGGER.warning("配置文件不可用,已退回默认设置 文件=%s 原因=%s", self.path, exc)
             return AppConfig()
         if not isinstance(raw, dict):
+            _LOGGER.warning("配置文件顶层不是对象,已退回默认设置 文件=%s", self.path)
             return AppConfig()
         return self._from_mapping(raw)
 

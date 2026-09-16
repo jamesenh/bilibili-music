@@ -60,8 +60,16 @@ from ..core.download_task import (
     task_for_video,
 )
 from ..core.errors import NoAudioSourceError
+from ..core.logging_setup import get_logger
 from ..core.models import AudioTrack, Page, Video
 from .resolver import pick_best_cached
+
+#: 本模块的日志器。命名空间由 ``core.logging_setup`` 统一决定。
+#:
+#: 批量缓存的日志粒度是**一个分P一行**(``DEBUG``):一次缓存可能是 200 个分P,
+#: 逐块记会把日志冲爆,只记开头结尾又无法回答"卡在哪一首"。所以:``INFO`` 记任务
+#: 级事件(加入 / 开始 / 完成),``DEBUG`` 记每个分P。
+_LOGGER = get_logger(__name__)
 
 __all__ = ["Downloader"]
 
@@ -244,6 +252,7 @@ class Downloader(QObject):
         task = task_for_video(video)
         self._tasks[task.bvid] = task
         self._persist(task)
+        _LOGGER.info("加入缓存任务 bvid=%s 分P=%d", task.bvid, task.total_pages)
         self.tasks_changed.emit()
         self._pump()
         return True
@@ -427,6 +436,7 @@ class Downloader(QObject):
         if task is None:
             return False
         task = self._set_state(task, TaskState.RUNNING)
+        _LOGGER.info("开始缓存 bvid=%s 共 %d 个分P", task.bvid, task.total_pages)
         run = _Run(task=task)
         self._run = run
         # 详情可能已经在 client 的缓存里(用户刚在搜索结果里播过它),那样回调是同步的,
@@ -457,6 +467,7 @@ class Downloader(QObject):
                 run.retried = True
                 run.pages, run.deferred = run.deferred, []
                 run.index = 0
+                _LOGGER.debug("重试还在播的那些分P 个数=%d", len(run.pages))
                 return
             self._finish(run)
             return
@@ -558,6 +569,12 @@ class Downloader(QObject):
         assert video is not None
         # 与播放那条管线一样顺手写索引,否则这一首不会出现在"本地缓存"页里
         self.cache.remember(video, page, track, path)
+        _LOGGER.debug(
+            "分P已缓存 序号=%d 档位=%d 体积=%d",
+            page.index,
+            track.quality_id,
+            self._file_size(path),
+        )
         self._mark_page_done(run, page.index, self._file_size(path))
 
     def _mark_page_done(self, run: _Run, index: int, size: int) -> None:
@@ -579,6 +596,12 @@ class Downloader(QObject):
         """任务结束:标记完成并接着跑队列里的下一个。"""
         self._run = None
         self._set_state(run.task, TaskState.DONE)
+        _LOGGER.info(
+            "缓存任务完成 bvid=%s 已存 %d 个分P 共 %.1f MB",
+            run.task.bvid,
+            run.task.done_pages,
+            run.task.bytes_done / 1048576,
+        )
         self.tasks_changed.emit()
         self._pump()
 
@@ -595,9 +618,21 @@ class Downloader(QObject):
         self._cancel_run(run)
         self._run = None
         task = self._set_state(run.task, TaskState.FAILED, error=str(exc))
+        paused = 0
         for other in list(self._tasks.values()):
             if other.state is TaskState.PENDING:
                 self._set_state(other, TaskState.PAUSED)
+                paused += 1
+        # WARNING 而不是 ERROR:技术现场(状态码、响应体)已由网络层记过一条 ERROR,
+        # 这里补的是"哪个任务失败、连带暂停了多少个排队任务"。
+        # 连带暂停是接口级的重要行为 —— 界面上会突然出现一批"已暂停",日志得先解释它
+        _LOGGER.warning(
+            "缓存任务失败 bvid=%s 分P=%d 说明=%s 连带暂停=%d",
+            task.bvid,
+            task.page_index,
+            exc,
+            paused,
+        )
         self.task_updated.emit(task.bvid)
         self.tasks_changed.emit()
         self.task_failed.emit(task.bvid, str(exc))

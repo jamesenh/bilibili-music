@@ -86,6 +86,8 @@ src/bilibili_music/
 │   ├── download_task.py  DownloadTaskStore(批量缓存的任务与进度,跨重启恢复)
 │   ├── queue.py       PlayQueue / PlayMode(队列与播放模式)
 │   ├── session.py     Session / SessionStore(登录凭据的明文 JSON 落盘)
+│   ├── redact.py      日志脱敏(纯函数 + handler 层强制生效的过滤器)
+│   ├── logging_setup.py  日志落点 / 级别 / 按天轮转 / 导出打包
 │   └── config.py      AppConfig / ConfigStore(纯 JSON 落盘)
 ├── net/             网络后端,两者接口一致可互换
 │   ├── base.py        契约(Protocol)、重试策略、限速器、响应校验
@@ -107,7 +109,7 @@ src/bilibili_music/
     └── widgets/       可单独构造、可单独测的控件
         ├── window_frame.py  FramelessWindow(无边框 + 边缘缩放把手)
         ├── title_bar.py     TitleBar(图标 / 搜索框 / 窗口按钮)
-        ├── sidebar.py       Sidebar(导航 + 收藏夹列表 + 刷新/显示隐藏 + 账号入口)
+        ├── sidebar.py       Sidebar(导航 + 收藏夹列表 + 刷新/显示隐藏 + 账号/日志入口)
         ├── track_list.py    TrackList(搜索结果与队列共用的曲目列表)
         ├── player_bar.py    PlayerBar(传输控件 / 进度 / 分P / 音质 / 音量)
         ├── page_selector.py PageSelector(分P选择器与它的弹出菜单)
@@ -400,6 +402,76 @@ CREATE TABLE download_tasks (     -- 「缓存整个合集」的任务,bvid 是�
 
 ---
 
+## 日志
+
+目标很具体:**用户点两下就能把日志交给你,而你看完就知道卡在哪。**
+没有日志时,"放不出来"这类反馈只能靠复现 —— 而 412 风控、下载失败、播放器报错
+恰恰都不是随时能重现的。
+
+### 落点与级别
+
+| 项 | 取值 |
+|---|---|
+| 目录 | macOS `~/Library/Logs/BiliMusic` · Windows `%LOCALAPPDATA%\BiliMusic\Logs` · Linux `$XDG_STATE_HOME/BiliMusic`(退回 `~/.local/state/BiliMusic`) |
+| 文件 | `bilimusic.log`;按天轮转成 `bilimusic.log.2026-09-14`,保留 7 份(加当天最多 8 个文件) |
+| 级别 | 默认 `INFO`;**要抓 `DEBUG` 就手改 `config.json` 的 `log_level` 再重启** |
+| 权限 | POSIX 下 `0o600` —— 日志里有你搜过的关键词与 `bvid` |
+
+**日志目录与配置目录是物理隔离的**:`config.json` / `session.json`(明文凭据)在配置目录里,
+日志在平台自己的日志目录里。所以"把日志目录整个打包发出去"这件事**天然不可能**带上凭据 ——
+这比"导出时记得排除某个文件名"可靠得多。
+
+没做界面开关是有意的:`DEBUG` 会把每一次网络请求都记下来,量级比 `INFO` 大两个数量级,
+做成一个随手可点的按钮只会让日志更难找。
+
+### 记了什么
+
+- **网络层 `DEBUG`**:每次请求一行(方法、**脱敏后**的地址、头的**名字**、cookie 个数),
+  每次响应一行(状态码、长度、耗时、编码);重试记 `WARNING`(第几次 / 等多久 / 触发的状态码)
+- **失败现场 `ERROR`**:状态码 + **响应体前 2 KB** + 脱敏后的完整请求头 + 异常
+  —— 412 的复盘靠的就是这三样(两个后端写出的字段由契约测试㔡死一致)
+- **关键业务节点 `INFO`**:加入队列 / 开始播放 / 自动前进 / 选档(含"指定的档位这次没有,
+  退了最高码率")/ 缓存完成 / 会话读写 / 界面状态文字
+- 界面底部那行提示也落盘:它就是本应用的**用户操作时间线**
+- **崩溃与 Qt 自身告警不记**(没装 `sys.excepthook` / `qInstallMessageHandler` /
+  `faulthandler`):闪退这类问题仍然只能靠复现。这是**已知缺口**,不是遗漏;
+  将来要补也是增量改动,不必推翻现有结构
+
+两条**必须遵守**的噪声规则(`DEBUG` 一开就靠它们保命):
+
+- 封面加载**成功不记**(滚一次列表就是几十张图),失败才记
+- 缓存写入**绝不逐块记**(一首歌几十次 `write()`),只在落盘时记一行
+
+### 脱敏:为什么可以放心记 URL
+
+- **URL 只留 `host + path + query 参数名`,取值全抹**:`.../view?bvid=<redacted>`。
+  刻意**不按域名黑名单**判断音视频直链 —— 那种清单漏一个域名的后果是"带签名的完整直链
+  落盘",而且**漏了是看不出来的**
+- 你想看的参数值(搜索关键词 / `bvid` / `cid`)由 `api` 层的 `DEBUG` 以**显式变量**记下来,
+  不用从 URL 反解
+- `Cookie` / `Set-Cookie` / `Authorization` 只留名字与条目数;`Referer` **保留**
+  (它不是凭据,而且"有没有带 Referer"正是音频 CDN 返回 403 的第一排查线索)
+- **脱敏在 handler 层强制生效**(`core/redact.py::RedactionFilter`):每条日志写盘前都会
+  再过一遍。调用点漏了也不会泄 —— 全库几十处 `except ... as exc` 会把原始异常(里面嵌着
+  完整 URL)拼进日志,靠"每个调用点都记得脱敏"等于没有防线
+
+`CREDENTIAL_FIELD_NAMES` 是一份**被单测逐项遍历**的常量:往清单里加字段会自动获得覆盖,
+"加了字段却忘了测"在结构上不可能发生。
+
+### 怎么拿到日志
+
+侧栏底部两个入口(**不占导航项**):
+
+- **打开目录** —— 用系统文件管理器打开日志目录(给开发者自己排障用;因为与凭据目录隔离,
+  打开它没有泄露风险)
+- **导出** —— 先弹一句"包含什么 / 不包含什么",再打包成一个 `BiliMusic-logs-YYYYMMDD.zip`
+
+包里只有**匹配 `*.log*` 的文件**加一份 `environment.txt`(版本 / 平台 / Python / Qt /
+当前级别 / 保留天数);**不含** `session.json`、`config.json`、`library.db`、任何 cookie 取值、
+`uname` / `mid`。压缩包里会有你搜过的关键词与视频 ID,所以导出前必须让人知情。
+
+---
+
 ## 已实现的功能
 
 - [x] **自绘标题栏的无边框窗口**:应用图标 + 圆角搜索框 + 粉色搜索按钮 + 最小化/最大化/关闭,
@@ -456,6 +528,9 @@ CREATE TABLE download_tasks (     -- 「缓存整个合集」的任务,bvid 是�
       落 `config.json` 的 `fav_hidden_ids`
 - [x] **账号对话框**:从浏览器复制 Cookie 整行即可登录(输入框遮蔽取值、**明示凭据保存
       路径**、一键登出会删掉凭据文件);启动时恢复上次登录态并用 `nav` 校验一次
+- [x] **日志与自助导出**:默认 `INFO`(手改 `config.json` 可上 `DEBUG`)、按天轮转保留 7 天,
+      侧栏底部可一键「打开目录 / 导出压缩包」;URL 取值、cookie、账号标识全不入日志
+      (详见「日志」一节)
 
 ## 尚未实现
 
@@ -472,6 +547,8 @@ CREATE TABLE download_tasks (     -- 「缓存整个合集」的任务,bvid 是�
 - [ ] 上次播放位置**续播**:配置里已经在记录,但启动时不会自动接着放
       (开机自动出声比较打扰,要不要做得先定;见 `docs/ROADMAP.md`)
 - [ ] 队列跨重启恢复(当前只记播放模式与位置,不记住队列内容)
+- [ ] **崩溃与 Qt 告警不落盘**:没装 `sys.excepthook` / `qInstallMessageHandler` /
+      `faulthandler`,闪退只能靠复现(见上面「日志」一节)
 - [ ] 打包分发(PyInstaller / Nuitka)
 
 > 刻意**不做**的:缓存任务并发(串行是为了避免风控)、下载速度与剩余时间估算

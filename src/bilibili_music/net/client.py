@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -45,6 +46,7 @@ from ..core.http import (
     DEFAULT_TIMEOUT,
     RETRYABLE_STATUS,
 )
+from ..core.logging_setup import get_logger
 from .base import (
     BILI_COOKIE_DOMAIN,
     DownloadHandle,
@@ -53,11 +55,15 @@ from .base import (
     JsonCallback,
     ProgressCallback,
     RateLimiter,
+    RequestLogger,
     SuccessCallback,
     backoff_delay,
     check_payload,
     is_blank_cookie,
 )
+
+#: 本模块的日志器。命名空间由 ``core.logging_setup`` 统一决定。
+_LOGGER = get_logger(__name__)
 
 #: ``QNetworkRequest`` 上取 HTTP 状态码 / 原因短语的两个属性。
 #: ``_REASON`` 只为错误消息更可读,取值本身不参与任何判断。
@@ -127,6 +133,9 @@ class QtNetworkClient(QObject):
         self.timeout_ms = int(timeout * 1000)
         self.max_retries = max_retries
         self._limiter = RateLimiter(min_interval)
+        #: 请求日志。两种后端共用 ``net.base.RequestLogger``,
+        #: 所以“两边日志字段一致”由构造保证而不是靠人盯(见 ``tests/test_backend_contract.py``)。
+        self._log = RequestLogger(_LOGGER, backend="qt")
         self._api_headers = api_headers(user_agent=user_agent)
         self._media_headers = media_headers(user_agent=user_agent)
         self._warmed_up = False
@@ -347,6 +356,8 @@ class QtNetworkClient(QObject):
         """
         if self._closed or handle.cancelled:
             return
+        self._log.request(url, headers=self._api_headers, cookie_names=self.cookie_names)
+        started = time.monotonic()
         reply = self._manager.get(self._make_request(url, self._api_headers))
         handle.reply = reply
         buffer = bytearray()
@@ -381,26 +392,71 @@ class QtNetworkClient(QObject):
                 status = self._status_of(reply)
                 if status in RETRYABLE_STATUS or status >= 500:
                     if attempt + 1 < self.max_retries:
+                        # 退避只算一次:日志里记的等待时间必须就是真的等多久
+                        wait_s = backoff_delay(attempt)
+                        self._log.retry(
+                            url,
+                            attempt=attempt + 1,
+                            total=self.max_retries,
+                            wait_s=wait_s,
+                            status=status,
+                        )
                         self.warm_up(force=True)  # 换一份新鲜 Cookie 再试
                         self._schedule(
                             lambda: self._start_json(
                                 url, on_success, on_error, attempt=attempt + 1, handle=handle
                             ),
                             attempt=attempt + 1,
-                            extra_delay_ms=int(backoff_delay(attempt) * 1000),
+                            extra_delay_ms=int(wait_s * 1000),
                         )
                         return
-                    on_error(
-                        NetworkError(
-                            f"请求失败(已重试 {self.max_retries} 次): {self._describe(reply)}"
-                        )
+                    error = NetworkError(
+                        f"请求失败(已重试 {self.max_retries} 次): {self._describe(reply)}"
                     )
+                    self._log.failure(
+                        url,
+                        status=status,
+                        exc=error,
+                        body=bytes(buffer),
+                        headers=self._api_headers,
+                        note="重试耗尽",
+                    )
+                    on_error(error)
                     return
                 if reply.error() != QNetworkReply.NetworkError.NoError:
-                    on_error(NetworkError(f"{reply.errorString()} ({self._describe(reply)})"))
+                    error = NetworkError(f"{reply.errorString()} ({self._describe(reply)})")
+                    self._log.failure(
+                        url,
+                        status=status,
+                        exc=error,
+                        body=bytes(buffer),
+                        headers=self._api_headers,
+                        note="连接失败",
+                    )
+                    on_error(error)
                     return
-                on_success(check_payload(bytes(buffer), url))
+                payload = bytes(buffer)
+                # 业务码非 0 会在这里抛 ApiError,由下面的 except 记成失败
+                result = check_payload(payload, url)
+                self._log.response(
+                    url,
+                    status=status,
+                    length=len(payload),
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    encoding=state["decoder"].encoding if state["decoder"].active else "",
+                )
+                on_success(result)
             except Exception as exc:  # 解析失败也要回到回调,不能抛进事件循环
+                # 走到这里的都还没记过失败(上面每个失败分支都自己 return 了),
+                # 所以这一次失败只会有一条 ERROR
+                self._log.failure(
+                    url,
+                    status=self._status_of(reply),
+                    exc=exc,
+                    body=bytes(buffer),
+                    headers=self._api_headers,
+                    note="解析失败",
+                )
                 on_error(exc)
             finally:
                 reply.deleteLater()
@@ -451,7 +507,11 @@ class QtNetworkClient(QObject):
                     buffer.extend(chunk)
 
             def on_finished() -> None:
-                """响应结束:冲刷解压器后把完整字节交给回调。"""
+                """响应结束:冲刷解压器后把完整字节交给回调。
+
+                这条路径**成功不记 DEBUG**:只有封面在用它,滚一次列表就是几十张图,
+                逐张记会把网络日志冲掉。失败仍然记 ``ERROR``。
+                """
                 self._limiter.touch()
                 try:
                     read_available()
@@ -462,13 +522,27 @@ class QtNetworkClient(QObject):
                         return
                     status = self._status_of(reply)
                     if status in RETRYABLE_STATUS or status >= 500:
-                        on_error(NetworkError(f"请求失败: {self._describe(reply)}"))
+                        error = NetworkError(f"请求失败: {self._describe(reply)}")
+                        self._log.failure(
+                            url,
+                            status=status,
+                            exc=error,
+                            body=bytes(buffer),
+                            headers=merged,
+                            note="原始字节",
+                        )
+                        on_error(error)
                         return
                     if reply.error() != QNetworkReply.NetworkError.NoError:
-                        on_error(NetworkError(reply.errorString()))
+                        error = NetworkError(reply.errorString())
+                        self._log.failure(
+                            url, status=status, exc=error, headers=merged, note="原始字节"
+                        )
+                        on_error(error)
                         return
                     on_success(bytes(buffer))
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - 解析失败也要回到回调
+                    self._log.failure(url, exc=exc, note="原始字节")
                     on_error(exc)
                 finally:
                     reply.deleteLater()
@@ -502,6 +576,8 @@ class QtNetworkClient(QObject):
             on_progress: 可选,CDN 未给 ``Content-Length`` 时第二个参数为 0。
         """
         sink.open()
+        self._log.request(url, headers=self._media_headers, cookie_names=self.cookie_names)
+        started = time.monotonic()
         reply = self._manager.get(self._make_request(url, self._media_headers))
         handle = ReplyHandle(reply)
 
@@ -526,16 +602,41 @@ class QtNetworkClient(QObject):
                     return
                 status = self._status_of(reply)
                 if status in RETRYABLE_STATUS or status >= 500:
+                    error = NetworkError(f"下载失败: {self._describe(reply)}")
+                    self._log.failure(
+                        url,
+                        status=status,
+                        exc=error,
+                        headers=self._media_headers,
+                        note="下载音轨(已清理 .part)",
+                    )
                     sink.abort()
-                    on_error(NetworkError(f"下载失败: {self._describe(reply)}"))
+                    on_error(error)
                     return
                 if reply.error() != QNetworkReply.NetworkError.NoError:
+                    error = NetworkError(f"{reply.errorString()} ({self._describe(reply)})")
+                    self._log.failure(
+                        url,
+                        status=status,
+                        exc=error,
+                        headers=self._media_headers,
+                        note="下载音轨(已清理 .part)",
+                    )
                     sink.abort()
-                    on_error(NetworkError(f"{reply.errorString()} ({self._describe(reply)})"))
+                    on_error(error)
                     return
-                on_success(sink.commit())
-            except Exception as exc:
+                final = sink.commit()
+                # commit 真的成功了才记“响应” —— 否则日志里会出现“成功了但没落盘”
+                self._log.response(
+                    url,
+                    status=status,
+                    length=sink.bytes_written,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                )
+                on_success(final)
+            except Exception as exc:  # noqa: BLE001 - 任何失败都要清掉 .part
                 sink.abort()
+                self._log.failure(url, exc=exc, note="下载音轨(已清理 .part)")
                 on_error(exc)
             finally:
                 reply.deleteLater()

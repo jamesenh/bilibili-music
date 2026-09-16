@@ -33,6 +33,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .config import config_root
+from .logging_setup import get_logger
+
+#: 本模块的日志器。命名空间由 ``core.logging_setup`` 统一决定。
+#:
+#: **纪律最严的一个模块**(``AGENTS.md`` 5.10):这里只允许记"有没有、几项、都是哪些名字",
+#: 取值(``SESSDATA`` / ``bili_jct`` / ``refresh_token``)一个字都不许出现。
+#: 名字本身不是秘密 —— 排查"凭据没生效"时要知道的恰恰是"带了哪几个名字"。
+_LOGGER = get_logger(__name__)
 
 __all__ = [
     "REQUIRED_COOKIE_NAMES",
@@ -194,12 +202,17 @@ class SessionStore:
         """
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            return None  # 从未登录过,启动时每天都走这条,不该记日志
+        except (OSError, ValueError) as exc:
+            _LOGGER.warning("会话文件不可用,按未登录处理 原因=%s", exc)
             return None
         if not isinstance(raw, dict):
+            _LOGGER.warning("会话文件顶层不是对象,按未登录处理")
             return None
         raw_cookies = raw.get("cookies")
         if not isinstance(raw_cookies, dict):
+            _LOGGER.warning("会话文件里 cookies 不是对象,按未登录处理")
             return None
         session = Session(
             cookies={
@@ -211,7 +224,19 @@ class SessionStore:
             mid=_as_int(raw.get("mid"), 0),
             saved_at=_as_float(raw.get("saved_at"), 0.0),
         ).normalized()
-        return session if session.is_usable else None
+        if not session.is_usable:
+            _LOGGER.warning(
+                "会话文件里没有可用凭据(缺 %s),按未登录处理",
+                "/".join(REQUIRED_COOKIE_NAMES),
+            )
+            return None
+        # 只记名字与数量,取值绝不落盘
+        _LOGGER.info(
+            "已读取会话 cookie=%d 项 名字=%s",
+            len(session.cookies),
+            ",".join(sorted(session.cookies)) or "无",
+        )
+        return session
 
     # ------------------------------------------------------------ 写
 
@@ -233,8 +258,15 @@ class SessionStore:
             OSError: 目录建不出来或写盘失败(磁盘满、无权限、文件被占用)。
         """
         path = self.path
-        text = json.dumps(asdict(session.normalized()), ensure_ascii=False, indent=2) + "\n"
+        cleaned = session.normalized()
+        text = json.dumps(asdict(cleaned), ensure_ascii=False, indent=2) + "\n"
         path.parent.mkdir(parents=True, exist_ok=True)
+        _LOGGER.info(
+            "保存会话 cookie=%d 项 名字=%s 路径=%s",
+            len(cleaned.cookies),
+            ",".join(sorted(cleaned.cookies)) or "无",
+            path,
+        )
         tmp = path.with_suffix(path.suffix + ".part")
         try:
             tmp.write_text(text, encoding="utf-8")
@@ -261,10 +293,14 @@ class SessionStore:
         try:
             self.path.unlink()
         except FileNotFoundError:
+            _LOGGER.info("登出:凭据文件本来就不存在")
             return False
-        except OSError:
-            # 被占用/无权限时不要抛:登出是收尾动作,失败也要让调用方继续走下去
+        except OSError as exc:
+            # 被占用/无权限时不要抛:登出是收尾动作,失败也要让调用方继续走下去。
+            # 但必须留痕 —— 这正是"用户以为登出了,凭据其实还在"的那种坑。
+            _LOGGER.warning("登出:凭据文件删不掉 原因=%s", exc)
             return False
+        _LOGGER.info("登出:凭据文件已删除")
         return True
 
 

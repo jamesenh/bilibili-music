@@ -139,6 +139,8 @@ class Sidebar(QWidget):
         manage_playlists_requested(): 点了「显示/隐藏」(打开自定义显示与否的弹窗)
         create_playlist_requested(): 点了"我的歌单"旁边的 "+"(新建歌单,尚未实现)
         account_requested(): 点了账号按钮(登录 / 查看当前账号 / 登出)
+        open_log_dir_requested(): 点了底部的「日志目录」(用文件管理器打开日志所在目录)
+        export_logs_requested(): 点了底部的「导出日志」(打包成一个压缩包)
     """
 
     nav_selected = Signal(str)
@@ -150,6 +152,8 @@ class Sidebar(QWidget):
     manage_playlists_requested = Signal()
     create_playlist_requested = Signal()
     account_requested = Signal()
+    open_log_dir_requested = Signal()
+    export_logs_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         """建好导航区与歌单区;初始没有选中任何入口。
@@ -205,7 +209,47 @@ class Sidebar(QWidget):
         self.playlist_hint.setContentsMargins(12, 2, 4, 0)
         self._playlist_box.addWidget(self.playlist_hint)
 
+        layout.addSpacing(6)
+        layout.addLayout(self._build_log_row())
+
         self._sync_playlist_actions()
+
+    def _build_log_row(self) -> QHBoxLayout:
+        """建底部那行低存在感的日志入口:打开目录 + 导出压缩包。
+
+        为什么不做成一个页面:**日志是排障工具,不是功能**。为它占一个与"发现 / 本地缓存"
+        并列的导航项,会把日常使用的界面变吵;而做成两个小号文字按钮,既找得到、又不会
+        诱导用户去点。
+
+        Returns:
+            已装好两个按钮的水平布局。
+        """
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        caption = QLabel("日志")
+        caption.setObjectName("MutedLabel")
+        row.addWidget(caption)
+
+        #: 打开日志所在目录(给开发者自己排障用;因为日志目录与凭据目录物理隔离,
+        #: 打开它不存在泄露风险)
+        self.log_dir_button = QPushButton("打开目录")
+        self.log_dir_button.setObjectName("GhostTextButton")
+        self.log_dir_button.setToolTip("用文件管理器打开日志所在目录")
+        self.log_dir_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.log_dir_button.clicked.connect(self.open_log_dir_requested.emit)
+        row.addWidget(self.log_dir_button)
+
+        #: 导出日志包(给用户"点了出问题,把日志发过来"用)
+        self.export_logs_button = QPushButton("导出")
+        self.export_logs_button.setObjectName("GhostTextButton")
+        self.export_logs_button.setToolTip("把日志打包成一个压缩包,方便发给开发者")
+        self.export_logs_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.export_logs_button.clicked.connect(self.export_logs_requested.emit)
+        row.addWidget(self.export_logs_button)
+
+        row.addStretch(1)
+        return row
 
     # ------------------------------------------------------------ 构建界面
 

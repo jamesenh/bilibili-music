@@ -69,14 +69,18 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from collections.abc import Callable, Sequence
+from datetime import datetime
+from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt, QUrl, Slot
+from PySide6.QtCore import QEvent, Qt, QUrl, Slot, qVersion
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMenu,
@@ -112,6 +116,13 @@ from ..core.cover_cache import CoverCache
 from ..core.download_task import DownloadTaskStore
 from ..core.history import HistoryEntry, PlayHistory, history_entry_for
 from ..core.library_db import LibraryDb
+from ..core.logging_setup import (
+    environment_summary,
+    export_logs,
+    get_logger,
+    log_root,
+    setup_logging,
+)
 from ..core.models import (
     Page,
     PlayableEntry,
@@ -147,6 +158,9 @@ from .widgets.sidebar import EMPTY_PLAYLIST_HINT
 from .widgets.track_list import split_title_prefix
 
 __all__ = ["MainWindow", "run"]
+
+#: 本模块的日志器。命名空间由 ``core.logging_setup`` 统一决定 —— 不在那棵树下就落不了盘。
+_LOGGER = get_logger(__name__)
 
 #: 搜索结果列表的列。第 0 / 1 列由 ``TrackList`` 自己填(序号、封面 + 标题)。
 _SEARCH_COLUMNS = ("#", "视频信息", "UP主", "时长", "分P", "操作")
@@ -211,6 +225,7 @@ class MainWindow(FramelessWindow):
         downloader: Downloader | None = None,
         library: LibraryDb | None = None,
         session_store: SessionStore | None = None,
+        log_dir: Path | None = None,
     ) -> None:
         """建依赖、建界面、接线,并套用配置。
 
@@ -224,6 +239,9 @@ class MainWindow(FramelessWindow):
             library: 本地库。
             session_store: 登录凭据的读写;``None`` 表示用平台默认路径
                 (测试**必须**注入沙箱路径,否则会动到真实用户的凭据)。
+            log_dir: 日志目录(「打开目录」/「导出日志」两个入口用);``None`` 表示用
+                平台默认目录。**可注入是为了让测试不往用户真实的 ``~/Library/Logs``
+                里写文件** —— 与其它可注入资源同一套路。
         """
         super().__init__()
         self.setWindowTitle("BiliMusic")
@@ -245,6 +263,9 @@ class MainWindow(FramelessWindow):
         self.config_store = config_store if config_store is not None else ConfigStore()
         #: 登录凭据的读写。**默认值是用户真实的配置目录** —— 测试必须注入沙箱路径
         self.sessions = session_store if session_store is not None else SessionStore()
+        #: 日志目录。默认值是平台默认目录;``run()`` 会把 ``setup_logging`` 实际用的那个
+        #: 路径传进来(重配过级别/目录时两边才不会说法不一)
+        self.log_dir: Path = Path(log_dir) if log_dir is not None else log_root()
         self.playback = (
             playback
             if playback is not None
@@ -514,6 +535,8 @@ class MainWindow(FramelessWindow):
         self.sidebar.manage_playlists_requested.connect(self._open_fav_visibility_dialog)
         self.sidebar.create_playlist_requested.connect(self._on_create_playlist)
         self.sidebar.account_requested.connect(self._open_account_dialog)
+        self.sidebar.open_log_dir_requested.connect(self._open_log_dir)
+        self.sidebar.export_logs_requested.connect(self._export_logs)
 
         self.cache_page.row_activated.connect(self._on_cache_activated)
         self.cache_page.row_menu_requested.connect(self._on_cache_menu)
@@ -537,7 +560,7 @@ class MainWindow(FramelessWindow):
         self.fav_page.row_menu_requested.connect(self._on_fav_menu)
         self.fav_page.add_requested.connect(self._on_fav_add)
         self.fav_page.load_more_requested.connect(self._on_fav_load_more)
-        self.fav_page.unplayable_requested.connect(self.status_label.setText)
+        self.fav_page.unplayable_requested.connect(self._on_unplayable)
 
         self.cover_loader.loaded.connect(self._on_cover_loaded)
         self.cover_loader.failed.connect(self._on_cover_failed)
@@ -550,8 +573,9 @@ class MainWindow(FramelessWindow):
     def _apply_window_icon(self) -> None:
         """设置窗口/任务栏图标。
 
-        应用图标是位图 ``.ico``(含 16~256 共 7 档尺寸),不能用 SVG 替代 ——
-        Windows 的任务栏与标题栏要按 DPI 自行挑档渲染。
+        应用图标是位图而不是 SVG —— 平台要按 DPI 自行挑档渲染,矢量图给不了。
+        具体用哪一份由 :func:`app_icon_path` 按平台决定:Windows 用满幅的 ``.ico``
+        (含 16~256 共 7 档尺寸),macOS 用带留白的 ``app-macos.png``。
         """
         path = app_icon_path()
         if path is None:
@@ -608,7 +632,7 @@ class MainWindow(FramelessWindow):
         self._searching = True
         self.load_more_button.setVisible(False)
         self.title_bar.search_button.setEnabled(False)
-        self.status_label.setText(
+        self._set_status(
             f"正在搜索「{self._search_keyword}」…"
             if page == 1
             else f"正在加载第 {page} 页…"
@@ -678,7 +702,7 @@ class MainWindow(FramelessWindow):
         if self._loaded_page == 0:
             self._fail(f"搜索失败:{exc}")
             return
-        self.status_label.setText(f"第 {self._loaded_page + 1} 页加载失败:{exc}")
+        self._set_status(f"第 {self._loaded_page + 1} 页加载失败:{exc}", level=logging.WARNING)
         self.load_more_button.setText(f"重试第 {self._loaded_page + 1} 页")
         self.load_more_button.setVisible(True)
 
@@ -724,13 +748,13 @@ class MainWindow(FramelessWindow):
         """把"已加载多少 / 还能不能继续"写到底部状态栏。"""
         loaded = len(self._videos)
         if self._has_more:
-            self.status_label.setText(f"已加载 {loaded} 条,继续下滑加载更多")
+            self._set_status(f"已加载 {loaded} 条,继续下滑加载更多")
         elif self._loaded_page >= _SEARCH_MAX_PAGES:
-            self.status_label.setText(
+            self._set_status(
                 f"已加载 {loaded} 条(最多加载 {_SEARCH_MAX_PAGES} 页)"
             )
         else:
-            self.status_label.setText(f"已加载全部 {loaded} 条")
+            self._set_status(f"已加载全部 {loaded} 条")
 
     @staticmethod
     def _track_row_of(video: Video) -> TrackRow:
@@ -776,7 +800,7 @@ class MainWindow(FramelessWindow):
         if video is None:
             return
         self.playback.enqueue(QueueItem(video=video))
-        self.status_label.setText(f"已加入播放队列:{video.title}")
+        self._set_status(f"已加入播放队列:{video.title}")
 
     def _on_result_menu(self, row: int, position) -> None:  # noqa: ANN001 - QPoint
         """搜索结果右键菜单:播放 / 下一首播放 / 加入队列 / 缓存整个合集 / 在B站打开。"""
@@ -861,7 +885,7 @@ class MainWindow(FramelessWindow):
 
         def on_error(exc: Exception) -> None:
             """请求失败:这**不是**凭据失效,绝不删凭据。"""
-            self.status_label.setText(f"登录态暂时没校验成功(网络问题):{exc}")
+            self._set_status(f"登录态暂时没校验成功(网络问题):{exc}", level=logging.WARNING)
 
         self.client.fetch_nav(on_success=on_success, on_error=on_error)
 
@@ -896,7 +920,7 @@ class MainWindow(FramelessWindow):
                 return
             if self.account_dialog is not None:
                 self.account_dialog.set_account(info.uname, info.mid)
-            self.status_label.setText(f"已登录:{info.uname}")
+            self._set_status(f"已登录:{info.uname}")
 
         def on_error(exc: Exception) -> None:
             """请求本身失败了(网络 / 风控):如实说,不写文件。"""
@@ -919,7 +943,7 @@ class MainWindow(FramelessWindow):
         self._apply_account(None)
         if self.account_dialog is not None:
             self.account_dialog.set_account("", 0)
-        self.status_label.setText("已登出" + ("(本机凭据文件已删除)" if removed else ""))
+        self._set_status("已登出" + ("(本机凭据文件已删除)" if removed else ""))
 
     def _drop_session(self, message: str) -> None:
         """凭据被服务端拒了:清内存 + 清文件 + 把界面退回未登录。
@@ -934,7 +958,34 @@ class MainWindow(FramelessWindow):
         if self.account_dialog is not None:
             self.account_dialog.set_error(message)
         else:
-            self.status_label.setText(message)
+            self._set_status(message)
+
+    # ------------------------------------------------------------ 底部状态行
+
+    def _set_status(self, text: str, *, level: int = logging.INFO) -> None:
+        """更新底部状态文字,并把它记进日志。
+
+        底部那行文字就是本应用的**用户操作时间线**:谁在什么时候点了什么、结果如何,
+        只有它在记。日志从这里取最省力 —— 不必在几十个回调里各写一遍日志调用,而且
+        永远不会出现"界面上显示了、日志里没有"的不一致。
+
+        空串表示"清掉旧提示"(例如切页、登出),那不是一个事件,**不落盘**。
+
+        Args:
+            text: 要显示的中文文案。沿用原有文案,不因为加日志而改写。
+            level: 对应的日志级别,失败类提示传 ``logging.WARNING``。
+        """
+        self.status_label.setText(text)
+        if text:
+            _LOGGER.log(level, "界面状态:%s", text)
+
+    def _on_unplayable(self, text: str) -> None:
+        """列表里某一条因为取不到地址而播不了:提示用户并记一条 WARNING。
+
+        Args:
+            text: 栏页(或列表)给出的中文说明。
+        """
+        self._set_status(text, level=logging.WARNING)
 
     def _apply_account(self, info: AccountInfo | None) -> None:
         """把登录态推给界面;已登录时顺带拉一遍收藏夹列表。
@@ -999,10 +1050,10 @@ class MainWindow(FramelessWindow):
         self._folders = list(folders)
         self._render_playlists()
         if not self._folders and self._account is not None:
-            self.status_label.setText(f"账号「{self._account.uname}」下没有收藏夹")
+            self._set_status(f"账号「{self._account.uname}」下没有收藏夹")
             return
         if self.status_label.text().startswith(("登录态暂时", "账号「")):
-            self.status_label.setText("")
+            self._set_status("")
 
     def _on_folders_failed(self, exc: Exception, token: int) -> None:
         """收藏夹列表没取到:如实说,并保住手里已有的那份列表。
@@ -1019,7 +1070,7 @@ class MainWindow(FramelessWindow):
             return
         self._folders_loading = False
         self.sidebar.set_refresh_busy(False)
-        self.status_label.setText(f"收藏夹列表没取到:{exc}")
+        self._set_status(f"收藏夹列表没取到:{exc}", level=logging.WARNING)
 
     def _playlist_empty_hint(self) -> str:
         """侧栏一个歌单都不显示时,那句说明该写什么。
@@ -1063,9 +1114,9 @@ class MainWindow(FramelessWindow):
         会直接返回,按钮也已经被禁掉。
         """
         if self._account is None:
-            self.status_label.setText("还没登录,先点侧栏的账号按钮登录")
+            self._set_status("还没登录,先点侧栏的账号按钮登录")
             return
-        self.status_label.setText("正在刷新收藏夹列表…")
+        self._set_status("正在刷新收藏夹列表…")
         self._refresh_folders()
 
     def _open_fav_visibility_dialog(self) -> None:
@@ -1075,10 +1126,10 @@ class MainWindow(FramelessWindow):
         ``AccountDialog`` 同一条纪律(``AGENTS.md`` 第 4 节)。
         """
         if self._account is None:
-            self.status_label.setText("还没登录,先点侧栏的账号按钮登录")
+            self._set_status("还没登录,先点侧栏的账号按钮登录")
             return
         if not self._folders:
-            self.status_label.setText("还没取到收藏夹列表,先点「刷新」取一遍")
+            self._set_status("还没取到收藏夹列表,先点「刷新」取一遍")
             return
         dialog = FavVisibilityDialog(
             self._playlist_entries(), self._hidden_fav_ids, self
@@ -1140,9 +1191,9 @@ class MainWindow(FramelessWindow):
         self._render_playlists()
         count = len(hidden)
         if count:
-            self.status_label.setText(f"已隐藏 {count} 个收藏夹(只影响侧栏显示)")
+            self._set_status(f"已隐藏 {count} 个收藏夹(只影响侧栏显示)")
         else:
-            self.status_label.setText("已显示全部收藏夹")
+            self._set_status("已显示全部收藏夹")
 
     def _load_fav_page(self, page_no: int, *, append: bool) -> None:
         """取某个收藏夹的一页内容。
@@ -1177,7 +1228,7 @@ class MainWindow(FramelessWindow):
             self.fav_page.set_has_more(page.has_more)
             self.fav_page.set_loading(False)
             if not page.has_more:
-                self.status_label.setText("")
+                self._set_status("")
 
         def on_error(exc: Exception) -> None:
             """失败:留在当前页,给一个能再点的出口(页脚按钮还在)。"""
@@ -1218,7 +1269,7 @@ class MainWindow(FramelessWindow):
 
         def on_error(exc: Exception) -> None:
             """拿不到详情:说清是哪一条失败,不动队列。"""
-            self.status_label.setText(f"取视频详情失败({bvid}):{exc}")
+            self._set_status(f"取视频详情失败({bvid}):{exc}", level=logging.WARNING)
 
         self.client.fetch_video(bvid, on_success=on_success, on_error=on_error)
 
@@ -1254,7 +1305,7 @@ class MainWindow(FramelessWindow):
         def ready(video: Video) -> None:
             """详情到手:入队并提示。"""
             self.playback.enqueue(QueueItem(video=video))
-            self.status_label.setText(f"已加入播放队列:{video.title}")
+            self._set_status(f"已加入播放队列:{video.title}")
 
         self._with_video(item.bvid, ready)
 
@@ -1350,7 +1401,7 @@ class MainWindow(FramelessWindow):
         if video.pages:
             self._confirm_cache_all(video)
             return
-        self.status_label.setText(f"正在获取「{video.title}」的分P列表…")
+        self._set_status(f"正在获取「{video.title}」的分P列表…")
         self.client.fetch_video(
             video.bvid,
             on_success=self._confirm_cache_all,
@@ -1401,7 +1452,7 @@ class MainWindow(FramelessWindow):
                 self, "缓存到本地", "这个视频没有可缓存的分P,或者已经在任务列表里了。"
             )
             return
-        self.status_label.setText(
+        self._set_status(
             f"已开始缓存「{video.title}」(共 {len(pages)} 个分P)"
         )
 
@@ -1705,6 +1756,67 @@ class MainWindow(FramelessWindow):
                 self, "打开缓存目录", f"没能打开文件管理器,缓存目录在:\n{directory}"
             )
 
+    # ------------------------------------------------------------ 日志入口
+
+    def _open_log_dir(self) -> None:
+        """在系统文件管理器里打开日志目录。
+
+        这个入口是给**开发者自己**排障用的。它敢直接给用户用,是因为日志目录与凭据目录
+        是物理隔离的(见 ``core/logging_setup`` 的模块 docstring):打开它看不到
+        ``session.json``。
+        """
+        directory = self.log_dir
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "打开日志目录", f"日志目录不可用:{exc}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory))):
+            QMessageBox.warning(
+                self, "打开日志目录", f"没能打开文件管理器,日志目录在:\n{directory}"
+            )
+
+    def _export_logs(self) -> None:
+        """把日志打包成一个 zip,交给用户发给开发者。
+
+        导出前**先说明包里有什么、没有什么**:这是知情同意,不是多此一举 ——
+        日志里会有用户搜过的关键词与视频 ID(参数取值全抹了,但 ``api`` 层会记显式入参),
+        而包发给别人之前,用户有权知道自己在发什么。
+        """
+        answer = QMessageBox.question(
+            self,
+            "导出日志",
+            "即将导出一份日志压缩包。\n\n"
+            "包含:最近的运行日志、应用版本与系统信息。\n"
+            "不包含:账号凭据、收藏夹内容、本地音频。\n\n"
+            "日志里会带上你搜索过的关键词与视频 ID,请只发给可信的人。继续?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        default_name = f"BiliMusic-logs-{datetime.now().strftime('%Y%m%d')}.zip"
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "导出日志", str(Path.home() / default_name), "压缩包 (*.zip)"
+        )
+        if not chosen:
+            return
+        summary = environment_summary(
+            level=self._config.log_level,
+            log_dir=self.log_dir,
+            # Qt 版本只有界面层拿得到:``core`` 不许 import Qt(AGENTS.md 4.1)
+            extra={"Qt": qVersion()},
+        )
+        try:
+            path = export_logs(Path(chosen), log_dir=self.log_dir, summary=summary)
+        except OSError as exc:
+            # 写盘类失败都是 OSError(无权限、磁盘满、文件名非法),统一变成一句人话;
+            # 导出失败绝不能把界面炸掉
+            self._set_status(f"导出日志失败:{exc}", level=logging.WARNING)
+            QMessageBox.warning(self, "导出日志", f"导出失败:{exc}")
+            return
+        self._set_status(f"日志已导出:{path}")
+
     def _on_tasks_changed(self) -> None:
         """任务集合、状态或"刚有分P落盘"变了:刷新角标、缓存页与对话框。
 
@@ -1899,7 +2011,7 @@ class MainWindow(FramelessWindow):
         # 清掉上一首的封面(空 URL 会让加载器立刻发 failed → 显示占位图)。
         # 顺带把"在飞的旧封面请求"作废,否则它回来时会被当成当前封面贴上。
         self.cover_loader.load("")
-        self.status_label.setText(f"正在解析「{item.title}」…")
+        self._set_status(f"正在解析「{item.title}」…")
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)  # 不定长进度,表示"忙碌"
         self.result_list.set_highlight(self._result_row_for(item.video.bvid))
@@ -1921,7 +2033,7 @@ class MainWindow(FramelessWindow):
             resolved.display_title,
             f"{resolved.subtitle} · {track.label}",
         )
-        self.status_label.setText(f"已缓存 {resolved.path.name}")
+        self._set_status(f"已缓存 {resolved.path.name}")
         self.setWindowTitle(f"BiliMusic - {resolved.display_title}")
         self._mark_page_count(resolved)
         # 详情此刻才补全,分P列表到这会儿才可用 —— 再刷一次选择器,它才显示得出分P标题
@@ -1987,7 +2099,12 @@ class MainWindow(FramelessWindow):
         self._position_ms = max(0, position)
 
     def _on_progress(self, done: int, total: int) -> None:
-        """缓存进度:总长已知时显示百分比,未知时只显示已收字节。"""
+        """缓存进度:总长已知时显示百分比,未知时只显示已收字节。
+
+        这里的文字**故意不走** :meth:`_set_status`:一次下载会回调上百次,逐条落盘会把
+        真正有用的日志冲掉,而且"缓存到哪了"在 ``audio.downloader`` 的开始/结束日志里
+        已经有更好的记法(带字节数与耗时)。
+        """
         if total > 0:
             self.progress.setRange(0, 100)
             self.progress.setValue(int(done / total * 100))
@@ -2008,12 +2125,12 @@ class MainWindow(FramelessWindow):
     def _on_next(self) -> None:
         """下一首:到底了就如实说,不让按钮看起来像坏了。"""
         if not self.playback.next():
-            self.status_label.setText("已经是最后一首")
+            self._set_status("已经是最后一首")
 
     def _on_stopped(self) -> None:
         """编排层说没有下一项了。"""
         self.progress.setVisible(False)
-        self.status_label.setText("播放结束")
+        self._set_status("播放结束")
 
     def _on_error(self, message: str) -> None:
         """解析或播放失败:状态栏 + 弹窗(失败必须让用户看见)。"""
@@ -2048,7 +2165,7 @@ class MainWindow(FramelessWindow):
         try:
             self.config_store.save(self._config)
         except OSError as exc:
-            self.status_label.setText(f"配置保存失败:{exc}")
+            self._set_status(f"配置保存失败:{exc}", level=logging.WARNING)
 
     # ------------------------------------------------------------ 工具
 
@@ -2088,7 +2205,7 @@ class MainWindow(FramelessWindow):
     def _fail(self, message: str) -> None:
         """统一失败出口:收进度条、恢复按钮、提示用户。"""
         self.progress.setVisible(False)
-        self.status_label.setText(message)
+        self._set_status(message, level=logging.WARNING)
         QMessageBox.warning(self, "出错了", message)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt 命名
@@ -2121,7 +2238,24 @@ def run(argv: list[str] | None = None) -> int:
     if app_icon is not None:
         app.setWindowIcon(QIcon(str(app_icon)))
     apply_theme(app)
-    window = MainWindow()
+    # 配置只读一次:日志级别必须在窗口建起来**之前**就知道(启动阶段的日志同样要落盘),
+    # 所以先把 store 建好传进窗口,避免窗口再 load 一遍(两次结果可能不一样)
+    config_store = ConfigStore()
+    config = config_store.load()
+    log_path = setup_logging(level=config.log_level)
+    window = MainWindow(
+        config_store=config_store,
+        # 把 ``setup_logging`` 实际用的目录传进窗口:两个入口(打开/导出)必须操作
+        # 同一份日志,不能各自去猜一次平台默认路径
+        log_dir=log_path.parent if log_path is not None else None,
+    )
+    if log_path is None:
+        # 建档失败(目录不可写、磁盘满)不能让应用起不来,但用户必须知道:
+        # 否则他会以为“日志已经记下了”,把一份空报告发过来
+        window._set_status(  # noqa: SLF001 - 同一模块内的私有接线
+            "日志未能启用(目录不可写),排障信息不会落盘", level=logging.WARNING
+        )
+    _LOGGER.info("界面已就绪,日志文件 %s", log_path if log_path is not None else "(未启用)")
     window.show()
     return app.exec()
 

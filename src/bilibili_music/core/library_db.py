@@ -43,6 +43,14 @@ from pathlib import Path
 from typing import Any
 
 from .config import config_root
+from .logging_setup import get_logger
+
+#: 本模块的日志器。命名空间由 ``core.logging_setup`` 统一决定。
+#:
+#: 库不可用(目录不可写、文件被占、磁盘满)会让缓存索引与播放历史**静默**失灵 ——
+#: 界面看起来一切正常,只是"最近播放"永远空着。这正是必须留日志的那种失败。
+#: 连接建立失败只记一次(失败后 ``_broken`` 就锁住了),不会每读一次刷一条。
+_LOGGER = get_logger(__name__)
 
 __all__ = [
     "DB_FILE_NAME",
@@ -140,6 +148,22 @@ def library_db_path() -> Path:
     return config_root() / DB_FILE_NAME
 
 
+def _sql_head(sql: str) -> str:
+    """取 SQL 的开头一段,只用于日志。
+
+    建表语句是好几行的(见 :meth:`LibraryDb._create_schema`),整句落盘会把一行日志
+    变成一屏;而排查"哪条语句不合法"只需要看清它是 ``SELECT`` / ``INSERT`` / ``CREATE``
+    以及操作哪张表。
+
+    Args:
+        sql: 语句原文。
+
+    Returns:
+        折成单行、截到 80 字符以内的片段。
+    """
+    return " ".join(sql.split())[:80]
+
+
 class LibraryDb:
     """本地库的连接与建表。
 
@@ -213,8 +237,9 @@ class LibraryDb:
             conn.execute("PRAGMA synchronous = NORMAL")
             self._create_schema(conn)
             conn.commit()
-        except (sqlite3.Error, OSError):
+        except (sqlite3.Error, OSError) as exc:
             self._broken = True
+            _LOGGER.warning("本地库打不开,缓存索引与播放历史本次不可用 文件=%s 原因=%s", self.path, exc)
             return None
         self._conn = conn
         return conn
@@ -255,7 +280,8 @@ class LibraryDb:
         try:
             cursor = conn.execute(sql, tuple(params))
             conn.commit()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            _LOGGER.warning("本地库写入失败 语句=%s 原因=%s", _sql_head(sql), exc)
             return None
         return max(0, cursor.rowcount)
 
@@ -274,5 +300,6 @@ class LibraryDb:
             return []
         try:
             return list(conn.execute(sql, tuple(params)))
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            _LOGGER.warning("本地库查询失败 语句=%s 原因=%s", _sql_head(sql), exc)
             return []

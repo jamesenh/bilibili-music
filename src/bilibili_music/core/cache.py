@@ -34,7 +34,14 @@ from .cache_index import (
 )
 from .errors import BiliMusicError
 from .library_db import LibraryDb
+from .logging_setup import get_logger
 from .models import AudioTrack, Page, Video
+
+#: 本模块的日志器。命名空间由 ``core.logging_setup`` 统一决定。
+#:
+#: 只记 ``DEBUG``:缓存写入的每一次 open / commit / abort。**绝不在 ``write()`` 里记**——
+#: 一首歌就是几十次 ``write()``,逐块落盘日志会瞬间把整份日志冲爆(见 ``AGENTS.md`` 2.4)。
+_LOGGER = get_logger(__name__)
 
 __all__ = [
     "AudioCache",
@@ -104,6 +111,7 @@ class DownloadSink:
         """
         self.final_path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = self.tmp_path.open("wb")
+        _LOGGER.debug("打开缓存写入 文件=%s", self.tmp_path.name)
         return self
 
     def write(self, data: bytes) -> int:
@@ -120,6 +128,8 @@ class DownloadSink:
         """
         if self._handle is None:
             raise BiliMusicError("DownloadSink 未打开")
+        # 这里**故意不打日志**:一首歌就是几十次 write(),逐块记会把整份日志冲爆。
+        # 字节数在 commit() 里一次性记下来,足够了。
         self._handle.write(data)
         self.bytes_written += len(data)
         return len(data)
@@ -141,8 +151,14 @@ class DownloadSink:
             self._handle = None
         if self.bytes_written == 0:
             self.abort()
+            # 不给 ERROR:这个异常会一路回到下载编排与网络层,那些地方已经各记了一条;
+            # 这里补的是"写到哪个文件、几个字节"的现场
+            _LOGGER.debug("缓存落盘失败 文件=%s 原因=0 字节", self.tmp_path.name)
             raise BiliMusicError("下载得到 0 字节,音源可能已失效")
         os.replace(self.tmp_path, self.final_path)
+        _LOGGER.debug(
+            "缓存落盘 文件=%s 字节=%d", self.final_path.name, self.bytes_written
+        )
         return self.final_path
 
     def abort(self) -> None:
@@ -152,6 +168,8 @@ class DownloadSink:
                 self._handle.close()
             finally:
                 self._handle = None
+        if self.tmp_path.exists():
+            _LOGGER.debug("放弃缓存写入 文件=%s 已收字节=%d", self.tmp_path.name, self.bytes_written)
         self.tmp_path.unlink(missing_ok=True)
 
     def __enter__(self) -> "DownloadSink":

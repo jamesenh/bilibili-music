@@ -17,6 +17,7 @@ import os
 import shutil
 import sys
 import unittest
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,9 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # 注意导入顺序:先 QtWidgets/QtGui 再 QtCore(见 AGENTS.md 第 5 节)
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox  # noqa: E402
-from PySide6.QtGui import QPalette, QPixmap, QPixmapCache  # noqa: E402
-from PySide6.QtCore import QBuffer, QIODevice, QObject, Qt, Signal  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox  # noqa: E402
+from PySide6.QtGui import QDesktopServices, QPalette, QPixmap, QPixmapCache  # noqa: E402
+from PySide6.QtCore import QBuffer, QIODevice, QObject, Qt, Signal, qVersion  # noqa: E402
 
 from bilibili_music.api.bilibili import (  # noqa: E402
     AccountInfo,
@@ -47,9 +48,11 @@ from bilibili_music.core.config import AppConfig, ConfigStore  # noqa: E402
 from bilibili_music.core.cover_cache import CoverCache  # noqa: E402
 from bilibili_music.core.errors import NetworkError  # noqa: E402
 from bilibili_music.core.library_db import LibraryDb  # noqa: E402
+from bilibili_music.core.logging_setup import ENVIRONMENT_FILE_NAME  # noqa: E402
 from bilibili_music.core.models import Page, Video  # noqa: E402
 from bilibili_music.core.queue import PlayMode  # noqa: E402
 from bilibili_music.core.session import SessionStore, session_from_cookies  # noqa: E402
+from bilibili_music.ui import main_window as main_window_module  # noqa: E402
 from bilibili_music.ui.icons import DARK  # noqa: E402
 from bilibili_music.ui.main_window import _SEARCH_MAX_PAGES, MainWindow  # noqa: E402
 from bilibili_music.ui.theme import SURFACES  # noqa: E402
@@ -607,13 +610,26 @@ class _WindowCase(unittest.TestCase):
         # 登录凭据写到真实用户身上(AGENTS.md 第 7 节:可注入路径)
         self.session_store = SessionStore(self.tmp / "session.json")
 
-        # 模态弹窗在离屏测试里会把用例挂住,换成记录器
+        # 模态弹窗在离屏测试里会把用例挂住,换成记录器。
+        # ``question`` 也一并拦掉:它比 ``warning`` 危险得多 —— 忘了拦就是**整个模块死等**
+        # (写过一次,见 TestLogWiring 里那条回归用例的注释)。默认答"否",用例要"是"
+        # 就自己再套一层 patch(后套的先生效、先还原)。
         self.warnings: list[str] = []
         patcher = mock.patch.object(
             QMessageBox, "warning", lambda *args, **kwargs: self.warnings.append(args[2])
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.questions: list[str] = []
+
+        def _decline(*args: object, **kwargs: object) -> QMessageBox.StandardButton:
+            """记下被问的问题并按"否"回答(离屏测试里绝不允许真的开模态框)。"""
+            self.questions.append(str(args[2]) if len(args) > 2 else "")
+            return QMessageBox.StandardButton.No
+
+        question_patcher = mock.patch.object(QMessageBox, "question", _decline)
+        question_patcher.start()
+        self.addCleanup(question_patcher.stop)
 
         self.window = MainWindow(
             client=self.client,  # type: ignore[arg-type]
@@ -626,6 +642,9 @@ class _WindowCase(unittest.TestCase):
             config_store=self.store,
             playback=self.playback,
             session_store=self.session_store,
+            # 日志目录同样指向沙箱:默认值是用户真实的 ``~/Library/Logs``,
+            # 导出类用例一旦忘了用替身就会往那里写文件
+            log_dir=self.tmp / "logs",
         )
 
     def tearDown(self) -> None:
@@ -1208,6 +1227,7 @@ class TestAccountWiring(_WindowCase):
             config_store=ConfigStore(self.tmp / "config2.json"),
             playback=self.playback,
             session_store=self.session_store,
+            log_dir=self.tmp / "logs",
         )
         self.addCleanup(window.close)
         return window
@@ -1522,6 +1542,7 @@ class TestFavFolderActionsWiring(_WindowCase):
             config_store=self.store,
             playback=self.playback,
             session_store=self.session_store,
+            log_dir=self.tmp / "logs",
         )
         self.addCleanup(window.close)
 
@@ -1564,6 +1585,7 @@ class TestFavFolderActionsWiring(_WindowCase):
             config_store=self.store,
             playback=self.playback,
             session_store=self.session_store,
+            log_dir=self.tmp / "logs",
         )
         self.addCleanup(window.close)
         self.client.folders = [_folder(1, "夹子A", 2), _folder(2, "夹子B", 1)]
@@ -1856,6 +1878,116 @@ class TestThemeWiring(_WindowCase):
         self.assertEqual(self.window.player_bar.subtitle_label.objectName(), "TrackSubtitle")
         self.assertEqual(self.window.queue_drawer.count_label.objectName(), "MutedLabel")
         self.assertEqual(self.window.result_list.objectName(), "TrackTable")
+
+
+class TestLogWiring(_WindowCase):
+    """日志入口:侧栏两个按钮 → 打开目录 / 导出压缩包。
+
+    日志是这个应用里唯一"用户需要把它交给别人"的东西,所以这条路径必须真的能走通:
+    导出失败要有人话提示,用户在知情同意里选了"否"就什么都别写。
+    """
+
+    def _accept_export(self, target: Path) -> None:
+        """替掉两个模态弹窗,让导出路径能一口气走完。
+
+        Args:
+            target: 用户"选中"的保存路径。
+        """
+        question = mock.patch.object(
+            QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes
+        )
+        save = mock.patch.object(
+            QFileDialog,
+            "getSaveFileName",
+            lambda *args, **kwargs: (str(target), "压缩包 (*.zip)"),
+        )
+        question.start()
+        save.start()
+        self.addCleanup(question.stop)
+        self.addCleanup(save.stop)
+
+    def test_sidebar_shows_both_log_entries(self) -> None:
+        """侧栏底部有两个日志入口,而且它们不占导航项。"""
+        sidebar = self.window.sidebar
+        self.assertEqual(sidebar.log_dir_button.text(), "打开目录")
+        self.assertEqual(sidebar.export_logs_button.text(), "导出")
+        self.assertNotIn("日志", sidebar.nav_buttons)
+
+    def test_open_log_dir_creates_the_directory_and_opens_it(self) -> None:
+        """点"打开目录":目录不存在时先建出来,再交给系统文件管理器。
+
+        目录不存在就直接调 ``openUrl`` 会让用户看到一句看不懂的系统报错。
+        """
+        opened: list[str] = []
+        with mock.patch.object(
+            QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()) or True
+        ):
+            self.window.sidebar.log_dir_button.click()
+        self.assertEqual(opened, [str(self.tmp / "logs")])
+        self.assertTrue((self.tmp / "logs").is_dir())
+
+    def test_export_writes_an_archive_into_the_chosen_path(self) -> None:
+        """点"导出":弹知情同意 → 选路径 → 真的写出一个可读的压缩包。"""
+        target = self.tmp / "导出" / "BiliMusic-logs.zip"
+        self._accept_export(target)
+        self.window.sidebar.export_logs_button.click()
+        self.assertTrue(target.exists())
+        with zipfile.ZipFile(target) as archive:
+            names = archive.namelist()
+            text = archive.read(ENVIRONMENT_FILE_NAME).decode("utf-8")
+        self.assertIn(ENVIRONMENT_FILE_NAME, names)
+        # Qt 版本只有界面层拿得到,必须由界面注入(core 不许 import Qt)
+        self.assertIn(f"Qt={qVersion()}", text)
+        self.assertIn(str(target), self.window.status_label.text())
+
+    def test_declining_the_consent_dialog_writes_nothing(self) -> None:
+        """用户在知情同意里选"否"时不写任何文件。
+
+        日志里有用户搜过的关键词,不问就发是不对的 —— 这里钉住"问了而且当真"。
+        """
+        target = self.tmp / "不该出现的.zip"
+        with mock.patch.object(
+            QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.No
+        ):
+            self.window.sidebar.export_logs_button.click()
+        self.assertFalse(target.exists())
+        self.assertFalse(list(self.tmp.glob("*.zip")))
+
+    def test_cancelling_the_file_dialog_writes_nothing(self) -> None:
+        """取消保存对话框(返回空路径)时什么都不做,也不报错。
+
+        知情同意那一步仍要过(选"是"),否则卡在它上面 —— 这正是本用例第一版写漏的地方:
+        只拦了一个弹窗,另一个就把整个模块挂死了。
+        """
+        with (
+            mock.patch.object(
+                QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes
+            ),
+            mock.patch.object(QFileDialog, "getSaveFileName", lambda *args, **kwargs: ("", "")),
+        ):
+            self.window.sidebar.export_logs_button.click()
+        self.assertFalse(list(self.tmp.glob("*.zip")))
+        self.assertNotIn("失败", self.window.status_label.text())
+
+    def test_export_failure_is_reported_to_the_user(self) -> None:
+        """导出失败(磁盘满、无权限)要变成状态栏 + 弹窗里的人话,不能把界面炸掉。"""
+        target = self.tmp / "随便.zip"
+        self._accept_export(target)
+        with mock.patch.object(
+            main_window_module, "export_logs", side_effect=OSError("磁盘满了")
+        ):
+            self.window.sidebar.export_logs_button.click()
+        self.assertTrue(any("磁盘满了" in message for message in self.warnings))
+        self.assertIn("导出日志失败", self.window.status_label.text())
+
+    def test_status_text_is_written_to_the_log(self) -> None:
+        """底部状态文字会被记进日志 —— 它就是本应用的"用户操作时间线"。"""
+        with self.assertLogs("bilibili_music.ui.main_window", level="INFO") as captured:
+            self.window._set_status("已加入播放队列:某首歌")  # noqa: SLF001
+            self.window._set_status("")  # noqa: SLF001 - 清空提示不是事件
+        messages = [record.getMessage() for record in captured.records]
+        self.assertTrue(any("某首歌" in message for message in messages))
+        self.assertEqual(len(messages), 1, "清空状态不该记一条日志")
 
 
 if __name__ == "__main__":
