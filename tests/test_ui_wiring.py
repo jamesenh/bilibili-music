@@ -728,6 +728,37 @@ class TestSearchWiring(_WindowCase):
         self.window.title_bar.search_button.click()
         self.assertEqual(self.client.keywords, ["晴天"])
 
+    def test_search_switches_back_to_the_results_page(self) -> None:
+        """在别的页面上提交搜索:内容区要切回搜索结果页,侧栏选中态也要跟上。
+
+        搜索框长在标题栏、全局可用:在"本地缓存"/"最近播放"/收藏夹页上敲回车时,不切回去
+        的话结果就加载在一张看不见的页里。跳转在**提交那一刻**发生,而不是等结果回来
+        才跳:结果什么时候回来是网络的事。
+        """
+        self.window.sidebar.nav_buttons["cache"].click()
+        self.assertIs(self.window.pages.currentWidget(), self.window.cache_page)
+        self._search()
+        self.assertIs(self.window.pages.currentWidget(), self.window.results_page)
+        self.assertTrue(self.window.sidebar.nav_buttons["results"].isChecked())
+
+    def test_searching_a_history_term_also_switches_pages(self) -> None:
+        """点历史词去搜(填回输入框 + 立即搜索)与手敲回车是同一条路,同样要跳转。"""
+        self.window.sidebar.nav_buttons["cache"].click()
+        self.window.search_history.record("晴天")
+        self.window.search_suggest.refresh()
+        self.window.search_suggest.rows[0].click()
+        self.assertIs(self.window.pages.currentWidget(), self.window.results_page)
+
+    def test_failed_search_still_lands_on_the_results_page(self) -> None:
+        """第 1 页失败时人也要在结果页上:失败提示(弹窗与底部状态行)长在那一页。"""
+        self.client.fail_pages = {1}
+        # "发现"是占位页:跑得动又能代表"用户在别的页上"(基类窗口的 cache 是替身对象)
+        self.window.sidebar.nav_buttons["discover"].click()
+        self._search()
+        self.assertIs(self.window.pages.currentWidget(), self.window.results_page)
+        self.assertEqual(len(self.warnings), 1)
+        self.assertIn("搜索失败", self.warnings[0])
+
     def test_double_click_replaces_the_queue_from_that_row(self) -> None:
         """双击搜索结果:整个结果成为队列,并从那一行开始播。"""
         self._search_and_play(1)
@@ -1206,19 +1237,22 @@ class TestQueueVisibilityWiring(_WindowCase):
         """队列面板当前是否可见。"""
         return not self.window.queue_drawer.isHidden()
 
-    def test_queue_is_visible_on_start(self) -> None:
-        """设计稿里队列面板默认是展开的,播放条上的开关要是选中态。"""
-        self.assertTrue(self._visible())
-        self.assertTrue(self.window.player_bar.queue_button.isChecked())
+    def test_queue_is_hidden_on_start(self) -> None:
+        """队列面板**默认收起**(用户 2026-09-16 拍板),播放条上的开关是未选中态。
+
+        收起的是初始状态,不是"禁用":开关依旧能把它展开(见下一条用例)。
+        """
+        self.assertFalse(self._visible())
+        self.assertFalse(self.window.player_bar.queue_button.isChecked())
 
     def test_player_bar_button_hides_and_shows(self) -> None:
-        """播放条上的队列开关要真的收起/展开面板。"""
+        """播放条上的队列开关要真的展开/收起面板。"""
+        self.window.player_bar.queue_button.click()
+        self.assertTrue(self._visible())
+        self.assertTrue(self.window.player_bar.queue_button.isChecked())
         self.window.player_bar.queue_button.click()
         self.assertFalse(self._visible())
         self.assertFalse(self.window.player_bar.queue_button.isChecked())
-        self.window.player_bar.queue_button.click()
-        self.assertTrue(self._visible())
-        self.assertTrue(self.window.player_bar.queue_button.isChecked())
 
 
 class TestNavigationWiring(_WindowCase):

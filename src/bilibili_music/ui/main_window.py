@@ -440,7 +440,10 @@ class MainWindow(FramelessWindow):
 
         self.setCentralWidget(root)
         self.sidebar.set_active_page("results")
-        self._set_queue_visible(True)
+        # 队列面板**默认收起**(用户 2026-09-16 拍板):它常驻在右侧会把结果列表挤窄,而
+        # "队列里有什么"多数时候用户并不看;要看时点播放条上那个开关即可。可见性**不落盘**
+        # (只在本次会话里变),所以每次启动都从收起开始 —— 不是"记住上一次的状态"。
+        self._set_queue_visible(False)
 
     def _build_results_page(self) -> QWidget:
         """建"搜索标题行 + 结果列表 + 状态与进度"这一页。"""
@@ -629,10 +632,17 @@ class MainWindow(FramelessWindow):
 
         这是**唯一**记搜索历史的地方(点历史词搜、回车搜、点按钮搜都会走到这里):
         记的是提交出去的那个关键字。
+
+        提交即把内容区切回**搜索结果页**(并同步侧栏选中态):搜索框长在标题栏、全局可用,
+        用户完全可能在"本地缓存"/"最近播放"/收藏夹页上敲回车 —— 不切回去的话结果加载在
+        一张看不见的页里,表现为"点了搜索没反应"。跳转与请求成不成功无关:失败提示也长在
+        结果页那一张上。
         """
         keyword = self.title_bar.search_input.text().strip()
         if not keyword:
             return
+        # 先跳转再发请求:结果什么时候回来是网络的事,但"用户该看哪一页"这一刻就已经定了
+        self._show_page(self.results_page, "results")
         # 同一个词再搜一次会被提到最前,去重由主键 + UPSERT 完成(见 core/search_history.py)。
         # 记在"提交"这一刻而不是每次按键:否则"周”“周杰”“周杰伦”会存成三条
         self.search_history.record(keyword)
