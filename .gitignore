@@ -9,5 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# 测试运行产物:落盘类用例把目录注入到 tests/_scratch/ 下(见 AGENTS.md 第 7 节,
+# 不用 tempfile),每次跑测试都会重写一遍,不属于源码
+tests/_scratch/
+
 # Local UI design mockups (large binaries, deliberately not tracked)
 ui设计图/
