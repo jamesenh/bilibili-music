@@ -2033,7 +2033,8 @@ class TestLogWiring(_WindowCase):
             QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()) or True
         ):
             self.window.sidebar.log_dir_button.click()
-        self.assertEqual(opened, [str(self.tmp / "logs")])
+        # Qt在Windows上也可能返回正斜杠,按Path比较仍严格验证数量与目标目录。
+        self.assertEqual([Path(path) for path in opened], [self.tmp / "logs"])
         self.assertTrue((self.tmp / "logs").is_dir())
 
     def test_export_writes_an_archive_into_the_chosen_path(self) -> None:

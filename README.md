@@ -1,5 +1,9 @@
 # BiliMusic
 
+> **当前分支：Rust/Tauri迁移。** 新客户端源码在[`bili-music-tauri/`](bili-music-tauri/)，
+> 启动、验证与迁移待办见该目录的[README](bili-music-tauri/README.md)。
+> 下文保留Python/PySide6版本的使用说明与历史设计，不能当作Rust版本的完成状态。
+
 聚合哔哩哔哩音乐视频的桌面音乐客户端。**基于 PySide6 从零自研**,B站的接口与数据获取方式参考了社区现有项目。
 
 当前状态:**MVP 端到端已跑通**(搜索 → 分P → 音轨 → 缓存 → 播放),两种网络后端均验证可互换;单元测试全部不触网,用 `uv run python -m unittest discover -s tests` 可自查。

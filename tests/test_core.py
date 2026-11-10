@@ -219,7 +219,9 @@ class TestAudioCache(unittest.TestCase):
         self.cache = AudioCache(root, db=LibraryDb(root / "library.db"))
 
     def tearDown(self) -> None:
-        """用例结束后销毁临时目录,不留下残留文件影响后续断言。"""
+        """先关闭缓存索引连接再销毁临时目录,避免Windows拒绝删除已打开的数据库。"""
+        # POSIX允许删除仍打开的文件,Windows要求先释放sqlite连接再清理目录。
+        self.cache.db.close()
         self._tmp.cleanup()
 
     def test_key_depends_on_all_inputs(self) -> None:

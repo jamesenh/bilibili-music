@@ -374,9 +374,10 @@ class TestEnvironmentSummary(unittest.TestCase):
         self.assertIn(str(LOG_KEEP_DAYS), summary["日志保留"])
 
     def test_reports_injected_log_directory(self) -> None:
-        """日志目录取注入值,而不是永远报告平台默认目录。"""
-        summary = environment_summary(log_dir=Path("/tmp/某个目录"))
-        self.assertEqual(summary["日志目录"], "/tmp/某个目录")
+        """日志目录原样报告注入的Path,字符串分隔符遵循当前平台。"""
+        log_dir = Path("/tmp/某个目录")
+        summary = environment_summary(log_dir=log_dir)
+        self.assertEqual(summary["日志目录"], str(log_dir))
 
     def test_extra_entries_are_merged(self) -> None:
         """``extra`` 用来补只有界面层才知道的信息(Qt 版本)。"""
